@@ -102,9 +102,17 @@ impl GoogleOAuthConfig {
         &self,
         authorization: &OAuthAuthorization,
         code: &str,
+        client_secret: &str,
     ) -> Result<OAuthTokens, OAuthError> {
         if code.trim().is_empty() {
             return Err(OAuthError::MissingAuthorizationCode);
+        }
+
+        if client_secret.trim().is_empty()
+            || client_secret.len() != client_secret.trim().len()
+            || client_secret.chars().any(char::is_whitespace)
+        {
+            return Err(OAuthError::InvalidClientSecret);
         }
 
         let client = reqwest::blocking::Client::builder()
@@ -115,6 +123,7 @@ impl GoogleOAuthConfig {
             .post(GOOGLE_OAUTH_TOKEN_ENDPOINT)
             .form(&[
                 ("client_id", self.client_id.as_str()),
+                ("client_secret", client_secret),
                 ("code", code),
                 ("code_verifier", authorization.code_verifier()),
                 ("grant_type", "authorization_code"),
@@ -341,6 +350,8 @@ fn random_base64url_32_bytes() -> String {
 pub enum OAuthError {
     #[error("Google OAuth client id is invalid")]
     InvalidClientId,
+    #[error("Google OAuth Desktop client secret is invalid")]
+    InvalidClientSecret,
     #[error("loopback port must be a non-zero local port")]
     InvalidLoopbackPort,
     #[error("OAuth callback origin or path is invalid")]
@@ -377,6 +388,19 @@ mod tests {
             GoogleOAuthConfig::new("not-a-google-client-id"),
             Err(OAuthError::InvalidClientId)
         ));
+    }
+
+    #[test]
+    fn token_exchange_rejects_missing_desktop_client_secret_before_network() {
+        let config = GoogleOAuthConfig::new("123.apps.googleusercontent.com").unwrap();
+        let authorization = config
+            .begin_authorization(45123, GoogleDriveAccess::MetadataReadOnly)
+            .unwrap();
+
+        let error = config
+            .exchange_code(&authorization, "test-code", "")
+            .unwrap_err();
+        assert!(matches!(error, OAuthError::InvalidClientSecret));
     }
 
     #[test]

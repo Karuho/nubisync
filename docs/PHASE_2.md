@@ -80,3 +80,7 @@ Phase 2 closes only after:
 ## Loopback redirect URI
 
 The Desktop OAuth flow uses `http://127.0.0.1:<random-port>` with the root path. The exact same redirect URI is used for authorization and code exchange.
+
+## Development Desktop client configuration
+
+The live development test receives the Desktop OAuth client secret through `NUBISYNC_GOOGLE_CLIENT_SECRET`. It is client configuration, not an end-user refresh token, and must not be committed or logged.

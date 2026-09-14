@@ -19,6 +19,7 @@ use tiny_http::{Method, Response, Server};
 use url::Url;
 
 const GOOGLE_CLIENT_ID_ENV: &str = "NUBISYNC_GOOGLE_CLIENT_ID";
+const GOOGLE_CLIENT_SECRET_ENV: &str = "NUBISYNC_GOOGLE_CLIENT_SECRET";
 const REFRESH_TOKEN_PURPOSE: &str = "refresh-token";
 
 fn main() {
@@ -72,10 +73,11 @@ GOOGLE DEVELOPMENT LOGIN:
   Set the public OAuth Desktop client ID in the environment:
 
     export NUBISYNC_GOOGLE_CLIENT_ID='...apps.googleusercontent.com'
+    export NUBISYNC_GOOGLE_CLIENT_SECRET='...'
     cargo run -p nubisync-cli -- auth google login
 
 SECURITY:
-  - no Google client secret is required for this desktop PKCE flow
+  - the Desktop OAuth client secret is supplied at runtime and is never logged
   - refresh tokens are stored in the OS credential store
   - this Phase 2 command requests metadata-only Drive access
   - it does not list filenames, download files, or write to Drive
@@ -98,6 +100,8 @@ fn google_login() -> Result<(), CliError> {
     }
 
     let client_id = env::var(GOOGLE_CLIENT_ID_ENV).map_err(|_| CliError::MissingGoogleClientId)?;
+    let client_secret =
+        env::var(GOOGLE_CLIENT_SECRET_ENV).map_err(|_| CliError::MissingGoogleClientSecret)?;
     let oauth = GoogleOAuthConfig::new(client_id)?;
 
     let server = Server::http("127.0.0.1:0").map_err(|_| CliError::LoopbackBindFailed)?;
@@ -156,7 +160,7 @@ fn google_login() -> Result<(), CliError> {
         }
     };
 
-    let tokens = oauth.exchange_code(&authorization, &code)?;
+    let tokens = oauth.exchange_code(&authorization, &code, &client_secret)?;
     let api = GoogleDriveApi::new(tokens.access_token().clone())?;
     let user = api.user_info()?;
 
@@ -252,6 +256,8 @@ enum CliError {
     InvalidArguments,
     #[error("NUBISYNC_GOOGLE_CLIENT_ID is not set")]
     MissingGoogleClientId,
+    #[error("NUBISYNC_GOOGLE_CLIENT_SECRET is not set")]
+    MissingGoogleClientSecret,
     #[error("the operating-system credential store is unavailable")]
     KeyringUnavailable,
     #[error("failed to bind the OAuth callback to loopback")]
