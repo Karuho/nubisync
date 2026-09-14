@@ -286,7 +286,7 @@ fn drive_changes() -> Result<(), CliError> {
         return Err(CliError::NoLocalGoogleAccount);
     }
 
-    let storage = Storage::open(&db_path)?;
+    let mut storage = Storage::open(&db_path)?;
     let provider = ProviderId::new("google-drive")?;
     let account = single_google_account(storage.list_accounts(&provider)?)?;
 
@@ -327,6 +327,7 @@ fn drive_changes() -> Result<(), CliError> {
     let mut files = 0_u64;
     let mut folders = 0_u64;
     let mut trashed = 0_u64;
+    let mut collected_changes = Vec::new();
 
     let checkpoint = loop {
         if pages_fetched >= 10_000 {
@@ -339,7 +340,7 @@ fn drive_changes() -> Result<(), CliError> {
         for change in page.changes {
             changes_total += 1;
 
-            match change {
+            match &change {
                 RemoteChange::Delete { .. } => {
                     deletes += 1;
                 }
@@ -356,6 +357,8 @@ fn drive_changes() -> Result<(), CliError> {
                     }
                 }
             }
+
+            collected_changes.push(change);
         }
 
         match (page.continuation, page.checkpoint) {
@@ -371,7 +374,17 @@ fn drive_changes() -> Result<(), CliError> {
     };
 
     let cursor_changed = checkpoint != cursor;
-    storage.save_cursor(&provider, &account.subject, &checkpoint, unix_time_ms()?)?;
+    let observed_at_unix_ms = unix_time_ms()?;
+
+    let persisted = storage.commit_remote_changes_and_cursor(
+        &provider,
+        &account.subject,
+        &collected_changes,
+        &checkpoint,
+        observed_at_unix_ms,
+    )?;
+
+    let pending_total = storage.pending_remote_event_count(&provider, &account.subject)?;
 
     println!("DRIVE_CHANGES=PASS");
     println!("PAGES_FETCHED={pages_fetched}");
@@ -381,6 +394,9 @@ fn drive_changes() -> Result<(), CliError> {
     println!("FILES={files}");
     println!("FOLDERS={folders}");
     println!("TRASHED={trashed}");
+    println!("REMOTE_EVENTS_PERSISTED={persisted}");
+    println!("REMOTE_EVENTS_PENDING_TOTAL={pending_total}");
+    println!("CURSOR_AND_EVENTS_ATOMIC=yes");
     println!("CHECKPOINT_COMMITTED=yes");
     println!("CURSOR_CHANGED={}", yes_no(cursor_changed));
     println!("REMOTE_METADATA_PRINTED=no");

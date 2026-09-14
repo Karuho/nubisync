@@ -101,3 +101,45 @@ This makes a retry re-read the uncommitted change range instead of silently skip
 - no file content is downloaded
 - no Drive write is performed
 - no filename, remote ID, OAuth credential, page token, or cursor is printed
+
+## Phase 3C — Durable remote journal and atomic checkpoint
+
+Phase 3B proved that NubiSync can consume real Google Drive changes incrementally. Phase 3C makes that stream crash-safe before any filesystem application logic is introduced.
+
+SQLite schema version 2 adds `remote_events`.
+
+Each Google Drive `RemoteChange` is persisted locally with:
+
+- provider and account ownership
+- event kind (`upsert` or `delete`)
+- remote item identifier
+- parent identifier when available
+- local synchronization metadata required later by the reconciler
+- file/folder kind
+- size when available
+- trashed state
+- observation timestamp
+- lifecycle status, initially `pending`
+
+This metadata is local synchronization state. It is not diagnostics telemetry and is not emitted by `nubisync drive changes`.
+
+### Atomicity invariant
+
+The complete fetched change batch and the final provider cursor are committed in one SQLite transaction.
+
+Therefore:
+
+- if every event insert succeeds, all events and the new cursor become durable together
+- if any event insert fails, SQLite rolls back the complete batch and leaves the previous cursor untouched
+- a retry cannot silently skip a remote change because of a partially advanced checkpoint
+
+The storage tests include an intentional numeric-overflow failure after a valid first event. The test verifies that the first insert is rolled back and that the previous cursor remains active.
+
+### Phase 3C exit criteria
+
+- schema migrates from version 1 to version 2 on the existing local database
+- a real Drive change is persisted as a pending `remote_event`
+- the cursor and remote-event batch commit atomically
+- no remote filenames, IDs, page tokens, or cursor values are printed
+- no file content is downloaded
+- no Google Drive write occurs
