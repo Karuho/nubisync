@@ -41,7 +41,17 @@ pub struct GoogleOAuthConfig {
 impl GoogleOAuthConfig {
     pub fn new(client_id: impl Into<String>) -> Result<Self, OAuthError> {
         let client_id = client_id.into();
-        if client_id.trim().is_empty() || client_id.chars().any(char::is_whitespace) {
+        let normalized = client_id.trim();
+        let lowercase = normalized.to_ascii_lowercase();
+
+        if normalized.is_empty()
+            || normalized.len() != client_id.len()
+            || normalized.chars().any(char::is_whitespace)
+            || !normalized.ends_with(".apps.googleusercontent.com")
+            || lowercase.contains("tu_client_id")
+            || lowercase.contains("your_client_id")
+            || lowercase.contains("example")
+        {
             return Err(OAuthError::InvalidClientId);
         }
 
@@ -111,8 +121,21 @@ impl GoogleOAuthConfig {
                 ("grant_type", "authorization_code"),
                 ("redirect_uri", authorization.redirect_uri().as_str()),
             ])
-            .send()?
-            .error_for_status()?;
+            .send()?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_code = response
+                .json::<TokenErrorResponse>()
+                .ok()
+                .and_then(|body| sanitize_oauth_error_code(&body.error))
+                .unwrap_or_else(|| "unknown_error".to_owned());
+
+            return Err(OAuthError::TokenEndpointRejected {
+                status: status.as_u16(),
+                code: error_code,
+            });
+        }
 
         let response: TokenResponse = response.json()?;
 
@@ -283,6 +306,24 @@ impl fmt::Debug for OAuthTokens {
 }
 
 #[derive(Debug, Deserialize)]
+struct TokenErrorResponse {
+    error: String,
+}
+
+fn sanitize_oauth_error_code(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+
+    Some(value.to_owned())
+}
+
+#[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
     expires_in: u64,
@@ -315,7 +356,9 @@ pub enum OAuthError {
     MissingAuthorizationCode,
     #[error("OAuth URL construction failed")]
     Url(#[from] url::ParseError),
-    #[error("OAuth HTTP request failed")]
+    #[error("Google OAuth token endpoint rejected request (HTTP {status}): {code}")]
+    TokenEndpointRejected { status: u16, code: String },
+    #[error("OAuth HTTP transport or response parsing failed: {0}")]
     Http(#[from] reqwest::Error),
 }
 
@@ -323,6 +366,28 @@ pub enum OAuthError {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn client_id_rejects_placeholders_and_malformed_values() {
+        assert!(GoogleOAuthConfig::new("123.apps.googleusercontent.com").is_ok());
+        assert!(matches!(
+            GoogleOAuthConfig::new("TU_CLIENT_ID.apps.googleusercontent.com"),
+            Err(OAuthError::InvalidClientId)
+        ));
+        assert!(matches!(
+            GoogleOAuthConfig::new("not-a-google-client-id"),
+            Err(OAuthError::InvalidClientId)
+        ));
+    }
+
+    #[test]
+    fn oauth_error_code_sanitizer_rejects_free_form_text() {
+        assert_eq!(
+            sanitize_oauth_error_code("invalid_grant").as_deref(),
+            Some("invalid_grant")
+        );
+        assert!(sanitize_oauth_error_code("bad token: secret-ish text").is_none());
+    }
 
     #[test]
     fn metadata_flow_uses_loopback_pkce_and_least_privilege_scope() {
