@@ -88,7 +88,6 @@ impl GoogleOAuthConfig {
             .append_pair("code_challenge", &code_challenge)
             .append_pair("code_challenge_method", "S256")
             .append_pair("access_type", "offline")
-            .append_pair("include_granted_scopes", "true")
             .append_pair("prompt", "consent");
 
         Ok(OAuthAuthorization {
@@ -419,6 +418,8 @@ mod tests {
             params.get("access_type").map(String::as_str),
             Some("offline")
         );
+
+        assert!(!params.contains_key("include_granted_scopes"));
 
         let scopes = params.get("scope").unwrap();
         assert!(scopes.contains("openid"));

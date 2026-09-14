@@ -100,3 +100,7 @@ Do not log:
 - OAuth state
 
 Errors exposed to logs should use stable sanitized categories.
+
+## Installed-app authorization behavior
+
+NubiSync does not send `include_granted_scopes` in the Desktop installed-app authorization request. Google documents incremental authorization as unsupported for the Installed App flow. Each authorization therefore requests the explicit scope set required by the current NubiSync capability.
