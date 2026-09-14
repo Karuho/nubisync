@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/nubisync-core",
+  "crates/nubisync-drive",
+  "crates/nubisync-storage",
+  "crates/nubisync-auth",
+  "crates/nubisync-sync",
+  "crates/nubisync-daemon",
+  "crates/nubisync-telemetry",
+]
