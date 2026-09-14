@@ -1,56 +1,104 @@
-# Google OAuth Foundation
+# Google OAuth
 
-## Phase 1 status
-
-Phase 1 does **not** contact Google, exchange authorization codes or store real OAuth tokens.
-
-It establishes and tests the authorization-request contract only.
-
-## Intended production flow
+## Application type
 
 NubiSync is a native desktop application.
 
-The intended Google OAuth flow is:
+Google OAuth for desktop applications uses the system browser and a loopback redirect URI.
 
-1. generate a fresh high-entropy `state`
-2. generate a fresh PKCE verifier and S256 challenge
-3. bind an HTTP listener to `127.0.0.1` on an available local port
-4. open the Google authorization URL in the user's browser
-5. receive the authorization code on the loopback callback
-6. require an exact `state` match
-7. exchange the code with the original PKCE verifier
-8. store the refresh token in the operating-system secret store
-9. never place access or refresh tokens in SQLite telemetry tables, logs or NubiSync-operated services
+NubiSync binds only to:
 
-Google documents loopback redirects for desktop applications and recommends PKCE for installed apps.
+`127.0.0.1:<random-port>`
 
-## Scopes
+The callback path is:
 
-The current design requires:
+`/oauth/callback`
+
+## PKCE and state
+
+Every authorization attempt generates:
+
+- a fresh high-entropy OAuth `state`
+- a fresh PKCE verifier
+- an S256 PKCE challenge
+
+The callback must match the exact loopback scheme, host, port and path created for that authorization attempt.
+
+The returned `state` must match exactly before an authorization code is accepted.
+
+OAuth authorization URLs are intentionally excluded from `Debug` output because they contain the state value.
+
+## Access levels
+
+NubiSync models Drive permissions explicitly:
+
+### MetadataReadOnly
+
+`https://www.googleapis.com/auth/drive.metadata.readonly`
+
+Used for the first real Phase 2 connection.
+
+### ReadOnly
+
+`https://www.googleapis.com/auth/drive.readonly`
+
+Reserved for a later phase when actual file downloads are implemented.
+
+### FullSync
+
+`https://www.googleapis.com/auth/drive`
+
+Reserved for the phase that implements and validates remote mutations.
+
+NubiSync must not request a stronger access level merely because future code may need it.
+
+## Identity scopes
+
+NubiSync requests:
 
 - `openid`
 - `email`
 - `profile`
-- `https://www.googleapis.com/auth/drive`
 
-The full Drive scope is restricted. It is selected because NubiSync's primary function is full local synchronization of the user's existing Drive, not merely files created or individually selected by NubiSync.
+The OpenID Connect UserInfo response supplies the stable Google `sub` account identifier and may supply the display name and email address needed for account UX.
 
-Scope use must be re-reviewed before public OAuth verification.
+## Token exchange
 
-## Client identity
+Authorization codes are exchanged at:
 
-A Google OAuth desktop client ID is an application identifier, not an end-user secret.
+`https://oauth2.googleapis.com/token`
 
-Development must not commit:
+using:
 
-- user access tokens
-- user refresh tokens
+- client ID
+- authorization code
+- PKCE verifier
+- `authorization_code` grant type
+- exact loopback redirect URI
+
+The desktop flow does not rely on a confidential client secret.
+
+## Credential storage
+
+Refresh tokens are security credentials.
+
+They belong in the operating-system credential store and must never be:
+
+- committed to Git
+- stored in telemetry
+- logged
+- stored in NubiSync SQLite metadata tables
+- sent to NubiSync-operated services
+
+## Logging rule
+
+Do not log:
+
+- authorization URLs
 - authorization codes
-- service-account private keys
-- unrelated Google Cloud credentials
+- access tokens
+- refresh tokens
+- PKCE verifiers
+- OAuth state
 
-Official production OAuth configuration will be handled separately from user credentials.
-
-## No speculative permissions
-
-Future cloud providers or Google features must not cause additional Google scopes to be requested until the corresponding feature is implemented and justified.
+Errors exposed to logs should use stable sanitized categories.

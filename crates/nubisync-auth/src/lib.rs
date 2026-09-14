@@ -1,16 +1,19 @@
 //! Secret-storage boundary for OAuth credentials.
 //!
-//! Phase 1 provides only the interface and an in-memory test implementation.
-//! A Linux Secret Service/libsecret implementation will follow later.
+//! Production credentials belong in the operating-system credential store.
+//! SQLite and telemetry are not credential stores.
 
 #![forbid(unsafe_code)]
 
+use keyring::Entry;
 use std::{
     collections::HashMap,
     fmt,
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
+
+pub const NUBISYNC_KEYRING_SERVICE: &str = "dev.dynadev.nubisync";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SecretKey {
@@ -38,7 +41,21 @@ impl SecretKey {
             return Err(SecretStoreError::InvalidKey);
         }
 
+        if [&key.provider, &key.account_subject, &key.purpose]
+            .iter()
+            .any(|value| value.contains('\0'))
+        {
+            return Err(SecretStoreError::InvalidKey);
+        }
+
         Ok(key)
+    }
+
+    fn storage_username(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.provider, self.account_subject, self.purpose
+        )
     }
 }
 
@@ -77,8 +94,14 @@ pub enum SecretStoreError {
     InvalidKey,
     #[error("secret value must not be empty")]
     EmptySecret,
+    #[error("secret store service name is invalid")]
+    InvalidService,
     #[error("secret store lock is poisoned")]
     Poisoned,
+    #[error("operating-system credential store is unavailable")]
+    BackendUnavailable,
+    #[error("operating-system credential operation failed")]
+    BackendFailure,
 }
 
 #[derive(Clone, Default)]
@@ -105,6 +128,72 @@ impl SecretStore for MemorySecretStore {
     }
 }
 
+/// OS-backed credential storage used by official desktop builds.
+///
+/// On Linux, keyring-rs selects the Secret Service backend for its v1 API.
+#[derive(Debug, Clone)]
+pub struct KeyringSecretStore {
+    service: String,
+}
+
+impl Default for KeyringSecretStore {
+    fn default() -> Self {
+        Self {
+            service: NUBISYNC_KEYRING_SERVICE.to_owned(),
+        }
+    }
+}
+
+impl KeyringSecretStore {
+    pub fn new(service: impl Into<String>) -> Result<Self, SecretStoreError> {
+        let service = service.into();
+        if service.trim().is_empty() || service.contains('\0') {
+            return Err(SecretStoreError::InvalidService);
+        }
+        Ok(Self { service })
+    }
+
+    pub fn is_available() -> bool {
+        Entry::store_status().is_ok()
+    }
+
+    fn entry(&self, key: &SecretKey) -> Result<Entry, SecretStoreError> {
+        Entry::new(&self.service, &key.storage_username()).map_err(map_keyring_error)
+    }
+}
+
+impl SecretStore for KeyringSecretStore {
+    fn put(&self, key: &SecretKey, value: SecretValue) -> Result<(), SecretStoreError> {
+        self.entry(key)?
+            .set_secret(value.expose_bytes())
+            .map_err(map_keyring_error)
+    }
+
+    fn get(&self, key: &SecretKey) -> Result<Option<SecretValue>, SecretStoreError> {
+        match self.entry(key)?.get_secret() {
+            Ok(secret) => SecretValue::new(secret).map(Some),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(map_keyring_error(error)),
+        }
+    }
+
+    fn delete(&self, key: &SecretKey) -> Result<(), SecretStoreError> {
+        match self.entry(key)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(map_keyring_error(error)),
+        }
+    }
+}
+
+fn map_keyring_error(error: keyring::Error) -> SecretStoreError {
+    match error {
+        keyring::Error::NoDefaultStore | keyring::Error::NoStorageAccess(_) => {
+            SecretStoreError::BackendUnavailable
+        }
+        _ => SecretStoreError::BackendFailure,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +214,11 @@ mod tests {
         assert_eq!(store.get(&key).unwrap(), Some(value));
         store.delete(&key).unwrap();
         assert_eq!(store.get(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn storage_username_is_namespaced() {
+        let key = SecretKey::new("google-drive", "12345", "refresh-token").unwrap();
+        assert_eq!(key.storage_username(), "google-drive:12345:refresh-token");
     }
 }

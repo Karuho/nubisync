@@ -8,4 +8,5 @@ license-file = "../../LICENSE"
 repository.workspace = true
 
 [dependencies]
+keyring.workspace = true
 thiserror.workspace = true

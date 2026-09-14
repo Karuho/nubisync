@@ -1,5 +1,5 @@
 [package]
-name = "nubisync-drive"
+name = "nubisync-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,12 +7,16 @@ authors.workspace = true
 license-file = "../../LICENSE"
 repository.workspace = true
 
+[[bin]]
+name = "nubisync"
+path = "src/main.rs"
+
 [dependencies]
-base64.workspace = true
+nubisync-auth = { path = "../nubisync-auth" }
 nubisync-core = { path = "../nubisync-core" }
-rand.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-sha2.workspace = true
+nubisync-drive = { path = "../nubisync-drive" }
+nubisync-storage = { path = "../nubisync-storage" }
 thiserror.workspace = true
+tiny_http.workspace = true
 url.workspace = true
+webbrowser.workspace = true

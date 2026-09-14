@@ -72,3 +72,39 @@ Later phases must address:
 - rate-limit amplification
 - SQLite corruption and recovery
 - local malware reading user-session credentials
+
+## Phase 2 additions
+
+### Loopback callback substitution
+
+Mitigations:
+
+- listener binds only to `127.0.0.1`
+- OS selects an ephemeral port
+- callback scheme, host, port and path must match exactly
+- OAuth `state` must match exactly
+- only HTTP GET is accepted by the development callback handler
+
+### Overbroad OAuth authorization during early development
+
+Mitigation:
+
+- the first live account connection uses `drive.metadata.readonly`
+- `drive.readonly` is deferred until file downloads exist
+- full `drive` is deferred until remote write operations exist and are tested
+
+### Refresh-token theft from SQLite
+
+Mitigation:
+
+- refresh tokens are never inserted into SQLite
+- Linux stores them through Secret Service/keyring
+- SQLite stores only synchronization metadata and opaque provider cursors
+
+### Accidental file inventory during account probing
+
+Mitigation:
+
+- Phase 2 uses `about.get` and `changes.getStartPageToken`
+- it does not call `files.list`
+- field masks are explicit for the Drive account probe

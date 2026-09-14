@@ -81,3 +81,17 @@ Upload, download, deletion and rename APIs are deferred until their exact transa
 OAuth credentials are handled behind a separate secret-store boundary. SQLite is for synchronization metadata; it is not the intended storage location for OAuth refresh tokens.
 
 Telemetry uses typed event variants rather than arbitrary key/value metadata so filenames, local paths and provider object identifiers cannot be casually attached to diagnostic events.
+
+## Phase 2 authentication boundary
+
+The Google provider separates three authorization capabilities:
+
+- metadata read-only
+- content read-only
+- full synchronization
+
+Application code must request the weakest capability that satisfies the currently implemented operation.
+
+The development CLI is an integration harness, not a second synchronization engine. It orchestrates the same auth, storage and provider crates that the desktop application will later consume.
+
+Refresh tokens live behind `SecretStore` and the production Linux implementation uses the desktop credential service. SQLite stores account metadata and provider cursors only.
