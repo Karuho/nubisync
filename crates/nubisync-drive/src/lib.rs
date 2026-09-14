@@ -1,3 +1,10 @@
-//! nubisync-drive
-//!
-//! Phase 0 placeholder. Public APIs will be introduced incrementally.
+//! Google Drive provider foundations.
+
+#![forbid(unsafe_code)]
+
+mod oauth;
+
+pub use oauth::{
+    GOOGLE_DRIVE_FULL_SCOPE, GOOGLE_OAUTH_AUTH_ENDPOINT, GoogleOAuthConfig, OAuthAuthorization,
+    OAuthError,
+};

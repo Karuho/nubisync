@@ -71,3 +71,13 @@ Remote changes and local filesystem events must be journaled before destructive 
 Interrupted synchronization must resume safely after process or machine restart.
 
 A failure in telemetry, update infrastructure or NubiSync-operated services must not stop Google Drive synchronization.
+
+## Phase 1 implementation note
+
+The initial provider contract intentionally exposes only account identity and incremental change-stream primitives.
+
+Upload, download, deletion and rename APIs are deferred until their exact transactional semantics are designed and tested. This prevents the first Google Drive adapter from defining accidental semantics that would later leak into every provider.
+
+OAuth credentials are handled behind a separate secret-store boundary. SQLite is for synchronization metadata; it is not the intended storage location for OAuth refresh tokens.
+
+Telemetry uses typed event variants rather than arbitrary key/value metadata so filenames, local paths and provider object identifiers cannot be casually attached to diagnostic events.

@@ -1,7 +1,13 @@
 [package]
 name = "nubisync-telemetry"
-version = "0.0.0"
-edition = "2021"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file = "../../LICENSE"
+repository.workspace = true
 
 [dependencies]
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

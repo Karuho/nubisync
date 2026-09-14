@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
   "crates/nubisync-core",
   "crates/nubisync-drive",
@@ -9,3 +9,22 @@ members = [
   "crates/nubisync-daemon",
   "crates/nubisync-telemetry",
 ]
+
+[workspace.package]
+version = "0.1.0-alpha.0"
+edition = "2024"
+rust-version = "1.98.1"
+authors = ["Karuho / DynaDev"]
+license-file = "LICENSE"
+repository = "https://github.com/Karuho/nubisync"
+
+[workspace.dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+rand = "0.8"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }

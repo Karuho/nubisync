@@ -1,7 +1,13 @@
 [package]
 name = "nubisync-storage"
-version = "0.0.0"
-edition = "2021"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file = "../../LICENSE"
+repository.workspace = true
 
 [dependencies]
+nubisync-core = { path = "../nubisync-core" }
+rusqlite.workspace = true
+thiserror.workspace = true
