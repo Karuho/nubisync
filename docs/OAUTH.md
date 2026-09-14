@@ -10,9 +10,7 @@ NubiSync binds only to:
 
 `127.0.0.1:<random-port>`
 
-The callback path is:
-
-`/oauth/callback`
+The loopback callback uses the URI root (`/`), so the redirect URI is exactly `http://127.0.0.1:<port>`.
 
 ## PKCE and state
 

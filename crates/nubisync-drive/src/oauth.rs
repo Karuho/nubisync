@@ -71,7 +71,7 @@ impl GoogleOAuthConfig {
         let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
         let state = random_base64url_32_bytes();
 
-        let redirect_uri = Url::parse(&format!("http://127.0.0.1:{loopback_port}/oauth/callback"))?;
+        let redirect_uri = Url::parse(&format!("http://127.0.0.1:{loopback_port}"))?;
         let mut authorization_url = Url::parse(GOOGLE_OAUTH_AUTH_ENDPOINT)?;
 
         let mut scopes = IDENTITY_SCOPES.to_vec();
@@ -399,6 +399,7 @@ mod tests {
         assert_eq!(request.redirect_uri().scheme(), "http");
         assert_eq!(request.redirect_uri().host_str(), Some("127.0.0.1"));
         assert_eq!(request.redirect_uri().port(), Some(45123));
+        assert_eq!(request.redirect_uri().path(), "/");
 
         let params: HashMap<_, _> = request
             .authorization_url()
@@ -443,22 +444,21 @@ mod tests {
             .unwrap();
 
         let valid = Url::parse(&format!(
-            "http://127.0.0.1:45123/oauth/callback?code=test-code&state={}",
+            "http://127.0.0.1:45123/?code=test-code&state={}",
             request.expected_state()
         ))
         .unwrap();
 
         assert_eq!(request.accept_callback(&valid).unwrap(), "test-code");
 
-        let wrong_state =
-            Url::parse("http://127.0.0.1:45123/oauth/callback?code=test-code&state=wrong").unwrap();
+        let wrong_state = Url::parse("http://127.0.0.1:45123/?code=test-code&state=wrong").unwrap();
         assert!(matches!(
             request.accept_callback(&wrong_state),
             Err(OAuthError::StateMismatch)
         ));
 
         let wrong_host = Url::parse(&format!(
-            "http://localhost:45123/oauth/callback?code=test-code&state={}",
+            "http://localhost:45123/?code=test-code&state={}",
             request.expected_state()
         ))
         .unwrap();

@@ -76,3 +76,7 @@ Phase 2 closes only after:
 - the refresh token is stored in the OS keyring
 - the cursor is stored in SQLite
 - no file listing or write operation occurs
+
+## Loopback redirect URI
+
+The Desktop OAuth flow uses `http://127.0.0.1:<random-port>` with the root path. The exact same redirect URI is used for authorization and code exchange.
