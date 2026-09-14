@@ -62,3 +62,11 @@ Production secrets and private signing keys are never stored in either repositor
 Pre-alpha / Phase 0.
 
 No production NubiSync telemetry service or public Google OAuth production integration should be considered active merely because source code or design documents exist in this repository.
+
+## Support NubiSync
+
+NubiSync can be supported through GitHub Sponsors.
+
+Sponsorship is voluntary support for development and does not grant ownership, commercial-use rights, exclusivity, official status for forks, or any rights beyond those separately granted by the applicable software license or a written agreement.
+
+See `SPONSORSHIP.md`.

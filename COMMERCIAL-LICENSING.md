@@ -39,3 +39,9 @@ Until that mechanism is adopted, project maintainers should avoid merging substa
 ## No trademark license
 
 Commercial permission for software does not automatically grant rights to use the NubiSync name, logo or other project branding. See `TRADEMARKS.md`.
+
+## Sponsorship and donations
+
+Sponsorships and donations support the project but do not grant a commercial software license, ownership, exclusivity or additional intellectual-property rights.
+
+See `SPONSORSHIP.md`.
