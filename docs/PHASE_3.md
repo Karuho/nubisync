@@ -52,3 +52,11 @@ That is acceptable for NubiSync development, but production persistence must be 
 - refreshed UserInfo `sub` matches the stored account
 - access token remains memory-only
 - full workspace tests and Clippy pass
+
+## Persistent client configuration
+
+Phase 3A no longer depends on shell environment variables for the Google Desktop OAuth client.
+
+`nubisync auth google configure` prompts for the Client ID and Client Secret directly. The Client Secret input is hidden. Both values are written to the OS credential store and immediately read back; NubiSync verifies exact byte-for-byte round-trip equality without printing either value.
+
+`auth google login` and `auth google refresh` use only this persisted keyring configuration.

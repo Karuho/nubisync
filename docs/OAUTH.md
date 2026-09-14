@@ -109,7 +109,7 @@ NubiSync does not send `include_granted_scopes` in the Desktop installed-app aut
 
 Google Desktop OAuth clients include a `client_secret`. Installed desktop software cannot keep this value confidential, so it is not treated as a user credential. Current Google token-endpoint behavior may nevertheless require the value during authorization-code exchange even when PKCE is used.
 
-Development runs provide it through `NUBISYNC_GOOGLE_CLIENT_SECRET`. NubiSync does not log it, write it to telemetry, or commit it to the public repository. User refresh tokens remain actual credentials and continue to live only in the OS credential store.
+Development setup stores it interactively in the OS credential store. NubiSync does not log it, write it to telemetry, or commit it to the public repository. User refresh tokens remain actual credentials and continue to live only in the OS credential store.
 
 ## Persistent session refresh
 

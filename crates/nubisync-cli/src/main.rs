@@ -11,15 +11,13 @@ use nubisync_drive::{GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig};
 use nubisync_storage::Storage;
 use std::{
     env, fs,
+    io::{self, Write},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tiny_http::{Method, Response, Server};
 use url::Url;
-
-const GOOGLE_CLIENT_ID_ENV: &str = "NUBISYNC_GOOGLE_CLIENT_ID";
-const GOOGLE_CLIENT_SECRET_ENV: &str = "NUBISYNC_GOOGLE_CLIENT_SECRET";
 
 const REFRESH_TOKEN_PURPOSE: &str = "refresh-token";
 const OAUTH_CLIENT_SUBJECT: &str = "oauth-desktop-client";
@@ -92,14 +90,12 @@ USAGE:
   nubisync auth google logout
 
 GOOGLE DEVELOPMENT CLIENT CONFIG:
-  Store the development Desktop OAuth client in the OS credential store:
+  Store the development Desktop OAuth client directly in the OS credential store:
 
-    export NUBISYNC_GOOGLE_CLIENT_ID='...apps.googleusercontent.com'
-    export NUBISYNC_GOOGLE_CLIENT_SECRET='...'
     cargo run -p nubisync-cli -- auth google configure
-    unset NUBISYNC_GOOGLE_CLIENT_ID NUBISYNC_GOOGLE_CLIENT_SECRET
 
-  Once configured, refresh/status do not require these environment variables.
+  The command prompts for the Client ID and hides the Client Secret while typing.
+  Login, refresh, and status then use the persistent OS-keyring configuration.
 
 SECURITY:
   - Desktop OAuth client configuration is never printed
@@ -120,9 +116,8 @@ fn keyring_check() -> Result<(), CliError> {
 fn google_configure() -> Result<(), CliError> {
     ensure_keyring_available()?;
 
-    let client_id = env::var(GOOGLE_CLIENT_ID_ENV).map_err(|_| CliError::MissingGoogleClientId)?;
-    let client_secret =
-        env::var(GOOGLE_CLIENT_SECRET_ENV).map_err(|_| CliError::MissingGoogleClientSecret)?;
+    let client_id = prompt_line("Google Client ID: ")?;
+    let client_secret = rpassword::prompt_password("Google Client Secret: ")?;
 
     let _ = GoogleOAuthConfig::new(client_id.clone())?;
     validate_client_secret_text(&client_secret)?;
@@ -130,9 +125,18 @@ fn google_configure() -> Result<(), CliError> {
     let keyring = KeyringSecretStore::default();
     store_google_client_config(&keyring, &client_id, &client_secret)?;
 
+    let (stored_client_id, stored_client_secret) = load_google_client_config(&keyring)?;
+    if stored_client_id.as_bytes() != client_id.as_bytes()
+        || stored_client_secret.as_bytes() != client_secret.as_bytes()
+    {
+        return Err(CliError::StoredGoogleClientConfigMismatch);
+    }
+
     println!("GOOGLE_CLIENT_CONFIG=PASS");
     println!("CLIENT_ID_STORAGE=OS_KEYRING");
     println!("CLIENT_SECRET_STORAGE=OS_KEYRING");
+    println!("CLIENT_ID_ROUNDTRIP_MATCH=yes");
+    println!("CLIENT_SECRET_ROUNDTRIP_MATCH=yes");
     println!("CLIENT_VALUES_PRINTED=no");
 
     Ok(())
@@ -209,15 +213,7 @@ fn google_refresh() -> Result<(), CliError> {
         CliError::MissingStoredRefreshToken,
     )?;
 
-    let (client_id_key, client_secret_key) = google_client_config_keys()?;
-    let client_id = required_secret_utf8(
-        keyring.get(&client_id_key)?,
-        CliError::MissingStoredGoogleClientConfig,
-    )?;
-    let client_secret = required_secret_utf8(
-        keyring.get(&client_secret_key)?,
-        CliError::MissingStoredGoogleClientConfig,
-    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
 
     let oauth = GoogleOAuthConfig::new(client_id)?;
     let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
@@ -282,9 +278,8 @@ fn google_logout() -> Result<(), CliError> {
 fn google_login() -> Result<(), CliError> {
     ensure_keyring_available()?;
 
-    let client_id = env::var(GOOGLE_CLIENT_ID_ENV).map_err(|_| CliError::MissingGoogleClientId)?;
-    let client_secret =
-        env::var(GOOGLE_CLIENT_SECRET_ENV).map_err(|_| CliError::MissingGoogleClientSecret)?;
+    let keyring = KeyringSecretStore::default();
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
     let oauth = GoogleOAuthConfig::new(client_id.clone())?;
     validate_client_secret_text(&client_secret)?;
 
@@ -360,7 +355,6 @@ fn google_login() -> Result<(), CliError> {
         user.name.clone(),
     )?;
 
-    let keyring = KeyringSecretStore::default();
     let refresh_key = refresh_token_key(&user.sub)?;
 
     if let Some(refresh_token) = tokens.refresh_token() {
@@ -436,6 +430,20 @@ fn validate_client_secret_text(value: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+fn prompt_line(prompt: &str) -> Result<String, CliError> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+
+    while value.ends_with(['\n', '\r']) {
+        value.pop();
+    }
+
+    Ok(value)
+}
+
 fn store_google_client_config(
     keyring: &KeyringSecretStore,
     client_id: &str,
@@ -451,6 +459,20 @@ fn store_google_client_config(
         SecretValue::new(client_secret.as_bytes().to_vec())?,
     )?;
     Ok(())
+}
+
+fn load_google_client_config(keyring: &KeyringSecretStore) -> Result<(String, String), CliError> {
+    let (client_id_key, client_secret_key) = google_client_config_keys()?;
+    let client_id = required_secret_utf8(
+        keyring.get(&client_id_key)?,
+        CliError::MissingStoredGoogleClientConfig,
+    )?;
+    let client_secret = required_secret_utf8(
+        keyring.get(&client_secret_key)?,
+        CliError::MissingStoredGoogleClientConfig,
+    )?;
+
+    Ok((client_id, client_secret))
 }
 
 fn google_client_config_keys() -> Result<(SecretKey, SecretKey), CliError> {
@@ -524,10 +546,6 @@ fn unix_time_ms() -> Result<i64, CliError> {
 enum CliError {
     #[error("invalid command; run `nubisync help`")]
     InvalidArguments,
-    #[error("NUBISYNC_GOOGLE_CLIENT_ID is not set")]
-    MissingGoogleClientId,
-    #[error("NUBISYNC_GOOGLE_CLIENT_SECRET is not set")]
-    MissingGoogleClientSecret,
     #[error("Google OAuth Desktop client secret is invalid")]
     InvalidGoogleClientSecret,
     #[error("the operating-system credential store is unavailable")]
@@ -540,6 +558,8 @@ enum CliError {
     MissingStoredRefreshToken,
     #[error("stored Google OAuth client configuration is missing")]
     MissingStoredGoogleClientConfig,
+    #[error("OS keyring changed Google OAuth client configuration during round-trip")]
+    StoredGoogleClientConfigMismatch,
     #[error("stored credential contains invalid UTF-8")]
     InvalidStoredSecret,
     #[error("refreshed Google identity does not match the stored account")]

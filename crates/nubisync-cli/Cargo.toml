@@ -16,6 +16,7 @@ nubisync-auth = { path = "../nubisync-auth" }
 nubisync-core = { path = "../nubisync-core" }
 nubisync-drive = { path = "../nubisync-drive" }
 nubisync-storage = { path = "../nubisync-storage" }
+rpassword.workspace = true
 thiserror.workspace = true
 tiny_http.workspace = true
 url.workspace = true
