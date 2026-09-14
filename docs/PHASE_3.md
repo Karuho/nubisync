@@ -31,7 +31,7 @@ Inspects local session state without a network request and without printing cred
 
 `nubisync auth google refresh`
 
-Uses the stored refresh token to obtain a new short-lived access token and verifies that OpenID Connect UserInfo returns the same stable Google `sub` stored in SQLite.
+Uses the stored refresh token to obtain a new short-lived access token using the stored Desktop client ID only and verifies that OpenID Connect UserInfo returns the same stable Google `sub` stored in SQLite.
 
 `nubisync auth google logout`
 
