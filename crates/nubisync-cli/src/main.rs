@@ -6,10 +6,11 @@
 #![forbid(unsafe_code)]
 
 use nubisync_auth::{KeyringSecretStore, SecretKey, SecretStore, SecretValue};
-use nubisync_core::{ProviderAccount, ProviderId};
+use nubisync_core::{ProviderAccount, ProviderId, RemoteChange, RemoteItemKind};
 use nubisync_drive::{GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig};
 use nubisync_storage::Storage;
 use std::{
+    collections::HashSet,
     env, fs,
     io::{self, Write},
     path::PathBuf,
@@ -64,6 +65,7 @@ fn run() -> Result<(), CliError> {
         [auth, google, logout] if auth == "auth" && google == "google" && logout == "logout" => {
             google_logout()
         }
+        [drive, changes] if drive == "drive" && changes == "changes" => drive_changes(),
         [auth, keyring, check] if auth == "auth" && keyring == "keyring" && check == "check" => {
             keyring_check()
         }
@@ -88,6 +90,7 @@ USAGE:
   nubisync auth google status
   nubisync auth google refresh
   nubisync auth google logout
+  nubisync drive changes
 
 GOOGLE DEVELOPMENT CLIENT CONFIG:
   Store the development Desktop OAuth client directly in the OS credential store:
@@ -271,6 +274,118 @@ fn google_logout() -> Result<(), CliError> {
     println!("REFRESH_TOKEN_REMOVED=yes");
     println!("CLIENT_CONFIG_RETAINED=yes");
     println!("LOCAL_METADATA_RETAINED=yes");
+
+    Ok(())
+}
+
+fn drive_changes() -> Result<(), CliError> {
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    let cursor = storage
+        .load_cursor(&provider, &account.subject)?
+        .ok_or(CliError::MissingStoredDriveCursor)?;
+
+    let mut continuation = None;
+    let mut seen_continuations = HashSet::new();
+    let mut pages_fetched = 0_u64;
+    let mut changes_total = 0_u64;
+    let mut upserts = 0_u64;
+    let mut deletes = 0_u64;
+    let mut files = 0_u64;
+    let mut folders = 0_u64;
+    let mut trashed = 0_u64;
+
+    let checkpoint = loop {
+        if pages_fetched >= 10_000 {
+            return Err(CliError::DriveChangePageLimitExceeded);
+        }
+
+        let page = api.list_changes_page(&cursor, continuation.as_ref())?;
+        pages_fetched += 1;
+
+        for change in page.changes {
+            changes_total += 1;
+
+            match change {
+                RemoteChange::Delete { .. } => {
+                    deletes += 1;
+                }
+                RemoteChange::Upsert(item) => {
+                    upserts += 1;
+
+                    if item.trashed {
+                        trashed += 1;
+                    }
+
+                    match item.kind {
+                        RemoteItemKind::File => files += 1,
+                        RemoteItemKind::Folder => folders += 1,
+                    }
+                }
+            }
+        }
+
+        match (page.continuation, page.checkpoint) {
+            (Some(next), None) => {
+                if !seen_continuations.insert(next.as_str().to_owned()) {
+                    return Err(CliError::DriveChangePaginationLoop);
+                }
+                continuation = Some(next);
+            }
+            (None, Some(checkpoint)) => break checkpoint,
+            _ => return Err(CliError::DriveChangeStreamMissingCheckpoint),
+        }
+    };
+
+    let cursor_changed = checkpoint != cursor;
+    storage.save_cursor(&provider, &account.subject, &checkpoint, unix_time_ms()?)?;
+
+    println!("DRIVE_CHANGES=PASS");
+    println!("PAGES_FETCHED={pages_fetched}");
+    println!("CHANGES_TOTAL={changes_total}");
+    println!("UPSERTS={upserts}");
+    println!("DELETES={deletes}");
+    println!("FILES={files}");
+    println!("FOLDERS={folders}");
+    println!("TRASHED={trashed}");
+    println!("CHECKPOINT_COMMITTED=yes");
+    println!("CURSOR_CHANGED={}", yes_no(cursor_changed));
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
 }
@@ -556,6 +671,14 @@ enum CliError {
     MultipleGoogleAccountsUnsupported,
     #[error("stored Google refresh token is missing")]
     MissingStoredRefreshToken,
+    #[error("stored Google Drive change cursor is missing")]
+    MissingStoredDriveCursor,
+    #[error("Google Drive change pagination repeated a continuation token")]
+    DriveChangePaginationLoop,
+    #[error("Google Drive change pagination exceeded the safety limit")]
+    DriveChangePageLimitExceeded,
+    #[error("Google Drive change stream ended without a durable checkpoint")]
+    DriveChangeStreamMissingCheckpoint,
     #[error("stored Google OAuth client configuration is missing")]
     MissingStoredGoogleClientConfig,
     #[error("OS keyring changed Google OAuth client configuration during round-trip")]

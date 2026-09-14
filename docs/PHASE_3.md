@@ -60,3 +60,44 @@ Phase 3A no longer depends on shell environment variables for the Google Desktop
 `nubisync auth google configure` prompts for the Client ID and Client Secret directly. The Client Secret input is hidden. Both values are written to the OS credential store and immediately read back; NubiSync verifies exact byte-for-byte round-trip equality without printing either value.
 
 `auth google login` and `auth google refresh` use only this persisted keyring configuration.
+
+## Phase 3B — Incremental Google Drive change journal
+
+NubiSync now consumes the Google Drive `changes` collection using the durable start-page token already stored in SQLite.
+
+The command is:
+
+`nubisync drive changes`
+
+Behavior:
+
+- refreshes the short-lived Google access token from the OS credential store
+- verifies the refreshed Google `sub` matches the SQLite account
+- loads the durable Drive cursor from SQLite
+- calls `changes.list` with `spaces=drive`, `includeRemoved=true`, and `restrictToMyDrive=true`
+- follows every `nextPageToken`
+- treats `nextPageToken` as short-lived pagination state only
+- accepts `newStartPageToken` only on the final page
+- commits the new durable cursor to SQLite only after every page has been parsed successfully
+- does not request file content
+- does not write to Google Drive
+- does not print filenames, Drive IDs, page tokens, or cursor values
+
+The current implementation maps visible file metadata changes into the provider-neutral `RemoteChange` model. Removed entries become `Delete`; current file/folder states become `Upsert`.
+
+For this subphase, `modified_unix_ms` remains unset because timestamp normalization belongs in a later metadata-normalization step.
+
+### Failure behavior
+
+A malformed change page, repeated continuation token, excessive pagination, account mismatch, refresh failure, or missing final checkpoint aborts the run without advancing the durable cursor.
+
+This makes a retry re-read the uncommitted change range instead of silently skipping it.
+
+### Exit criteria
+
+- `nubisync drive changes` succeeds against the real Google account
+- a no-change poll safely commits the returned checkpoint
+- a manually created or renamed My Drive item produces at least one incremental change on the next poll
+- no file content is downloaded
+- no Drive write is performed
+- no filename, remote ID, OAuth credential, page token, or cursor is printed
