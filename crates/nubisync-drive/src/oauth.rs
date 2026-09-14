@@ -156,7 +156,12 @@ impl GoogleOAuthConfig {
         })
     }
 
-    pub fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuthTokens, OAuthError> {
+    pub fn refresh_access_token(
+        &self,
+        refresh_token: &str,
+        client_secret: &str,
+    ) -> Result<OAuthTokens, OAuthError> {
+        validate_runtime_secret(client_secret, OAuthError::InvalidClientSecret)?;
         validate_runtime_secret(refresh_token, OAuthError::InvalidRefreshToken)?;
 
         let client = reqwest::blocking::Client::builder()
@@ -167,6 +172,7 @@ impl GoogleOAuthConfig {
             .post(GOOGLE_OAUTH_TOKEN_ENDPOINT)
             .form(&[
                 ("client_id", self.client_id.as_str()),
+                ("client_secret", client_secret),
                 ("refresh_token", refresh_token),
                 ("grant_type", "refresh_token"),
             ])
@@ -460,7 +466,9 @@ mod tests {
     #[test]
     fn refresh_rejects_empty_stored_refresh_token_before_network() {
         let config = GoogleOAuthConfig::new("123.apps.googleusercontent.com").unwrap();
-        let error = config.refresh_access_token("").unwrap_err();
+        let error = config
+            .refresh_access_token("", "desktop-client-secret")
+            .unwrap_err();
 
         assert!(matches!(error, OAuthError::InvalidRefreshToken));
     }

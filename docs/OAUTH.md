@@ -118,10 +118,9 @@ A successful offline authorization stores the Google refresh token in the OS cre
 NubiSync later refreshes the short-lived access token by POSTing to Google's token endpoint with:
 
 - `client_id`
+- Desktop `client_secret`
 - `refresh_token`
 - `grant_type=refresh_token`
-
-For the Installed App refresh flow, NubiSync deliberately omits the Desktop `client_secret`. Google's installed-app documentation marks that parameter as optional and its refresh example omits it.
 
 The resulting access token remains memory-only.
 

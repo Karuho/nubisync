@@ -209,14 +209,18 @@ fn google_refresh() -> Result<(), CliError> {
         CliError::MissingStoredRefreshToken,
     )?;
 
-    let (client_id_key, _) = google_client_config_keys()?;
+    let (client_id_key, client_secret_key) = google_client_config_keys()?;
     let client_id = required_secret_utf8(
         keyring.get(&client_id_key)?,
         CliError::MissingStoredGoogleClientConfig,
     )?;
+    let client_secret = required_secret_utf8(
+        keyring.get(&client_secret_key)?,
+        CliError::MissingStoredGoogleClientConfig,
+    )?;
 
     let oauth = GoogleOAuthConfig::new(client_id)?;
-    let tokens = oauth.refresh_access_token(&refresh_token)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
 
     if let Some(rotated_refresh_token) = tokens.refresh_token() {
         keyring.put(
