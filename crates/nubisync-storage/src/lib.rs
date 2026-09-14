@@ -135,6 +135,40 @@ impl Storage {
         Ok(())
     }
 
+    pub fn list_accounts(
+        &self,
+        provider: &ProviderId,
+    ) -> Result<Vec<ProviderAccount>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT subject, email, display_name
+            FROM accounts
+            WHERE provider = ?1
+            ORDER BY created_at_unix_ms ASC, subject ASC
+            ",
+        )?;
+
+        let rows = statement.query_map(params![provider.as_str()], |row| {
+            let subject: String = row.get(0)?;
+            let email: Option<String> = row.get(1)?;
+            let display_name: Option<String> = row.get(2)?;
+            Ok((subject, email, display_name))
+        })?;
+
+        let mut accounts = Vec::new();
+        for row in rows {
+            let (subject, email, display_name) = row?;
+            accounts.push(ProviderAccount::new(
+                provider.clone(),
+                subject,
+                email,
+                display_name,
+            )?);
+        }
+
+        Ok(accounts)
+    }
+
     pub fn save_cursor(
         &self,
         provider: &ProviderId,
@@ -203,6 +237,26 @@ mod tests {
     fn migration_is_applied_transactionally() {
         let storage = Storage::open_in_memory().unwrap();
         assert_eq!(storage.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn accounts_can_be_loaded_for_persistent_session_discovery() {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = ProviderAccount::new(
+            provider.clone(),
+            "google-subject-123",
+            Some("user@example.test".into()),
+            Some("Test User".into()),
+        )
+        .unwrap();
+
+        storage.upsert_account(&account, 1_700_000_000_000).unwrap();
+
+        let accounts = storage.list_accounts(&provider).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].subject, "google-subject-123");
+        assert_eq!(accounts[0].email.as_deref(), Some("user@example.test"));
     }
 
     #[test]

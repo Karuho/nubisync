@@ -20,7 +20,11 @@ use url::Url;
 
 const GOOGLE_CLIENT_ID_ENV: &str = "NUBISYNC_GOOGLE_CLIENT_ID";
 const GOOGLE_CLIENT_SECRET_ENV: &str = "NUBISYNC_GOOGLE_CLIENT_SECRET";
+
 const REFRESH_TOKEN_PURPOSE: &str = "refresh-token";
+const OAUTH_CLIENT_SUBJECT: &str = "oauth-desktop-client";
+const OAUTH_CLIENT_ID_PURPOSE: &str = "client-id";
+const OAUTH_CLIENT_SECRET_PURPOSE: &str = "client-secret";
 
 fn main() {
     if let Err(error) = run() {
@@ -48,6 +52,20 @@ fn run() -> Result<(), CliError> {
         [auth, google, login] if auth == "auth" && google == "google" && login == "login" => {
             google_login()
         }
+        [auth, google, configure]
+            if auth == "auth" && google == "google" && configure == "configure" =>
+        {
+            google_configure()
+        }
+        [auth, google, status] if auth == "auth" && google == "google" && status == "status" => {
+            google_status()
+        }
+        [auth, google, refresh] if auth == "auth" && google == "google" && refresh == "refresh" => {
+            google_refresh()
+        }
+        [auth, google, logout] if auth == "auth" && google == "google" && logout == "logout" => {
+            google_logout()
+        }
         [auth, keyring, check] if auth == "auth" && keyring == "keyring" && check == "check" => {
             keyring_check()
         }
@@ -68,41 +86,207 @@ USAGE:
   nubisync --version
   nubisync auth keyring check
   nubisync auth google login
+  nubisync auth google configure
+  nubisync auth google status
+  nubisync auth google refresh
+  nubisync auth google logout
 
-GOOGLE DEVELOPMENT LOGIN:
-  Set the public OAuth Desktop client ID in the environment:
+GOOGLE DEVELOPMENT CLIENT CONFIG:
+  Store the development Desktop OAuth client in the OS credential store:
 
     export NUBISYNC_GOOGLE_CLIENT_ID='...apps.googleusercontent.com'
     export NUBISYNC_GOOGLE_CLIENT_SECRET='...'
-    cargo run -p nubisync-cli -- auth google login
+    cargo run -p nubisync-cli -- auth google configure
+    unset NUBISYNC_GOOGLE_CLIENT_ID NUBISYNC_GOOGLE_CLIENT_SECRET
+
+  Once configured, refresh/status do not require these environment variables.
 
 SECURITY:
-  - the Desktop OAuth client secret is supplied at runtime and is never logged
-  - refresh tokens are stored in the OS credential store
-  - this Phase 2 command requests metadata-only Drive access
-  - it does not list filenames, download files, or write to Drive
+  - Desktop OAuth client configuration is never printed
+  - user refresh tokens are stored in the OS credential store
+  - access tokens remain memory-only
+  - auth status performs no network request
+  - logout removes the user refresh token but retains local sync metadata
 "
     );
 }
 
 fn keyring_check() -> Result<(), CliError> {
-    if KeyringSecretStore::is_available() {
-        println!("KEYRING_STATUS=AVAILABLE");
-        Ok(())
-    } else {
-        Err(CliError::KeyringUnavailable)
-    }
+    ensure_keyring_available()?;
+    println!("KEYRING_STATUS=AVAILABLE");
+    Ok(())
 }
 
-fn google_login() -> Result<(), CliError> {
-    if !KeyringSecretStore::is_available() {
-        return Err(CliError::KeyringUnavailable);
-    }
+fn google_configure() -> Result<(), CliError> {
+    ensure_keyring_available()?;
 
     let client_id = env::var(GOOGLE_CLIENT_ID_ENV).map_err(|_| CliError::MissingGoogleClientId)?;
     let client_secret =
         env::var(GOOGLE_CLIENT_SECRET_ENV).map_err(|_| CliError::MissingGoogleClientSecret)?;
+
+    let _ = GoogleOAuthConfig::new(client_id.clone())?;
+    validate_client_secret_text(&client_secret)?;
+
+    let keyring = KeyringSecretStore::default();
+    store_google_client_config(&keyring, &client_id, &client_secret)?;
+
+    println!("GOOGLE_CLIENT_CONFIG=PASS");
+    println!("CLIENT_ID_STORAGE=OS_KEYRING");
+    println!("CLIENT_SECRET_STORAGE=OS_KEYRING");
+    println!("CLIENT_VALUES_PRINTED=no");
+
+    Ok(())
+}
+
+fn google_status() -> Result<(), CliError> {
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        println!("GOOGLE_STATUS=NOT_CONNECTED");
+        println!("DATABASE_PRESENT=no");
+        println!("NETWORK_CHECK=not_performed");
+        return Ok(());
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let accounts = storage.list_accounts(&provider)?;
+
+    if accounts.is_empty() {
+        println!("GOOGLE_STATUS=NOT_CONNECTED");
+        println!("DATABASE_PRESENT=yes");
+        println!("NETWORK_CHECK=not_performed");
+        return Ok(());
+    }
+
+    let account = single_google_account(accounts)?;
+    let keyring = KeyringSecretStore::default();
+
+    let refresh_present = keyring
+        .get(&refresh_token_key(&account.subject)?)?
+        .is_some();
+    let (client_id_key, client_secret_key) = google_client_config_keys()?;
+    let client_id_present = keyring.get(&client_id_key)?.is_some();
+    let client_secret_present = keyring.get(&client_secret_key)?.is_some();
+    let client_config_present = client_id_present && client_secret_present;
+
+    let status = if refresh_present && client_config_present {
+        "CONNECTED"
+    } else {
+        "INCOMPLETE"
+    };
+
+    println!("GOOGLE_STATUS={status}");
+    println!(
+        "ACCOUNT_EMAIL={}",
+        account.email.as_deref().unwrap_or("(not returned)")
+    );
+    println!("REFRESH_TOKEN_PRESENT={}", yes_no(refresh_present));
+    println!("CLIENT_CONFIG_PRESENT={}", yes_no(client_config_present));
+    println!("DATABASE_PRESENT=yes");
+    println!("NETWORK_CHECK=not_performed");
+
+    Ok(())
+}
+
+fn google_refresh() -> Result<(), CliError> {
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+
+    let (client_id_key, client_secret_key) = google_client_config_keys()?;
+    let client_id = required_secret_utf8(
+        keyring.get(&client_id_key)?,
+        CliError::MissingStoredGoogleClientConfig,
+    )?;
+    let client_secret = required_secret_utf8(
+        keyring.get(&client_secret_key)?,
+        CliError::MissingStoredGoogleClientConfig,
+    )?;
+
     let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("GOOGLE_REFRESH=PASS");
+    println!("ACCOUNT_SUBJECT_MATCH=yes");
+    println!("ACCESS_TOKEN_STORAGE=memory_only");
+    println!("REFRESH_TOKEN_STORAGE=OS_KEYRING");
+    println!(
+        "REFRESH_TOKEN_ROTATED={}",
+        yes_no(tokens.refresh_token().is_some())
+    );
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn google_logout() -> Result<(), CliError> {
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        println!("GOOGLE_LOGOUT=NOT_CONNECTED");
+        return Ok(());
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let accounts = storage.list_accounts(&provider)?;
+
+    if accounts.is_empty() {
+        println!("GOOGLE_LOGOUT=NOT_CONNECTED");
+        return Ok(());
+    }
+
+    let account = single_google_account(accounts)?;
+    let keyring = KeyringSecretStore::default();
+    keyring.delete(&refresh_token_key(&account.subject)?)?;
+
+    println!("GOOGLE_LOGOUT=PASS");
+    println!("REFRESH_TOKEN_REMOVED=yes");
+    println!("CLIENT_CONFIG_RETAINED=yes");
+    println!("LOCAL_METADATA_RETAINED=yes");
+
+    Ok(())
+}
+
+fn google_login() -> Result<(), CliError> {
+    ensure_keyring_available()?;
+
+    let client_id = env::var(GOOGLE_CLIENT_ID_ENV).map_err(|_| CliError::MissingGoogleClientId)?;
+    let client_secret =
+        env::var(GOOGLE_CLIENT_SECRET_ENV).map_err(|_| CliError::MissingGoogleClientSecret)?;
+    let oauth = GoogleOAuthConfig::new(client_id.clone())?;
+    validate_client_secret_text(&client_secret)?;
 
     let server = Server::http("127.0.0.1:0").map_err(|_| CliError::LoopbackBindFailed)?;
     let listen_addr = server
@@ -177,7 +361,7 @@ fn google_login() -> Result<(), CliError> {
     )?;
 
     let keyring = KeyringSecretStore::default();
-    let refresh_key = SecretKey::new("google-drive", &user.sub, REFRESH_TOKEN_PURPOSE)?;
+    let refresh_key = refresh_token_key(&user.sub)?;
 
     if let Some(refresh_token) = tokens.refresh_token() {
         keyring.put(
@@ -187,6 +371,8 @@ fn google_login() -> Result<(), CliError> {
     } else if keyring.get(&refresh_key)?.is_none() {
         return Err(CliError::MissingRefreshToken);
     }
+
+    store_google_client_config(&keyring, &client_id, &client_secret)?;
 
     let probe = api.probe()?;
 
@@ -210,6 +396,7 @@ fn google_login() -> Result<(), CliError> {
         user.name.as_deref().unwrap_or("(not returned)")
     );
     println!("REFRESH_TOKEN_STORAGE=OS_KEYRING");
+    println!("CLIENT_CONFIG_STORAGE=OS_KEYRING");
     println!("DRIVE_WRITE_ACCESS=no");
     println!("DRIVE_FILE_LISTING_PERFORMED=no");
     println!("DRIVE_CHANGE_CURSOR_STORED=yes");
@@ -228,6 +415,89 @@ fn google_login() -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+fn ensure_keyring_available() -> Result<(), CliError> {
+    if KeyringSecretStore::is_available() {
+        Ok(())
+    } else {
+        Err(CliError::KeyringUnavailable)
+    }
+}
+
+fn validate_client_secret_text(value: &str) -> Result<(), CliError> {
+    if value.trim().is_empty()
+        || value.len() != value.trim().len()
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err(CliError::InvalidGoogleClientSecret);
+    }
+
+    Ok(())
+}
+
+fn store_google_client_config(
+    keyring: &KeyringSecretStore,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<(), CliError> {
+    let (client_id_key, client_secret_key) = google_client_config_keys()?;
+    keyring.put(
+        &client_id_key,
+        SecretValue::new(client_id.as_bytes().to_vec())?,
+    )?;
+    keyring.put(
+        &client_secret_key,
+        SecretValue::new(client_secret.as_bytes().to_vec())?,
+    )?;
+    Ok(())
+}
+
+fn google_client_config_keys() -> Result<(SecretKey, SecretKey), CliError> {
+    Ok((
+        SecretKey::new(
+            "google-drive",
+            OAUTH_CLIENT_SUBJECT,
+            OAUTH_CLIENT_ID_PURPOSE,
+        )?,
+        SecretKey::new(
+            "google-drive",
+            OAUTH_CLIENT_SUBJECT,
+            OAUTH_CLIENT_SECRET_PURPOSE,
+        )?,
+    ))
+}
+
+fn refresh_token_key(account_subject: &str) -> Result<SecretKey, CliError> {
+    Ok(SecretKey::new(
+        "google-drive",
+        account_subject,
+        REFRESH_TOKEN_PURPOSE,
+    )?)
+}
+
+fn required_secret_utf8(
+    secret: Option<SecretValue>,
+    missing_error: CliError,
+) -> Result<String, CliError> {
+    let secret = secret.ok_or(missing_error)?;
+    String::from_utf8(secret.expose_bytes().to_vec()).map_err(|_| CliError::InvalidStoredSecret)
+}
+
+fn single_google_account(accounts: Vec<ProviderAccount>) -> Result<ProviderAccount, CliError> {
+    match accounts.len() {
+        0 => Err(CliError::NoLocalGoogleAccount),
+        1 => Ok(accounts.into_iter().next().expect("length checked")),
+        _ => Err(CliError::MultipleGoogleAccountsUnsupported),
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn nubisync_database_path() -> Result<PathBuf, CliError> {
+    Ok(nubisync_data_dir()?.join("nubisync.db"))
 }
 
 fn nubisync_data_dir() -> Result<PathBuf, CliError> {
@@ -258,8 +528,22 @@ enum CliError {
     MissingGoogleClientId,
     #[error("NUBISYNC_GOOGLE_CLIENT_SECRET is not set")]
     MissingGoogleClientSecret,
+    #[error("Google OAuth Desktop client secret is invalid")]
+    InvalidGoogleClientSecret,
     #[error("the operating-system credential store is unavailable")]
     KeyringUnavailable,
+    #[error("no local Google account is configured")]
+    NoLocalGoogleAccount,
+    #[error("multiple Google accounts are not supported in this NubiSync alpha")]
+    MultipleGoogleAccountsUnsupported,
+    #[error("stored Google refresh token is missing")]
+    MissingStoredRefreshToken,
+    #[error("stored Google OAuth client configuration is missing")]
+    MissingStoredGoogleClientConfig,
+    #[error("stored credential contains invalid UTF-8")]
+    InvalidStoredSecret,
+    #[error("refreshed Google identity does not match the stored account")]
+    GoogleAccountMismatch,
     #[error("failed to bind the OAuth callback to loopback")]
     LoopbackBindFailed,
     #[error("failed to open the system browser")]

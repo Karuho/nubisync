@@ -155,6 +155,53 @@ impl GoogleOAuthConfig {
             scope: response.scope,
         })
     }
+
+    pub fn refresh_access_token(
+        &self,
+        refresh_token: &str,
+        client_secret: &str,
+    ) -> Result<OAuthTokens, OAuthError> {
+        validate_runtime_secret(client_secret, OAuthError::InvalidClientSecret)?;
+        validate_runtime_secret(refresh_token, OAuthError::InvalidRefreshToken)?;
+
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(concat!("NubiSync/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+
+        let response = client
+            .post(GOOGLE_OAUTH_TOKEN_ENDPOINT)
+            .form(&[
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", client_secret),
+                ("refresh_token", refresh_token),
+                ("grant_type", "refresh_token"),
+            ])
+            .send()?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_code = response
+                .json::<TokenErrorResponse>()
+                .ok()
+                .and_then(|body| sanitize_oauth_error_code(&body.error))
+                .unwrap_or_else(|| "unknown_error".to_owned());
+
+            return Err(OAuthError::TokenEndpointRejected {
+                status: status.as_u16(),
+                code: error_code,
+            });
+        }
+
+        let response: TokenResponse = response.json()?;
+
+        Ok(OAuthTokens {
+            access_token: OAuthAccessToken(response.access_token),
+            refresh_token: response.refresh_token.map(OAuthRefreshToken),
+            expires_in_seconds: response.expires_in,
+            token_type: response.token_type,
+            scope: response.scope,
+        })
+    }
 }
 
 pub struct OAuthAuthorization {
@@ -340,6 +387,17 @@ struct TokenResponse {
     token_type: String,
 }
 
+fn validate_runtime_secret(value: &str, error: OAuthError) -> Result<(), OAuthError> {
+    if value.trim().is_empty()
+        || value.len() != value.trim().len()
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err(error);
+    }
+
+    Ok(())
+}
+
 fn random_base64url_32_bytes() -> String {
     let mut random = [0_u8; 32];
     OsRng.fill_bytes(&mut random);
@@ -352,6 +410,8 @@ pub enum OAuthError {
     InvalidClientId,
     #[error("Google OAuth Desktop client secret is invalid")]
     InvalidClientSecret,
+    #[error("stored Google OAuth refresh token is invalid")]
+    InvalidRefreshToken,
     #[error("loopback port must be a non-zero local port")]
     InvalidLoopbackPort,
     #[error("OAuth callback origin or path is invalid")]
@@ -401,6 +461,16 @@ mod tests {
             .exchange_code(&authorization, "test-code", "")
             .unwrap_err();
         assert!(matches!(error, OAuthError::InvalidClientSecret));
+    }
+
+    #[test]
+    fn refresh_rejects_empty_stored_refresh_token_before_network() {
+        let config = GoogleOAuthConfig::new("123.apps.googleusercontent.com").unwrap();
+        let error = config
+            .refresh_access_token("", "desktop-client-secret")
+            .unwrap_err();
+
+        assert!(matches!(error, OAuthError::InvalidRefreshToken));
     }
 
     #[test]
