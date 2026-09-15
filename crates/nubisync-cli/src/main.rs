@@ -336,11 +336,14 @@ fn drive_inventory() -> Result<(), CliError> {
         println!("DRIVE_INVENTORY_FETCH_PAGE={page_number}");
         let page = api.list_inventory_page(continuation.as_ref())?;
         pages_fetched += 1;
-        println!("DRIVE_INVENTORY_PAGE_COMPLETE={pages_fetched}");
         supported_items += page.supported_items;
         files += page.file_count;
         folders += page.folder_count;
         unsupported_provider_native += page.unsupported_provider_native;
+        println!(
+            "DRIVE_INVENTORY_PAGE_COMPLETE={} SUPPORTED_SO_FAR={} FILES_SO_FAR={} FOLDERS_SO_FAR={} UNSUPPORTED_NATIVE_SO_FAR={}",
+            pages_fetched, supported_items, files, folders, unsupported_provider_native
+        );
 
         match page.continuation {
             Some(next) => {

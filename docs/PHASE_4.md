@@ -39,6 +39,14 @@ The Drive API client now uses:
 
 - 10-second connection timeout
 - 60-second total request timeout
-- 100 items per metadata inventory page during the probe
+- 1000 items per metadata inventory page during the probe
 
 `drive inventory` also emits privacy-safe stage/page counters. It still does not print filenames, Drive IDs, cursor values, page tokens, or OAuth credentials.
+
+### Inventory page sizing
+
+The runtime probe showed that the account can legitimately span many inventory pages.
+Phase 4A therefore uses Drive's maximum documented `files.list` page size of 1000
+to reduce request count while preserving pagination correctness. Progress output
+includes cumulative counts so long inventories are visibly advancing rather than
+appearing stalled.

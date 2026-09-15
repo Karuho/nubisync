@@ -116,7 +116,7 @@ impl GoogleDriveApi {
                 ("q", "'me' in owners and trashed = false"),
                 ("corpora", "user"),
                 ("spaces", "drive"),
-                ("pageSize", "100"),
+                ("pageSize", "1000"),
                 ("fields", GOOGLE_DRIVE_INVENTORY_FIELDS),
             ]);
 
