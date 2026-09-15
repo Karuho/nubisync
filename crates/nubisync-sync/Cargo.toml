@@ -8,4 +8,4 @@ license-file = "../../LICENSE"
 repository.workspace = true
 
 [dependencies]
-serde.workspace = true
+nubisync-core = { path = "../nubisync-core" }

@@ -3,7 +3,8 @@
 #![forbid(unsafe_code)]
 
 use nubisync_core::{
-    ChangeCursor, ProviderAccount, ProviderId, RemoteChange, RemoteItem, RemoteItemKind,
+    ChangeCursor, ProviderAccount, ProviderId, RemoteChange, RemoteItem, RemoteItemKind, SyncMode,
+    SyncRoot,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
@@ -287,6 +288,97 @@ impl Storage {
         }
 
         Ok(accounts)
+    }
+
+    pub fn upsert_sync_root(&self, root: &SyncRoot) -> Result<(), StorageError> {
+        self.connection.execute(
+            "INSERT INTO sync_roots (
+                id,
+                provider,
+                account_subject,
+                local_path,
+                remote_root_id,
+                mode,
+                created_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                provider = excluded.provider,
+                account_subject = excluded.account_subject,
+                local_path = excluded.local_path,
+                remote_root_id = excluded.remote_root_id,
+                mode = excluded.mode",
+            params![
+                root.id,
+                root.provider.as_str(),
+                root.account_subject,
+                root.local_path,
+                root.remote_root_id,
+                root.mode.as_str(),
+                root.created_at_unix_ms
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn list_sync_roots(
+        &self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<Vec<SyncRoot>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                id,
+                local_path,
+                remote_root_id,
+                mode,
+                created_at_unix_ms
+             FROM sync_roots
+             WHERE provider = ?1 AND account_subject = ?2
+             ORDER BY created_at_unix_ms ASC, id ASC",
+        )?;
+
+        let rows = statement.query_map(params![provider.as_str(), account_subject], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+
+        let mut roots = Vec::new();
+        for row in rows {
+            let (id, local_path, remote_root_id, mode, created_at_unix_ms) = row?;
+            roots.push(SyncRoot::new(
+                id,
+                provider.clone(),
+                account_subject,
+                local_path,
+                remote_root_id,
+                SyncMode::parse(&mode)?,
+                created_at_unix_ms,
+            )?);
+        }
+
+        Ok(roots)
+    }
+
+    pub fn sync_root_count(
+        &self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM sync_roots
+             WHERE provider = ?1 AND account_subject = ?2",
+            params![provider.as_str(), account_subject],
+            |row| row.get(0),
+        )?;
+
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
     }
 
     pub fn save_cursor(
@@ -1006,6 +1098,39 @@ mod tests {
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].subject, "google-subject-123");
         assert_eq!(accounts[0].email.as_deref(), Some("user@example.test"));
+    }
+
+    #[test]
+    fn sync_root_round_trip_uses_typed_mode() {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "sync-root-1",
+            provider.clone(),
+            account.subject.clone(),
+            "/tmp/nubisync-test",
+            Some("drive-folder-1".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+
+        storage.upsert_sync_root(&root).unwrap();
+
+        let roots = storage
+            .list_sync_roots(&provider, &account.subject)
+            .unwrap();
+
+        assert_eq!(roots, vec![root]);
+        assert_eq!(
+            storage
+                .sync_root_count(&provider, &account.subject)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

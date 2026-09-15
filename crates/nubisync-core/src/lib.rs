@@ -121,6 +121,88 @@ impl fmt::Debug for ContinuationToken {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncMode {
+    TwoWay,
+    MirrorLocalToRemote,
+    ReceiveOnly,
+}
+
+impl SyncMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoWay => "two_way",
+            Self::MirrorLocalToRemote => "mirror_local_to_remote",
+            Self::ReceiveOnly => "receive_only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CoreError> {
+        match value {
+            "two_way" => Ok(Self::TwoWay),
+            "mirror_local_to_remote" => Ok(Self::MirrorLocalToRemote),
+            "receive_only" => Ok(Self::ReceiveOnly),
+            _ => Err(CoreError::InvalidSyncMode),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncRoot {
+    pub id: String,
+    pub provider: ProviderId,
+    pub account_subject: String,
+    pub local_path: String,
+    pub remote_root_id: Option<String>,
+    pub mode: SyncMode,
+    pub created_at_unix_ms: i64,
+}
+
+impl SyncRoot {
+    pub fn new(
+        id: impl Into<String>,
+        provider: ProviderId,
+        account_subject: impl Into<String>,
+        local_path: impl Into<String>,
+        remote_root_id: Option<String>,
+        mode: SyncMode,
+        created_at_unix_ms: i64,
+    ) -> Result<Self, CoreError> {
+        let id = id.into();
+        let account_subject = account_subject.into();
+        let local_path = local_path.into();
+
+        if id.trim().is_empty() || id.len() > 128 {
+            return Err(CoreError::InvalidSyncRootId);
+        }
+
+        if account_subject.trim().is_empty() {
+            return Err(CoreError::InvalidAccountSubject);
+        }
+
+        if local_path.trim().is_empty() {
+            return Err(CoreError::InvalidSyncRootLocalPath);
+        }
+
+        if remote_root_id
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(CoreError::InvalidRemoteRootId);
+        }
+
+        Ok(Self {
+            id,
+            provider,
+            account_subject,
+            local_path,
+            remote_root_id,
+            mode,
+            created_at_unix_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteItemKind {
     File,
     Folder,
@@ -179,6 +261,14 @@ pub enum CoreError {
     InvalidCursor,
     #[error("continuation token is invalid")]
     InvalidContinuationToken,
+    #[error("sync mode is invalid")]
+    InvalidSyncMode,
+    #[error("sync root id is invalid")]
+    InvalidSyncRootId,
+    #[error("sync root local path is invalid")]
+    InvalidSyncRootLocalPath,
+    #[error("sync root remote id is invalid")]
+    InvalidRemoteRootId,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -207,6 +297,49 @@ mod tests {
         assert_eq!(
             ProviderId::new("Google Drive"),
             Err(CoreError::InvalidProviderId)
+        );
+    }
+
+    #[test]
+    fn sync_mode_storage_names_round_trip() {
+        for mode in [
+            SyncMode::TwoWay,
+            SyncMode::MirrorLocalToRemote,
+            SyncMode::ReceiveOnly,
+        ] {
+            assert_eq!(SyncMode::parse(mode.as_str()).unwrap(), mode);
+        }
+        assert_eq!(SyncMode::parse("invalid"), Err(CoreError::InvalidSyncMode));
+    }
+
+    #[test]
+    fn sync_root_rejects_empty_local_path_and_remote_id() {
+        let provider = ProviderId::new("google-drive").unwrap();
+
+        assert_eq!(
+            SyncRoot::new(
+                "root-1",
+                provider.clone(),
+                "subject",
+                "   ",
+                Some("remote".into()),
+                SyncMode::ReceiveOnly,
+                1,
+            ),
+            Err(CoreError::InvalidSyncRootLocalPath)
+        );
+
+        assert_eq!(
+            SyncRoot::new(
+                "root-1",
+                provider,
+                "subject",
+                "/tmp/nubisync",
+                Some("   ".into()),
+                SyncMode::ReceiveOnly,
+                1,
+            ),
+            Err(CoreError::InvalidRemoteRootId)
         );
     }
 

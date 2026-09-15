@@ -65,6 +65,9 @@ fn run() -> Result<(), CliError> {
         [auth, google, logout] if auth == "auth" && google == "google" && logout == "logout" => {
             google_logout()
         }
+        [sync, roots, status] if sync == "sync" && roots == "roots" && status == "status" => {
+            sync_roots_status()
+        }
         [drive, changes] if drive == "drive" && changes == "changes" => drive_changes(),
         [drive, catalog, status]
             if drive == "drive" && catalog == "catalog" && status == "status" =>
@@ -123,6 +126,7 @@ USAGE:
   nubisync auth google status
   nubisync auth google refresh
   nubisync auth google logout
+  nubisync sync roots status
   nubisync drive changes
   nubisync drive catalog status
   nubisync drive catalog catchup
@@ -314,6 +318,34 @@ fn google_logout() -> Result<(), CliError> {
     println!("REFRESH_TOKEN_REMOVED=yes");
     println!("CLIENT_CONFIG_RETAINED=yes");
     println!("LOCAL_METADATA_RETAINED=yes");
+
+    Ok(())
+}
+
+fn sync_roots_status() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    let with_remote_root = roots
+        .iter()
+        .filter(|root| root.remote_root_id.is_some())
+        .count();
+
+    println!("SYNC_ROOTS_STATUS=PASS");
+    println!("CONFIGURED_ROOTS={}", roots.len());
+    println!("REMOTE_ROOTS_CONFIGURED={with_remote_root}");
+    println!("ROOT_PATHS_PRINTED=no");
+    println!("REMOTE_ROOT_IDS_PRINTED=no");
+    println!("NETWORK_CHECK=not_performed");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
 }

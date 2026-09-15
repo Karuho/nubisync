@@ -2,14 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SyncMode {
-    TwoWay,
-    MirrorLocalToRemote,
-    ReceiveOnly,
-}
+pub use nubisync_core::SyncMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Divergence {

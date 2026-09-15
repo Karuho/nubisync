@@ -238,3 +238,30 @@ A bounded traversal can report `TRAVERSAL_COMPLETE=no`; that is expected wheneve
 the hard limit is reached before the selected tree has been exhausted.
 
 This traversal is the provider-side foundation for a durable sync root.
+
+## Phase 4I — Durable sync-root contract
+
+The existing `sync_roots` SQLite table now has a typed provider-neutral domain
+contract and storage API.
+
+`SyncMode` lives in `nubisync-core` so persistence and reconciliation share the
+same semantics. `nubisync-sync` re-exports it to preserve the existing planner
+API.
+
+A `SyncRoot` binds:
+
+- one provider/account
+- one local path
+- an optional remote root identifier
+- one sync mode
+- one durable root identifier
+
+Phase 4I adds the offline aggregate-only command:
+
+`nubisync sync roots status`
+
+It does not print local paths or Drive IDs and performs no network or filesystem
+mutation.
+
+This phase intentionally does not create a sync root yet. Remote-folder
+validation and explicit root registration remain separate operations.
