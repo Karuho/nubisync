@@ -3,7 +3,8 @@
 #![forbid(unsafe_code)]
 
 pub use nubisync_core::SyncMode;
-use nubisync_core::{RemoteChange, RemoteItemKind};
+use nubisync_core::{RemoteChange, RemoteItem, RemoteItemKind};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootChangeMembership {
@@ -87,6 +88,325 @@ pub fn plan_root_catalog_change(
             }
         },
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootCatalogMutationPlan {
+    Upsert(RemoteItem),
+    DeleteSubtree { remote_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootCatalogResolution {
+    Noop,
+    RevalidateRoot,
+    Mutations(Vec<RootCatalogMutationPlan>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootCatalogProjectionError {
+    Plan(RootCatalogPlanError),
+    InvalidRootIdentifier,
+    InvalidInitialCatalogItem,
+    DuplicateInitialRemoteId,
+    IncompleteInitialCatalog,
+    HydrationRequired,
+    UnexpectedHydration,
+    InvalidHydrationRoot,
+    InvalidHydrationItem,
+    DuplicateHydrationRemoteId,
+    IncompleteHydration,
+    IncompleteProjectedCatalog,
+}
+
+pub struct RootCatalogProjection {
+    root_remote_id: String,
+    parents: HashMap<String, Option<String>>,
+    children_by_parent: HashMap<String, HashSet<String>>,
+}
+
+impl RootCatalogProjection {
+    pub fn new(
+        root_remote_id: impl Into<String>,
+        items: &[RemoteItem],
+    ) -> Result<Self, RootCatalogProjectionError> {
+        let root_remote_id = root_remote_id.into();
+        if root_remote_id.trim().is_empty() {
+            return Err(RootCatalogProjectionError::InvalidRootIdentifier);
+        }
+
+        let mut projection = Self {
+            root_remote_id,
+            parents: HashMap::with_capacity(items.len()),
+            children_by_parent: HashMap::new(),
+        };
+
+        for item in items {
+            if item.remote_id.trim().is_empty()
+                || item.name.is_empty()
+                || item.trashed
+                || item.remote_id == projection.root_remote_id
+            {
+                return Err(RootCatalogProjectionError::InvalidInitialCatalogItem);
+            }
+
+            if projection.parents.contains_key(&item.remote_id) {
+                return Err(RootCatalogProjectionError::DuplicateInitialRemoteId);
+            }
+
+            projection.apply_upsert(item);
+        }
+
+        if !projection.is_complete() {
+            return Err(RootCatalogProjectionError::IncompleteInitialCatalog);
+        }
+
+        Ok(projection)
+    }
+
+    pub fn item_count(&self) -> usize {
+        self.parents.len()
+    }
+
+    pub fn contains(&self, remote_id: &str) -> bool {
+        self.parents.contains_key(remote_id)
+    }
+
+    pub fn apply_change(
+        &mut self,
+        change: &RemoteChange,
+        membership: RootChangeMembership,
+        hydration: Option<Vec<RemoteItem>>,
+    ) -> Result<RootCatalogResolution, RootCatalogProjectionError> {
+        let remote_id = match change {
+            RemoteChange::Delete { remote_id } => remote_id.as_str(),
+            RemoteChange::Upsert(item) => item.remote_id.as_str(),
+        };
+        let previously_cataloged = self.contains(remote_id);
+
+        let action = plan_root_catalog_change(change, membership, previously_cataloged)
+            .map_err(RootCatalogProjectionError::Plan)?;
+
+        match action {
+            RootCatalogAction::Ignore => {
+                reject_unexpected_hydration(hydration)?;
+                Ok(RootCatalogResolution::Noop)
+            }
+            RootCatalogAction::RevalidateRoot => {
+                reject_unexpected_hydration(hydration)?;
+                Ok(RootCatalogResolution::RevalidateRoot)
+            }
+            RootCatalogAction::UpsertItem => {
+                reject_unexpected_hydration(hydration)?;
+
+                let RemoteChange::Upsert(item) = change else {
+                    return Err(RootCatalogProjectionError::Plan(
+                        RootCatalogPlanError::InvalidChangeContext,
+                    ));
+                };
+
+                self.apply_upsert(item);
+
+                Ok(RootCatalogResolution::Mutations(vec![
+                    RootCatalogMutationPlan::Upsert(item.clone()),
+                ]))
+            }
+            RootCatalogAction::DeleteSubtree => {
+                reject_unexpected_hydration(hydration)?;
+                self.delete_subtree(remote_id);
+
+                Ok(RootCatalogResolution::Mutations(vec![
+                    RootCatalogMutationPlan::DeleteSubtree {
+                        remote_id: remote_id.to_owned(),
+                    },
+                ]))
+            }
+            RootCatalogAction::HydrateSubtree => {
+                let hydration = hydration.ok_or(RootCatalogProjectionError::HydrationRequired)?;
+
+                let RemoteChange::Upsert(root_item) = change else {
+                    return Err(RootCatalogProjectionError::Plan(
+                        RootCatalogPlanError::InvalidChangeContext,
+                    ));
+                };
+
+                validate_hydration(root_item, &hydration)?;
+
+                let mut mutations = Vec::with_capacity(hydration.len());
+                for item in hydration {
+                    self.apply_upsert(&item);
+                    mutations.push(RootCatalogMutationPlan::Upsert(item));
+                }
+
+                Ok(RootCatalogResolution::Mutations(mutations))
+            }
+        }
+    }
+
+    pub fn validate_complete(&self) -> Result<(), RootCatalogProjectionError> {
+        if self.is_complete() {
+            Ok(())
+        } else {
+            Err(RootCatalogProjectionError::IncompleteProjectedCatalog)
+        }
+    }
+
+    fn apply_upsert(&mut self, item: &RemoteItem) {
+        if let Some(Some(old_parent)) = self.parents.get(&item.remote_id).cloned()
+            && let Some(children) = self.children_by_parent.get_mut(&old_parent)
+        {
+            children.remove(&item.remote_id);
+            if children.is_empty() {
+                self.children_by_parent.remove(&old_parent);
+            }
+        }
+
+        self.parents
+            .insert(item.remote_id.clone(), item.parent_remote_id.clone());
+
+        if let Some(parent_remote_id) = &item.parent_remote_id {
+            self.children_by_parent
+                .entry(parent_remote_id.clone())
+                .or_default()
+                .insert(item.remote_id.clone());
+        }
+    }
+
+    fn delete_subtree(&mut self, remote_id: &str) {
+        let mut queue = VecDeque::from([remote_id.to_owned()]);
+        let mut delete_order = Vec::new();
+
+        while let Some(current) = queue.pop_front() {
+            if let Some(children) = self.children_by_parent.get(&current) {
+                queue.extend(children.iter().cloned());
+            }
+            delete_order.push(current);
+        }
+
+        for current in delete_order.into_iter().rev() {
+            self.children_by_parent.remove(&current);
+
+            if let Some(Some(parent_remote_id)) = self.parents.remove(&current) {
+                let mut remove_parent_bucket = false;
+                if let Some(children) = self.children_by_parent.get_mut(&parent_remote_id) {
+                    children.remove(&current);
+                    remove_parent_bucket = children.is_empty();
+                }
+                if remove_parent_bucket {
+                    self.children_by_parent.remove(&parent_remote_id);
+                }
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        if self.parents.is_empty() {
+            return true;
+        }
+
+        let mut queue = VecDeque::from([self.root_remote_id.as_str()]);
+        let mut reached = HashSet::with_capacity(self.parents.len());
+
+        while let Some(parent_remote_id) = queue.pop_front() {
+            let Some(children) = self.children_by_parent.get(parent_remote_id) else {
+                continue;
+            };
+
+            for child_remote_id in children {
+                if reached.insert(child_remote_id.as_str()) {
+                    queue.push_back(child_remote_id.as_str());
+                }
+            }
+        }
+
+        reached.len() == self.parents.len()
+    }
+}
+
+impl std::fmt::Debug for RootCatalogProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RootCatalogProjection")
+            .field("item_count", &self.parents.len())
+            .finish()
+    }
+}
+
+fn reject_unexpected_hydration(
+    hydration: Option<Vec<RemoteItem>>,
+) -> Result<(), RootCatalogProjectionError> {
+    if hydration.is_some() {
+        Err(RootCatalogProjectionError::UnexpectedHydration)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_hydration(
+    expected_root: &RemoteItem,
+    hydration: &[RemoteItem],
+) -> Result<(), RootCatalogProjectionError> {
+    let Some(actual_root) = hydration.first() else {
+        return Err(RootCatalogProjectionError::InvalidHydrationRoot);
+    };
+
+    if actual_root != expected_root
+        || actual_root.kind != RemoteItemKind::Folder
+        || actual_root.trashed
+    {
+        return Err(RootCatalogProjectionError::InvalidHydrationRoot);
+    }
+
+    let mut items_by_id = HashMap::with_capacity(hydration.len());
+
+    for item in hydration {
+        if item.remote_id.trim().is_empty() || item.name.is_empty() || item.trashed {
+            return Err(RootCatalogProjectionError::InvalidHydrationItem);
+        }
+
+        if items_by_id.insert(item.remote_id.as_str(), item).is_some() {
+            return Err(RootCatalogProjectionError::DuplicateHydrationRemoteId);
+        }
+    }
+
+    let mut children_by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for item in hydration.iter().skip(1) {
+        let Some(parent_remote_id) = item.parent_remote_id.as_deref() else {
+            return Err(RootCatalogProjectionError::IncompleteHydration);
+        };
+
+        if !items_by_id.contains_key(parent_remote_id) {
+            return Err(RootCatalogProjectionError::IncompleteHydration);
+        }
+
+        children_by_parent
+            .entry(parent_remote_id)
+            .or_default()
+            .push(item.remote_id.as_str());
+    }
+
+    let mut queue = VecDeque::from([expected_root.remote_id.as_str()]);
+    let mut reached = HashSet::with_capacity(hydration.len());
+    reached.insert(expected_root.remote_id.as_str());
+
+    while let Some(parent_remote_id) = queue.pop_front() {
+        let Some(children) = children_by_parent.get(parent_remote_id) else {
+            continue;
+        };
+
+        for child_remote_id in children {
+            if reached.insert(*child_remote_id) {
+                queue.push_back(*child_remote_id);
+            }
+        }
+    }
+
+    if reached.len() != hydration.len() {
+        return Err(RootCatalogProjectionError::IncompleteHydration);
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +579,247 @@ mod tests {
             plan_root_catalog_change(&upsert, RootChangeMembership::UnresolvedDelete, false,),
             Err(RootCatalogPlanError::InvalidChangeContext)
         );
+    }
+
+    fn catalog_item(remote_id: &str, parent_remote_id: &str, kind: RemoteItemKind) -> RemoteItem {
+        RemoteItem {
+            remote_id: remote_id.into(),
+            parent_remote_id: Some(parent_remote_id.into()),
+            name: format!("{remote_id}.item"),
+            kind,
+            size_bytes: Some(10),
+            modified_unix_ms: None,
+            trashed: false,
+        }
+    }
+
+    #[test]
+    fn projection_rejects_incomplete_initial_catalog() {
+        let orphan = catalog_item("orphan", "missing-parent", RemoteItemKind::File);
+
+        assert_eq!(
+            RootCatalogProjection::new("selected-root", &[orphan]).unwrap_err(),
+            RootCatalogProjectionError::IncompleteInitialCatalog
+        );
+    }
+
+    #[test]
+    fn projection_debug_redacts_root_and_remote_metadata() {
+        let item = catalog_item("private-file-id", "selected-root", RemoteItemKind::File);
+        let projection = RootCatalogProjection::new("private-root-id", &[]).unwrap();
+        let debug = format!("{projection:?}");
+
+        assert_eq!(debug, "RootCatalogProjection { item_count: 0 }");
+        assert!(!debug.contains("private-root-id"));
+        assert!(!debug.contains(&item.remote_id));
+        assert!(!debug.contains(&item.name));
+    }
+
+    #[test]
+    fn hydration_is_required_exact_and_connected() {
+        let entering_folder = catalog_item("folder-in", "selected-root", RemoteItemKind::Folder);
+        let child = catalog_item("child", "folder-in", RemoteItemKind::File);
+        let change = RemoteChange::Upsert(entering_folder.clone());
+        let mut projection = RootCatalogProjection::new("selected-root", &[]).unwrap();
+
+        assert_eq!(
+            projection
+                .apply_change(&change, RootChangeMembership::Descendant, None,)
+                .unwrap_err(),
+            RootCatalogProjectionError::HydrationRequired
+        );
+
+        let wrong_root = catalog_item("different-folder", "selected-root", RemoteItemKind::Folder);
+        assert_eq!(
+            projection
+                .apply_change(
+                    &change,
+                    RootChangeMembership::Descendant,
+                    Some(vec![wrong_root]),
+                )
+                .unwrap_err(),
+            RootCatalogProjectionError::InvalidHydrationRoot
+        );
+
+        let disconnected = catalog_item("orphan", "missing", RemoteItemKind::File);
+        assert_eq!(
+            projection
+                .apply_change(
+                    &change,
+                    RootChangeMembership::Descendant,
+                    Some(vec![entering_folder.clone(), disconnected]),
+                )
+                .unwrap_err(),
+            RootCatalogProjectionError::IncompleteHydration
+        );
+
+        let resolution = projection
+            .apply_change(
+                &change,
+                RootChangeMembership::Descendant,
+                Some(vec![entering_folder.clone(), child.clone()]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolution,
+            RootCatalogResolution::Mutations(vec![
+                RootCatalogMutationPlan::Upsert(entering_folder),
+                RootCatalogMutationPlan::Upsert(child),
+            ])
+        );
+        assert_eq!(projection.item_count(), 2);
+        projection.validate_complete().unwrap();
+    }
+
+    #[test]
+    fn projection_tracks_items_introduced_earlier_in_same_batch() {
+        let entering_folder = catalog_item("folder-in", "selected-root", RemoteItemKind::Folder);
+        let child = catalog_item("child", "folder-in", RemoteItemKind::File);
+        let folder_change = RemoteChange::Upsert(entering_folder.clone());
+
+        let mut projection = RootCatalogProjection::new("selected-root", &[]).unwrap();
+
+        projection
+            .apply_change(
+                &folder_change,
+                RootChangeMembership::Descendant,
+                Some(vec![entering_folder, child.clone()]),
+            )
+            .unwrap();
+
+        assert!(projection.contains("child"));
+
+        let delete_child = RemoteChange::Delete {
+            remote_id: child.remote_id.clone(),
+        };
+
+        let resolution = projection
+            .apply_change(&delete_child, RootChangeMembership::UnresolvedDelete, None)
+            .unwrap();
+
+        assert_eq!(
+            resolution,
+            RootCatalogResolution::Mutations(vec![RootCatalogMutationPlan::DeleteSubtree {
+                remote_id: child.remote_id,
+            },])
+        );
+        assert!(!projection.contains("child"));
+        assert!(projection.contains("folder-in"));
+        projection.validate_complete().unwrap();
+    }
+
+    #[test]
+    fn projection_delete_subtree_removes_descendants_for_later_changes() {
+        let folder = catalog_item("folder", "selected-root", RemoteItemKind::Folder);
+        let nested_folder = catalog_item("nested", "folder", RemoteItemKind::Folder);
+        let nested_file = catalog_item("file", "nested", RemoteItemKind::File);
+
+        let mut projection = RootCatalogProjection::new(
+            "selected-root",
+            &[folder.clone(), nested_folder, nested_file],
+        )
+        .unwrap();
+
+        let moved_out = RemoteChange::Upsert(RemoteItem {
+            parent_remote_id: Some("outside".into()),
+            ..folder
+        });
+
+        let resolution = projection
+            .apply_change(&moved_out, RootChangeMembership::Outside, None)
+            .unwrap();
+
+        assert_eq!(
+            resolution,
+            RootCatalogResolution::Mutations(vec![RootCatalogMutationPlan::DeleteSubtree {
+                remote_id: "folder".into(),
+            },])
+        );
+        assert_eq!(projection.item_count(), 0);
+        projection.validate_complete().unwrap();
+
+        let removed_nested = RemoteChange::Delete {
+            remote_id: "file".into(),
+        };
+        assert_eq!(
+            projection
+                .apply_change(
+                    &removed_nested,
+                    RootChangeMembership::UnresolvedDelete,
+                    None,
+                )
+                .unwrap(),
+            RootCatalogResolution::Noop
+        );
+    }
+
+    #[test]
+    fn projection_detects_unresolved_parent_gap_before_commit() {
+        let mut projection = RootCatalogProjection::new("selected-root", &[]).unwrap();
+
+        let file = catalog_item("new-file", "not-yet-known-parent", RemoteItemKind::File);
+        let change = RemoteChange::Upsert(file);
+
+        projection
+            .apply_change(&change, RootChangeMembership::Descendant, None)
+            .unwrap();
+
+        assert_eq!(
+            projection.validate_complete().unwrap_err(),
+            RootCatalogProjectionError::IncompleteProjectedCatalog
+        );
+    }
+
+    #[test]
+    fn projection_allows_parent_arriving_later_in_same_batch() {
+        let mut projection = RootCatalogProjection::new("selected-root", &[]).unwrap();
+
+        let child = catalog_item("child", "parent", RemoteItemKind::File);
+        projection
+            .apply_change(
+                &RemoteChange::Upsert(child),
+                RootChangeMembership::Descendant,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            projection.validate_complete().unwrap_err(),
+            RootCatalogProjectionError::IncompleteProjectedCatalog
+        );
+
+        let parent = catalog_item("parent", "selected-root", RemoteItemKind::Folder);
+        projection
+            .apply_change(
+                &RemoteChange::Upsert(parent.clone()),
+                RootChangeMembership::Descendant,
+                Some(vec![parent]),
+            )
+            .unwrap();
+
+        projection.validate_complete().unwrap();
+        assert_eq!(projection.item_count(), 2);
+    }
+
+    #[test]
+    fn projection_requires_root_revalidation_without_mutating_catalog() {
+        let file = catalog_item("file", "selected-root", RemoteItemKind::File);
+        let mut projection =
+            RootCatalogProjection::new("selected-root", std::slice::from_ref(&file)).unwrap();
+
+        let root_change = RemoteChange::Delete {
+            remote_id: "selected-root".into(),
+        };
+
+        assert_eq!(
+            projection
+                .apply_change(&root_change, RootChangeMembership::Root, None,)
+                .unwrap(),
+            RootCatalogResolution::RevalidateRoot
+        );
+        assert_eq!(projection.item_count(), 1);
+        assert!(projection.contains(&file.remote_id));
     }
 
     #[test]

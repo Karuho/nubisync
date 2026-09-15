@@ -578,3 +578,37 @@ local sync tree, and does not add a live catch-up CLI command. The future
 selected-root executor must complete all required hydrations first, translate
 the result to root-catalog mutations, and only then call the atomic Phase 4S
 storage commit.
+
+## Phase 4U — In-memory selected-root batch projection
+
+Before a Drive change page can be committed atomically, later changes in the
+same provider batch must observe provisional effects from earlier changes.
+
+`RootCatalogProjection` is a provider-neutral, in-memory view of the selected
+root catalog. It is initialized from a complete authoritative catalog and:
+
+- keeps only remote IDs and parent relationships needed for membership presence
+  and recursive deletion semantics
+- redacts root and item metadata from `Debug`
+- derives `previously_cataloged` from the projected state, not only from the
+  durable pre-batch database state
+- applies the Phase 4Q planner result to the projection
+- converts ordinary upserts and subtree deletes into storage-ready mutation
+  plans
+- requires complete hydration for `HydrateSubtree`
+- validates that hydration begins with the exact changed folder and that every
+  hydrated descendant is connected to that folder
+- removes provisional descendants recursively for `DeleteSubtree`
+- allows a temporary missing-parent gap when provider events arrive child-first
+- requires `validate_complete()` to succeed before a caller may atomically
+  commit the batch
+
+This prevents ordering bugs such as a folder hydration introducing an item and a
+later delete in the same change batch being incorrectly ignored because that
+item was absent from the durable catalog at batch start.
+
+Phase 4U is pure/offline. It performs no Drive request, SQLite mutation, cursor
+advance, file transfer, or local filesystem mutation. The next executor phase
+will load the durable root catalog into this projection, resolve Drive
+membership/hydration, require final projection completeness, translate mutation
+plans to Phase 4S storage mutations, and commit once.
