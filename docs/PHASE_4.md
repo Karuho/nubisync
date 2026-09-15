@@ -422,3 +422,34 @@ descendants for that sync root.
 Phase 4O performs no network access, no filesystem mutation, and does not advance
 a provider cursor or mark catch-up complete. Provider-side subtree membership
 resolution remains a later phase.
+
+## Phase 4P — Canonical Drive root identity and ancestry foundation
+
+Google Drive accepts the special alias `root` anywhere a file ID is expected,
+but parent metadata uses provider IDs. NubiSync now resolves a selected folder
+to a canonical Drive ID before subtree membership decisions.
+
+`DriveFolderRoot` stores that canonical ID in memory and redacts it from
+`Debug`.
+
+The provider also exposes a metadata-only ancestry resolver:
+
+- selected item equal to the canonical root -> `Root`
+- parent chain reaches the canonical root -> `Descendant`
+- parent chain terminates outside the selected tree -> `Outside`
+
+Ancestry traversal is fail-closed:
+
+- requested/fetched metadata IDs must match
+- every ancestor must be an owned, live folder
+- multiple parents are rejected
+- repeated ancestor IDs are rejected as a cycle
+- traversal is capped at 128 hops
+
+Only `files.get` metadata fields are requested. No content, file write, SQLite
+mutation, provider cursor advancement, or remote-event mutation is performed in
+Phase 4P.
+
+This phase deliberately does not yet apply account-wide change events to a
+selected-root catalog. Folder moves into a selected root still require explicit
+subtree hydration semantics.

@@ -4,7 +4,7 @@ use nubisync_core::{
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use std::time::Duration;
+use std::{collections::HashSet, fmt, time::Duration};
 use thiserror::Error;
 
 const GOOGLE_USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
@@ -118,19 +118,97 @@ impl GoogleDriveApi {
     ///
     /// The provider fetches no file content and does not expose the remote ID
     /// in the returned value or logs.
-    pub fn validate_folder_root(&self, remote_root_id: &str) -> Result<(), DriveApiError> {
+    pub fn resolve_folder_root(
+        &self,
+        remote_root_id: &str,
+    ) -> Result<DriveFolderRoot, DriveApiError> {
         validate_drive_file_id(remote_root_id)?;
 
         let metadata: DriveFolderRootMetadata = self
             .client
             .get(format!("{GOOGLE_DRIVE_FILES_ENDPOINT}/{remote_root_id}"))
             .bearer_auth(self.access_token.as_str())
-            .query(&[("fields", "mimeType,trashed,ownedByMe")])
+            .query(&[("fields", "id,mimeType,trashed,ownedByMe")])
             .send()?
             .error_for_status()?
             .json()?;
 
-        validate_folder_root_metadata(&metadata)
+        validate_folder_root_metadata(&metadata)?;
+        validate_ancestry_id(&metadata.id)?;
+
+        Ok(DriveFolderRoot {
+            canonical_remote_id: metadata.id,
+        })
+    }
+
+    pub fn validate_folder_root(&self, remote_root_id: &str) -> Result<(), DriveApiError> {
+        self.resolve_folder_root(remote_root_id).map(|_| ())
+    }
+
+    pub fn resolve_item_membership(
+        &self,
+        item: &RemoteItem,
+        root: &DriveFolderRoot,
+    ) -> Result<DriveRootMembership, DriveApiError> {
+        validate_ancestry_id(&item.remote_id)?;
+        validate_ancestry_id(root.canonical_remote_id())?;
+
+        if item.remote_id == root.canonical_remote_id() {
+            return Ok(DriveRootMembership::Root);
+        }
+
+        let mut current_parent = item.parent_remote_id.clone();
+        let mut seen = HashSet::new();
+
+        for _ in 0..128 {
+            let Some(parent_remote_id) = current_parent else {
+                return Ok(DriveRootMembership::Outside);
+            };
+
+            validate_ancestry_id(&parent_remote_id)?;
+
+            if parent_remote_id == root.canonical_remote_id() {
+                return Ok(DriveRootMembership::Descendant);
+            }
+
+            if !seen.insert(parent_remote_id.clone()) {
+                return Err(DriveApiError::AncestryCycleDetected);
+            }
+
+            let metadata = self.fetch_ancestry_metadata(&parent_remote_id)?;
+
+            match ancestry_step(&parent_remote_id, root.canonical_remote_id(), &metadata)? {
+                DriveAncestryStep::ReachedRoot => {
+                    return Ok(DriveRootMembership::Descendant);
+                }
+                DriveAncestryStep::Continue(next_parent) => {
+                    current_parent = next_parent;
+                }
+                DriveAncestryStep::Outside => {
+                    return Ok(DriveRootMembership::Outside);
+                }
+            }
+        }
+
+        Err(DriveApiError::AncestryHopLimitExceeded)
+    }
+
+    fn fetch_ancestry_metadata(
+        &self,
+        remote_id: &str,
+    ) -> Result<DriveAncestryMetadata, DriveApiError> {
+        validate_ancestry_id(remote_id)?;
+
+        let metadata: DriveAncestryMetadata = self
+            .client
+            .get(format!("{GOOGLE_DRIVE_FILES_ENDPOINT}/{remote_id}"))
+            .bearer_auth(self.access_token.as_str())
+            .query(&[("fields", "id,mimeType,parents,trashed,ownedByMe")])
+            .send()?
+            .error_for_status()?
+            .json()?;
+
+        Ok(metadata)
     }
 
     /// Lists one metadata-only inventory page for ordinary Drive items
@@ -239,6 +317,30 @@ impl GoogleDriveApi {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct DriveFolderRoot {
+    canonical_remote_id: String,
+}
+
+impl DriveFolderRoot {
+    pub fn canonical_remote_id(&self) -> &str {
+        &self.canonical_remote_id
+    }
+}
+
+impl fmt::Debug for DriveFolderRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DriveFolderRoot([redacted])")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveRootMembership {
+    Root,
+    Descendant,
+    Outside,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GoogleUserInfo {
     pub sub: String,
@@ -259,12 +361,33 @@ pub struct DriveProbe {
 
 #[derive(Debug, Deserialize)]
 struct DriveFolderRootMetadata {
+    id: String,
     #[serde(rename = "mimeType")]
     mime_type: String,
     #[serde(default)]
     trashed: bool,
     #[serde(rename = "ownedByMe", default)]
     owned_by_me: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DriveAncestryMetadata {
+    id: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    #[serde(default)]
+    parents: Vec<String>,
+    #[serde(default)]
+    trashed: bool,
+    #[serde(rename = "ownedByMe", default)]
+    owned_by_me: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DriveAncestryStep {
+    ReachedRoot,
+    Continue(Option<String>),
+    Outside,
 }
 
 #[derive(Debug, Deserialize)]
@@ -531,6 +654,53 @@ struct GoogleFile {
     trashed: bool,
 }
 
+fn ancestry_step(
+    expected_remote_id: &str,
+    root_remote_id: &str,
+    metadata: &DriveAncestryMetadata,
+) -> Result<DriveAncestryStep, DriveApiError> {
+    validate_ancestry_id(expected_remote_id)?;
+    validate_ancestry_id(root_remote_id)?;
+    validate_ancestry_id(&metadata.id)?;
+
+    if metadata.id != expected_remote_id {
+        return Err(DriveApiError::AncestryMetadataIdMismatch);
+    }
+
+    if metadata.trashed || !metadata.owned_by_me {
+        return Ok(DriveAncestryStep::Outside);
+    }
+
+    if metadata.mime_type != GOOGLE_DRIVE_FOLDER_MIME_TYPE {
+        return Err(DriveApiError::AncestryParentNotFolder);
+    }
+
+    if metadata.parents.len() > 1 {
+        return Err(DriveApiError::AncestryMultipleParents);
+    }
+
+    let next_parent = metadata.parents.first().cloned();
+
+    if next_parent.as_deref() == Some(root_remote_id) {
+        Ok(DriveAncestryStep::ReachedRoot)
+    } else {
+        Ok(DriveAncestryStep::Continue(next_parent))
+    }
+}
+
+fn validate_ancestry_id(value: &str) -> Result<(), DriveApiError> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(DriveApiError::InvalidAncestryIdentifier);
+    }
+
+    Ok(())
+}
+
 fn validate_drive_file_id(value: &str) -> Result<(), DriveApiError> {
     if value.is_empty()
         || value.len() > 256
@@ -613,6 +783,18 @@ pub enum DriveApiError {
     RemoteRootTrashed,
     #[error("Google Drive remote root is outside the supported My Drive ownership scope")]
     RemoteRootNotOwnedByUser,
+    #[error("Google Drive ancestry identifier is invalid")]
+    InvalidAncestryIdentifier,
+    #[error("Google Drive ancestry metadata ID does not match the requested item")]
+    AncestryMetadataIdMismatch,
+    #[error("Google Drive ancestry parent is not a folder")]
+    AncestryParentNotFolder,
+    #[error("Google Drive ancestry metadata unexpectedly contains multiple parents")]
+    AncestryMultipleParents,
+    #[error("Google Drive ancestry traversal detected a cycle")]
+    AncestryCycleDetected,
+    #[error("Google Drive ancestry traversal exceeded the safety hop limit")]
+    AncestryHopLimitExceeded,
 }
 
 #[cfg(test)]
@@ -636,6 +818,7 @@ mod tests {
     #[test]
     fn remote_root_metadata_requires_owned_live_folder() {
         let valid = DriveFolderRootMetadata {
+            id: "canonical-root".into(),
             mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
             trashed: false,
             owned_by_me: true,
@@ -643,6 +826,7 @@ mod tests {
         assert!(validate_folder_root_metadata(&valid).is_ok());
 
         let file = DriveFolderRootMetadata {
+            id: "file-id".into(),
             mime_type: "text/plain".into(),
             trashed: false,
             owned_by_me: true,
@@ -653,6 +837,7 @@ mod tests {
         ));
 
         let trashed = DriveFolderRootMetadata {
+            id: "trashed-root".into(),
             mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
             trashed: true,
             owned_by_me: true,
@@ -663,6 +848,7 @@ mod tests {
         ));
 
         let not_owned = DriveFolderRootMetadata {
+            id: "foreign-root".into(),
             mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
             trashed: false,
             owned_by_me: false,
@@ -671,6 +857,111 @@ mod tests {
             validate_folder_root_metadata(&not_owned),
             Err(DriveApiError::RemoteRootNotOwnedByUser)
         ));
+    }
+
+    #[test]
+    fn canonical_root_identity_redacts_debug_output() {
+        let root = DriveFolderRoot {
+            canonical_remote_id: "real-drive-root-id".into(),
+        };
+
+        assert_eq!(root.canonical_remote_id(), "real-drive-root-id");
+        assert_eq!(format!("{root:?}"), "DriveFolderRoot([redacted])");
+    }
+
+    #[test]
+    fn ancestry_step_reaches_root_or_continues_without_guessing() {
+        let reaches_root = DriveAncestryMetadata {
+            id: "folder-a".into(),
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+            parents: vec!["canonical-root".into()],
+            trashed: false,
+            owned_by_me: true,
+        };
+
+        assert_eq!(
+            ancestry_step("folder-a", "canonical-root", &reaches_root).unwrap(),
+            DriveAncestryStep::ReachedRoot
+        );
+
+        let continues = DriveAncestryMetadata {
+            id: "folder-b".into(),
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+            parents: vec!["folder-a".into()],
+            trashed: false,
+            owned_by_me: true,
+        };
+
+        assert_eq!(
+            ancestry_step("folder-b", "canonical-root", &continues).unwrap(),
+            DriveAncestryStep::Continue(Some("folder-a".into()))
+        );
+    }
+
+    #[test]
+    fn ancestry_step_fails_closed_for_invalid_parent_metadata() {
+        let mismatch = DriveAncestryMetadata {
+            id: "different-id".into(),
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+            parents: vec!["canonical-root".into()],
+            trashed: false,
+            owned_by_me: true,
+        };
+        assert!(matches!(
+            ancestry_step("expected-id", "canonical-root", &mismatch),
+            Err(DriveApiError::AncestryMetadataIdMismatch)
+        ));
+
+        let non_folder = DriveAncestryMetadata {
+            id: "file-parent".into(),
+            mime_type: "text/plain".into(),
+            parents: vec!["canonical-root".into()],
+            trashed: false,
+            owned_by_me: true,
+        };
+        assert!(matches!(
+            ancestry_step("file-parent", "canonical-root", &non_folder),
+            Err(DriveApiError::AncestryParentNotFolder)
+        ));
+
+        let multiple_parents = DriveAncestryMetadata {
+            id: "folder-many".into(),
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+            parents: vec!["one".into(), "two".into()],
+            trashed: false,
+            owned_by_me: true,
+        };
+        assert!(matches!(
+            ancestry_step("folder-many", "canonical-root", &multiple_parents),
+            Err(DriveApiError::AncestryMultipleParents)
+        ));
+    }
+
+    #[test]
+    fn ancestry_step_treats_trashed_or_not_owned_parent_as_outside() {
+        let trashed = DriveAncestryMetadata {
+            id: "folder-a".into(),
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+            parents: vec!["canonical-root".into()],
+            trashed: true,
+            owned_by_me: true,
+        };
+        assert_eq!(
+            ancestry_step("folder-a", "canonical-root", &trashed).unwrap(),
+            DriveAncestryStep::Outside
+        );
+
+        let not_owned = DriveAncestryMetadata {
+            id: "folder-b".into(),
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+            parents: vec!["canonical-root".into()],
+            trashed: false,
+            owned_by_me: false,
+        };
+        assert_eq!(
+            ancestry_step("folder-b", "canonical-root", &not_owned).unwrap(),
+            DriveAncestryStep::Outside
+        );
     }
 
     #[test]
