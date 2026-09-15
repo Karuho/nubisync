@@ -346,3 +346,26 @@ The following local roots are rejected:
 
 The dry-run performs no local filesystem mutation, no inventory persistence, and
 no Drive write.
+
+## Phase 4M — Sync-root-scoped remote catalog storage
+
+Selected-folder synchronization must not share one account-wide authoritative
+catalog. NubiSync therefore adds a root-scoped catalog foundation in schema v6.
+
+New durable tables:
+
+- `sync_root_remote_items`
+- `sync_root_remote_inventory_staging`
+- `sync_root_remote_inventory_state`
+
+Each row is keyed by `sync_root_id`, so identical provider remote IDs can be
+represented independently in different roots without catalog collisions.
+
+The earlier account-scoped `remote_items`, `remote_inventory_staging`, and
+`remote_inventory_state` tables remain temporarily for Phase 4A–4F
+compatibility. New selected-root bootstrap work must use the root-scoped tables.
+
+`sync roots status` exposes only aggregate root-catalog counts and does not print
+local paths, remote IDs, filenames, or provider metadata.
+
+Phase 4M performs no Drive request and registers no sync root.

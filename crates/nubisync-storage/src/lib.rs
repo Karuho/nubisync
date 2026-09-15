@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 
@@ -209,6 +209,49 @@ impl Storage {
                 FOREIGN KEY (provider, account_subject)
                     REFERENCES accounts(provider, subject) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS sync_root_remote_items (
+                sync_root_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                parent_remote_id TEXT,
+                name TEXT NOT NULL,
+                item_kind TEXT NOT NULL CHECK (item_kind IN ('file', 'folder')),
+                size_bytes INTEGER,
+                trashed INTEGER NOT NULL DEFAULT 0 CHECK (trashed IN (0, 1)),
+                observed_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (sync_root_id, remote_id),
+                FOREIGN KEY (sync_root_id)
+                    REFERENCES sync_roots(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_root_remote_inventory_staging (
+                sync_root_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                parent_remote_id TEXT,
+                name TEXT NOT NULL,
+                item_kind TEXT NOT NULL CHECK (item_kind IN ('file', 'folder')),
+                size_bytes INTEGER,
+                trashed INTEGER NOT NULL DEFAULT 0 CHECK (trashed IN (0, 1)),
+                observed_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (sync_root_id, remote_id),
+                FOREIGN KEY (sync_root_id)
+                    REFERENCES sync_roots(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_root_remote_inventory_state (
+                sync_root_id TEXT PRIMARY KEY,
+                snapshot_complete INTEGER NOT NULL DEFAULT 0 CHECK (
+                    snapshot_complete IN (0, 1)
+                ),
+                catchup_complete INTEGER NOT NULL DEFAULT 0 CHECK (
+                    catchup_complete IN (0, 1)
+                ),
+                item_count INTEGER NOT NULL DEFAULT 0 CHECK (item_count >= 0),
+                snapshot_completed_at_unix_ms INTEGER,
+                catchup_from_cursor TEXT,
+                FOREIGN KEY (sync_root_id)
+                    REFERENCES sync_roots(id) ON DELETE CASCADE
+            );
             ",
         )?;
 
@@ -368,6 +411,228 @@ impl Storage {
             "SELECT COUNT(*)
              FROM sync_roots
              WHERE provider = ?1 AND account_subject = ?2",
+            params![provider.as_str(), account_subject],
+            |row| row.get(0),
+        )?;
+
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn begin_sync_root_remote_inventory_staging(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM sync_root_remote_inventory_staging WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn stage_sync_root_remote_inventory_items(
+        &mut self,
+        sync_root_id: &str,
+        items: &[RemoteItem],
+        observed_at_unix_ms: i64,
+    ) -> Result<usize, StorageError> {
+        let transaction = self.connection.transaction()?;
+        for item in items {
+            insert_sync_root_inventory_item(&transaction, sync_root_id, item, observed_at_unix_ms)?;
+        }
+        transaction.commit()?;
+        Ok(items.len())
+    }
+
+    pub fn staged_sync_root_remote_inventory_count(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_remote_inventory_staging
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn clear_sync_root_remote_inventory_staging(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM sync_root_remote_inventory_staging WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn commit_sync_root_remote_inventory_snapshot(
+        &mut self,
+        sync_root_id: &str,
+        catchup_from_cursor: &ChangeCursor,
+        completed_at_unix_ms: i64,
+    ) -> Result<usize, StorageError> {
+        let transaction = self.connection.transaction()?;
+
+        transaction.execute(
+            "DELETE FROM sync_root_remote_items WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+
+        let inserted = transaction.execute(
+            "INSERT INTO sync_root_remote_items (
+                sync_root_id,
+                remote_id,
+                parent_remote_id,
+                name,
+                item_kind,
+                size_bytes,
+                trashed,
+                observed_at_unix_ms
+             )
+             SELECT
+                sync_root_id,
+                remote_id,
+                parent_remote_id,
+                name,
+                item_kind,
+                size_bytes,
+                trashed,
+                observed_at_unix_ms
+             FROM sync_root_remote_inventory_staging
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+
+        let item_count = i64::try_from(inserted).map_err(|_| StorageError::NumericOverflow)?;
+
+        transaction.execute(
+            "INSERT INTO sync_root_remote_inventory_state (
+                sync_root_id,
+                snapshot_complete,
+                catchup_complete,
+                item_count,
+                snapshot_completed_at_unix_ms,
+                catchup_from_cursor
+             ) VALUES (?1, 1, 0, ?2, ?3, ?4)
+             ON CONFLICT(sync_root_id) DO UPDATE SET
+                snapshot_complete = 1,
+                catchup_complete = 0,
+                item_count = excluded.item_count,
+                snapshot_completed_at_unix_ms = excluded.snapshot_completed_at_unix_ms,
+                catchup_from_cursor = excluded.catchup_from_cursor",
+            params![
+                sync_root_id,
+                item_count,
+                completed_at_unix_ms,
+                catchup_from_cursor.as_str()
+            ],
+        )?;
+
+        transaction.execute(
+            "DELETE FROM sync_root_remote_inventory_staging WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn sync_root_remote_inventory_state(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<RemoteInventoryState, StorageError> {
+        let row: Option<RemoteInventoryStateRow> = self
+            .connection
+            .query_row(
+                "SELECT
+                    snapshot_complete,
+                    catchup_complete,
+                    item_count,
+                    snapshot_completed_at_unix_ms,
+                    catchup_from_cursor
+                 FROM sync_root_remote_inventory_state
+                 WHERE sync_root_id = ?1",
+                params![sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        match row {
+            Some((
+                snapshot_complete,
+                catchup_complete,
+                item_count,
+                completed_at,
+                catchup_from_cursor,
+            )) => Ok(RemoteInventoryState {
+                snapshot_complete: snapshot_complete != 0,
+                catchup_complete: catchup_complete != 0,
+                item_count: u64::try_from(item_count).map_err(|_| StorageError::NumericOverflow)?,
+                snapshot_completed_at_unix_ms: completed_at,
+                catchup_from_cursor: catchup_from_cursor.map(ChangeCursor::new).transpose()?,
+            }),
+            None => Ok(RemoteInventoryState {
+                snapshot_complete: false,
+                catchup_complete: false,
+                item_count: 0,
+                snapshot_completed_at_unix_ms: None,
+                catchup_from_cursor: None,
+            }),
+        }
+    }
+
+    pub fn sync_root_remote_inventory_count(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM sync_root_remote_items WHERE sync_root_id = ?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn sync_root_catalog_state_count(
+        &self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_remote_inventory_state AS state
+             INNER JOIN sync_roots AS root ON root.id = state.sync_root_id
+             WHERE root.provider = ?1 AND root.account_subject = ?2",
+            params![provider.as_str(), account_subject],
+            |row| row.get(0),
+        )?;
+
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn sync_root_catalog_item_count(
+        &self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_remote_items AS item
+             INNER JOIN sync_roots AS root ON root.id = item.sync_root_id
+             WHERE root.provider = ?1 AND root.account_subject = ?2",
             params![provider.as_str(), account_subject],
             |row| row.get(0),
         )?;
@@ -802,6 +1067,56 @@ impl Storage {
     }
 }
 
+fn insert_sync_root_inventory_item(
+    transaction: &Transaction<'_>,
+    sync_root_id: &str,
+    item: &RemoteItem,
+    observed_at_unix_ms: i64,
+) -> Result<(), StorageError> {
+    let item_kind = match item.kind {
+        RemoteItemKind::File => "file",
+        RemoteItemKind::Folder => "folder",
+    };
+
+    let size_bytes = item
+        .size_bytes
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| StorageError::NumericOverflow)?;
+
+    transaction.execute(
+        "INSERT INTO sync_root_remote_inventory_staging (
+            sync_root_id,
+            remote_id,
+            parent_remote_id,
+            name,
+            item_kind,
+            size_bytes,
+            trashed,
+            observed_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(sync_root_id, remote_id) DO UPDATE SET
+            parent_remote_id = excluded.parent_remote_id,
+            name = excluded.name,
+            item_kind = excluded.item_kind,
+            size_bytes = excluded.size_bytes,
+            trashed = excluded.trashed,
+            observed_at_unix_ms = excluded.observed_at_unix_ms",
+        params![
+            sync_root_id,
+            item.remote_id,
+            item.parent_remote_id,
+            item.name,
+            item_kind,
+            size_bytes,
+            item.trashed as i64,
+            observed_at_unix_ms
+        ],
+    )?;
+
+    Ok(())
+}
+
 fn apply_remote_change_to_inventory(
     transaction: &Transaction<'_>,
     provider: &ProviderId,
@@ -1166,6 +1481,121 @@ mod tests {
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].local_path, "/tmp/nubisync-one");
         assert_eq!(roots[0].remote_root_id.as_deref(), Some("remote-one"));
+    }
+
+    #[test]
+    fn root_scoped_catalogs_isolate_identical_remote_ids() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        assert_eq!(storage.schema_version().unwrap(), 6);
+
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root_one = SyncRoot::new(
+            "root-one",
+            provider.clone(),
+            account.subject.clone(),
+            "/tmp/root-one",
+            Some("remote-root-one".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        let root_two = SyncRoot::new(
+            "root-two",
+            provider.clone(),
+            account.subject.clone(),
+            "/tmp/root-two",
+            Some("remote-root-two".into()),
+            SyncMode::ReceiveOnly,
+            3,
+        )
+        .unwrap();
+
+        storage.insert_sync_root(&root_one).unwrap();
+        storage.insert_sync_root(&root_two).unwrap();
+
+        let shared = RemoteItem {
+            remote_id: "same-remote-id".into(),
+            parent_remote_id: Some("parent".into()),
+            name: "same.txt".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(10),
+            modified_unix_ms: None,
+            trashed: false,
+        };
+
+        storage
+            .begin_sync_root_remote_inventory_staging(&root_one.id)
+            .unwrap();
+        storage
+            .begin_sync_root_remote_inventory_staging(&root_two.id)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(&root_one.id, std::slice::from_ref(&shared), 4)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(&root_two.id, &[shared], 5)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .staged_sync_root_remote_inventory_count(&root_one.id)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .staged_sync_root_remote_inventory_count(&root_two.id)
+                .unwrap(),
+            1
+        );
+
+        let fence = ChangeCursor::new("root-one-fence").unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(&root_one.id, &fence, 6)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .sync_root_remote_inventory_count(&root_one.id)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_inventory_count(&root_two.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .staged_sync_root_remote_inventory_count(&root_two.id)
+                .unwrap(),
+            1
+        );
+
+        let state = storage
+            .sync_root_remote_inventory_state(&root_one.id)
+            .unwrap();
+        assert!(state.snapshot_complete);
+        assert!(!state.catchup_complete);
+        assert_eq!(state.item_count, 1);
+        assert_eq!(state.catchup_from_cursor.unwrap().as_str(), fence.as_str());
+
+        assert_eq!(
+            storage
+                .sync_root_catalog_state_count(&provider, &account.subject)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .sync_root_catalog_item_count(&provider, &account.subject)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

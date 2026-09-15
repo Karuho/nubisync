@@ -531,10 +531,14 @@ fn sync_roots_status() -> Result<(), CliError> {
         .iter()
         .filter(|root| root.remote_root_id.is_some())
         .count();
+    let root_catalog_states = storage.sync_root_catalog_state_count(&provider, &account.subject)?;
+    let root_catalog_items = storage.sync_root_catalog_item_count(&provider, &account.subject)?;
 
     println!("SYNC_ROOTS_STATUS=PASS");
     println!("CONFIGURED_ROOTS={}", roots.len());
     println!("REMOTE_ROOTS_CONFIGURED={with_remote_root}");
+    println!("ROOT_CATALOG_STATES={root_catalog_states}");
+    println!("ROOT_CATALOG_ITEMS={root_catalog_items}");
     println!("ROOT_PATHS_PRINTED=no");
     println!("REMOTE_ROOT_IDS_PRINTED=no");
     println!("NETWORK_CHECK=not_performed");
