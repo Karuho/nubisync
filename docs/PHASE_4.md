@@ -612,3 +612,33 @@ advance, file transfer, or local filesystem mutation. The next executor phase
 will load the durable root catalog into this projection, resolve Drive
 membership/hydration, require final projection completeness, translate mutation
 plans to Phase 4S storage mutations, and commit once.
+
+## Phase 4V — Integrated selected-root batch executor
+
+The daemon layer now owns the first complete selected-root batch execution
+pipeline.
+
+The executor:
+
+1. resolves the configured Drive root to its canonical provider identity
+2. loads the complete durable selected-root catalog
+3. initializes the Phase 4U in-memory projection
+4. resolves each upsert's current membership through the provider
+5. treats removed non-root changes as membership-unknown deletes
+6. hydrates newly entering folders before projection/commit
+7. applies planner effects to the provisional catalog in provider order
+8. revalidates the selected root when the planner requires it
+9. requires the final projected catalog to be complete
+10. translates projected mutations to Phase 4S storage mutations
+11. commits catalog mutations and the durable per-root cursor exactly once
+
+Provider failures, root revalidation failures, incomplete projection, hydration
+failures, storage failures, or cursor precondition failures all prevent a
+successful cursor advance.
+
+The executor is implemented in `nubisync-daemon`, keeping synchronization
+orchestration out of the GUI and CLI layers. `GoogleDriveApi` implements the
+executor's provider contract, while unit tests use an offline fake provider.
+
+Phase 4V does not expose a live daemon loop or CLI catch-up command yet. It does
+not download file contents and does not mutate the local sync tree.

@@ -14,6 +14,7 @@ const SCHEMA_VERSION: i64 = 7;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
+type SyncRootRemoteCatalogRow = (String, Option<String>, String, String, Option<i64>, i64);
 type SyncRootCursorStateRow = (i64, i64, Option<String>, Option<String>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -629,6 +630,71 @@ impl Storage {
         )?;
 
         u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn list_sync_root_remote_items(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<Vec<RemoteItem>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                remote_id,
+                parent_remote_id,
+                name,
+                item_kind,
+                size_bytes,
+                trashed
+             FROM sync_root_remote_items
+             WHERE sync_root_id = ?1
+             ORDER BY remote_id",
+        )?;
+
+        let rows = statement.query_map(params![sync_root_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?;
+
+        let mut items = Vec::new();
+
+        for row in rows {
+            let (
+                remote_id,
+                parent_remote_id,
+                name,
+                item_kind,
+                size_bytes,
+                trashed,
+            ): SyncRootRemoteCatalogRow = row?;
+
+            let kind = match item_kind.as_str() {
+                "file" => RemoteItemKind::File,
+                "folder" => RemoteItemKind::Folder,
+                _ => return Err(StorageError::InvalidStoredRemoteItemKind),
+            };
+
+            let size_bytes = size_bytes
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| StorageError::NumericOverflow)?;
+
+            items.push(RemoteItem {
+                remote_id,
+                parent_remote_id,
+                name,
+                kind,
+                size_bytes,
+                modified_unix_ms: None,
+                trashed: trashed != 0,
+            });
+        }
+
+        Ok(items)
     }
 
     pub fn sync_root_remote_item(
@@ -2050,6 +2116,47 @@ mod tests {
                 .sync_root_catalog_item_count(&provider, &account.subject)
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn root_catalog_can_be_loaded_for_batch_projection() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "projection-load-root",
+            provider,
+            account.subject,
+            "/tmp/projection-load-root",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let folder = test_remote_item(
+            "folder",
+            Some("remote-root"),
+            "folder",
+            RemoteItemKind::Folder,
+        );
+        let file = test_remote_item("file", Some("folder"), "file.txt", RemoteItemKind::File);
+
+        prepare_root_snapshot(
+            &mut storage,
+            &root,
+            &[folder.clone(), file.clone()],
+            "projection-fence",
+            10,
+        );
+
+        assert_eq!(
+            storage.list_sync_root_remote_items(&root.id).unwrap(),
+            vec![file, folder]
         );
     }
 

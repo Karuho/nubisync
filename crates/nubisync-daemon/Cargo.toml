@@ -12,3 +12,8 @@ name = "nubisyncd"
 path = "src/main.rs"
 
 [dependencies]
+nubisync-core = { path = "../nubisync-core" }
+nubisync-drive = { path = "../nubisync-drive" }
+nubisync-storage = { path = "../nubisync-storage" }
+nubisync-sync = { path = "../nubisync-sync" }
+thiserror.workspace = true

@@ -1224,6 +1224,13 @@ dependencies = [
 [[package]]
 name = "nubisync-daemon"
 version = "0.1.0-alpha.0"
+dependencies = [
+ "nubisync-core",
+ "nubisync-drive",
+ "nubisync-storage",
+ "nubisync-sync",
+ "thiserror",
+]
 
 [[package]]
 name = "nubisync-drive"
