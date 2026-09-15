@@ -107,7 +107,13 @@ impl GoogleDriveApi {
     pub fn list_inventory_page(
         &self,
         continuation: Option<&ContinuationToken>,
+        page_size: u16,
     ) -> Result<DriveInventoryPage, DriveApiError> {
+        if !(1..=1000).contains(&page_size) {
+            return Err(DriveApiError::InvalidInventoryPageSize);
+        }
+
+        let page_size = page_size.to_string();
         let mut request = self
             .client
             .get(GOOGLE_DRIVE_FILES_ENDPOINT)
@@ -116,7 +122,7 @@ impl GoogleDriveApi {
                 ("q", "'me' in owners and trashed = false"),
                 ("corpora", "user"),
                 ("spaces", "drive"),
-                ("pageSize", "1000"),
+                ("pageSize", page_size.as_str()),
                 ("fields", GOOGLE_DRIVE_INVENTORY_FIELDS),
             ]);
 
@@ -439,6 +445,8 @@ pub enum DriveApiError {
     InvalidChangePage { code: &'static str },
     #[error("Google Drive inventory search was incomplete")]
     IncompleteInventorySearch,
+    #[error("Google Drive inventory page size must be between 1 and 1000")]
+    InvalidInventoryPageSize,
     #[error("Google Drive inventory page is invalid: {code}")]
     InvalidInventoryPage { code: &'static str },
 }

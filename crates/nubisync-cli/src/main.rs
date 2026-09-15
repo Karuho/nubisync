@@ -66,7 +66,19 @@ fn run() -> Result<(), CliError> {
             google_logout()
         }
         [drive, changes] if drive == "drive" && changes == "changes" => drive_changes(),
-        [drive, inventory] if drive == "drive" && inventory == "inventory" => drive_inventory(),
+        [drive, inventory] if drive == "drive" && inventory == "inventory" => {
+            drive_inventory(Some(20))
+        }
+        [drive, inventory, full]
+            if drive == "drive" && inventory == "inventory" && full == "--full" =>
+        {
+            drive_inventory(None)
+        }
+        [drive, inventory, limit, value]
+            if drive == "drive" && inventory == "inventory" && limit == "--limit" =>
+        {
+            drive_inventory(Some(parse_inventory_limit(value)?))
+        }
         [auth, keyring, check] if auth == "auth" && keyring == "keyring" && check == "check" => {
             keyring_check()
         }
@@ -93,6 +105,8 @@ USAGE:
   nubisync auth google logout
   nubisync drive changes
   nubisync drive inventory
+  nubisync drive inventory --limit <1-10000>
+  nubisync drive inventory --full
 
 GOOGLE DEVELOPMENT CLIENT CONFIG:
   Store the development Desktop OAuth client directly in the OS credential store:
@@ -280,7 +294,19 @@ fn google_logout() -> Result<(), CliError> {
     Ok(())
 }
 
-fn drive_inventory() -> Result<(), CliError> {
+fn parse_inventory_limit(value: &str) -> Result<u64, CliError> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| CliError::InvalidInventoryLimit)?;
+
+    if !(1..=10_000).contains(&parsed) {
+        return Err(CliError::InvalidInventoryLimit);
+    }
+
+    Ok(parsed)
+}
+
+fn drive_inventory(max_items: Option<u64>) -> Result<(), CliError> {
     println!("DRIVE_INVENTORY_STAGE=local_session");
     ensure_keyring_available()?;
 
@@ -322,27 +348,53 @@ fn drive_inventory() -> Result<(), CliError> {
     let mut continuation = None;
     let mut seen_continuations = HashSet::new();
     let mut pages_fetched = 0_u64;
+    let mut observed_items = 0_u64;
     let mut supported_items = 0_u64;
     let mut files = 0_u64;
     let mut folders = 0_u64;
     let mut unsupported_provider_native = 0_u64;
+    let mut inventory_complete = false;
+    let mut limit_reached = false;
 
     loop {
         if pages_fetched >= 10_000 {
             return Err(CliError::DriveInventoryPageLimitExceeded);
         }
 
+        let page_size = match max_items {
+            Some(limit) => {
+                if observed_items >= limit {
+                    limit_reached = true;
+                    break;
+                }
+
+                u16::try_from((limit - observed_items).min(1000))
+                    .map_err(|_| CliError::InvalidInventoryLimit)?
+            }
+            None => 1000,
+        };
+
         let page_number = pages_fetched + 1;
         println!("DRIVE_INVENTORY_FETCH_PAGE={page_number}");
-        let page = api.list_inventory_page(continuation.as_ref())?;
+
+        let page = api.list_inventory_page(continuation.as_ref(), page_size)?;
         pages_fetched += 1;
+
+        let page_items = page.supported_items + page.unsupported_provider_native;
+        observed_items += page_items;
         supported_items += page.supported_items;
         files += page.file_count;
         folders += page.folder_count;
         unsupported_provider_native += page.unsupported_provider_native;
+
         println!(
-            "DRIVE_INVENTORY_PAGE_COMPLETE={} SUPPORTED_SO_FAR={} FILES_SO_FAR={} FOLDERS_SO_FAR={} UNSUPPORTED_NATIVE_SO_FAR={}",
-            pages_fetched, supported_items, files, folders, unsupported_provider_native
+            "DRIVE_INVENTORY_PAGE_COMPLETE={} OBSERVED_SO_FAR={} SUPPORTED_SO_FAR={} FILES_SO_FAR={} FOLDERS_SO_FAR={} UNSUPPORTED_NATIVE_SO_FAR={}",
+            pages_fetched,
+            observed_items,
+            supported_items,
+            files,
+            folders,
+            unsupported_provider_native
         );
 
         match page.continuation {
@@ -350,14 +402,38 @@ fn drive_inventory() -> Result<(), CliError> {
                 if !seen_continuations.insert(next.as_str().to_owned()) {
                     return Err(CliError::DriveInventoryPaginationLoop);
                 }
+
                 continuation = Some(next);
+
+                if max_items.is_some_and(|limit| observed_items >= limit) {
+                    limit_reached = true;
+                    break;
+                }
             }
-            None => break,
+            None => {
+                inventory_complete = true;
+                break;
+            }
         }
     }
 
     println!("DRIVE_INVENTORY=PASS");
+    println!(
+        "MODE={}",
+        if max_items.is_some() {
+            "bounded"
+        } else {
+            "full"
+        }
+    );
+    match max_items {
+        Some(limit) => println!("MAX_ITEMS={limit}"),
+        None => println!("MAX_ITEMS=unlimited"),
+    }
+    println!("INVENTORY_COMPLETE={}", yes_no(inventory_complete));
+    println!("LIMIT_REACHED={}", yes_no(limit_reached));
     println!("PAGES_FETCHED={pages_fetched}");
+    println!("OBSERVED_ITEMS={observed_items}");
     println!("SUPPORTED_ITEMS={supported_items}");
     println!("FILES={files}");
     println!("FOLDERS={folders}");
@@ -791,6 +867,8 @@ enum CliError {
     DriveInventoryPaginationLoop,
     #[error("Google Drive inventory pagination exceeded the safety limit")]
     DriveInventoryPageLimitExceeded,
+    #[error("inventory limit must be an integer between 1 and 10000")]
+    InvalidInventoryLimit,
     #[error("Google Drive change stream ended without a durable checkpoint")]
     DriveChangeStreamMissingCheckpoint,
     #[error("stored Google OAuth client configuration is missing")]

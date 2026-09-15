@@ -50,3 +50,24 @@ Phase 4A therefore uses Drive's maximum documented `files.list` page size of 100
 to reduce request count while preserving pagination correctness. Progress output
 includes cumulative counts so long inventories are visibly advancing rather than
 appearing stalled.
+
+### Bounded development probe
+
+Large Drive accounts can contain tens of thousands of objects, so routine
+development validation must not require a complete inventory.
+
+The default command is bounded to 20 returned Drive objects:
+
+`nubisync drive inventory`
+
+A custom bounded probe can be requested with:
+
+`nubisync drive inventory --limit <1-10000>`
+
+A complete scan is explicit:
+
+`nubisync drive inventory --full`
+
+A bounded probe reports `INVENTORY_COMPLETE=no` and `LIMIT_REACHED=yes` when
+the cap is reached. It does not persist inventory metadata, alter the durable
+change cursor, or modify the pending remote-event journal.
