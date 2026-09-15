@@ -14,6 +14,7 @@ const SCHEMA_VERSION: i64 = 7;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
+type SyncRootCursorStateRow = (i64, i64, Option<String>, Option<String>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteInventoryState {
@@ -35,6 +36,19 @@ pub struct CatalogCatchupCommit {
     pub changes_applied: usize,
     pub authoritative_items: u64,
     pub remote_events_superseded: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncRootCatalogMutation {
+    Upsert(RemoteItem),
+    DeleteSubtree { remote_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncRootCatalogBatchCommit {
+    pub mutations_applied: usize,
+    pub authoritative_items: u64,
+    pub completed_initial_catchup: bool,
 }
 
 pub struct Storage {
@@ -705,6 +719,113 @@ impl Storage {
         transaction.commit()?;
 
         u64::try_from(deleted).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn commit_sync_root_catalog_batch_and_cursor(
+        &mut self,
+        sync_root_id: &str,
+        expected_cursor: &ChangeCursor,
+        mutations: &[SyncRootCatalogMutation],
+        next_cursor: &ChangeCursor,
+        observed_at_unix_ms: i64,
+    ) -> Result<SyncRootCatalogBatchCommit, StorageError> {
+        let transaction = self.connection.transaction()?;
+
+        let state: Option<SyncRootCursorStateRow> = transaction
+            .query_row(
+                "SELECT
+                    snapshot_complete,
+                    catchup_complete,
+                    catchup_from_cursor,
+                    change_cursor
+                 FROM sync_root_remote_inventory_state
+                 WHERE sync_root_id = ?1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+
+        let Some((snapshot_complete, catchup_complete, catchup_from_cursor, change_cursor)) = state
+        else {
+            return Err(StorageError::SyncRootCatalogSnapshotMissing);
+        };
+
+        if snapshot_complete == 0 {
+            return Err(StorageError::SyncRootCatalogSnapshotMissing);
+        }
+
+        let completed_initial_catchup = catchup_complete == 0;
+
+        let current_cursor = if completed_initial_catchup {
+            if change_cursor.is_some() {
+                return Err(StorageError::SyncRootCatalogInvalidCursorState);
+            }
+
+            catchup_from_cursor
+                .as_deref()
+                .ok_or(StorageError::SyncRootCatalogCatchupCursorMissing)?
+        } else {
+            change_cursor
+                .as_deref()
+                .ok_or(StorageError::SyncRootCatalogChangeCursorMissing)?
+        };
+
+        if current_cursor != expected_cursor.as_str() {
+            return Err(StorageError::SyncRootCatalogExpectedCursorMismatch);
+        }
+
+        for mutation in mutations {
+            match mutation {
+                SyncRootCatalogMutation::Upsert(item) => {
+                    if item.trashed || item.remote_id.trim().is_empty() {
+                        return Err(StorageError::InvalidSyncRootCatalogMutation);
+                    }
+
+                    upsert_sync_root_catalog_item(
+                        &transaction,
+                        sync_root_id,
+                        item,
+                        observed_at_unix_ms,
+                    )?;
+                }
+                SyncRootCatalogMutation::DeleteSubtree { remote_id } => {
+                    if remote_id.trim().is_empty() {
+                        return Err(StorageError::InvalidSyncRootCatalogMutation);
+                    }
+
+                    delete_sync_root_subtree_in_transaction(&transaction, sync_root_id, remote_id)?;
+                }
+            }
+        }
+
+        refresh_sync_root_catalog_count(&transaction, sync_root_id)?;
+
+        let authoritative_items_i64: i64 = transaction.query_row(
+            "SELECT item_count
+             FROM sync_root_remote_inventory_state
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        let authoritative_items =
+            u64::try_from(authoritative_items_i64).map_err(|_| StorageError::NumericOverflow)?;
+
+        transaction.execute(
+            "UPDATE sync_root_remote_inventory_state
+             SET
+                catchup_complete = 1,
+                change_cursor = ?2
+             WHERE sync_root_id = ?1",
+            params![sync_root_id, next_cursor.as_str()],
+        )?;
+
+        transaction.commit()?;
+
+        Ok(SyncRootCatalogBatchCommit {
+            mutations_applied: mutations.len(),
+            authoritative_items,
+            completed_initial_catchup,
+        })
     }
 
     pub fn sync_root_change_cursor(
@@ -1600,6 +1721,18 @@ pub enum StorageError {
     RemoteCatalogCatchupCursorMissing,
     #[error("remote catalog catch-up cursor does not match the stored bootstrap fence")]
     RemoteCatalogCatchupCursorMismatch,
+    #[error("sync root catalog mutation is invalid")]
+    InvalidSyncRootCatalogMutation,
+    #[error("sync root catalog does not have a complete authoritative snapshot")]
+    SyncRootCatalogSnapshotMissing,
+    #[error("sync root catalog bootstrap catch-up cursor is missing")]
+    SyncRootCatalogCatchupCursorMissing,
+    #[error("sync root catalog incremental change cursor is missing")]
+    SyncRootCatalogChangeCursorMissing,
+    #[error("sync root catalog expected cursor does not match durable state")]
+    SyncRootCatalogExpectedCursorMismatch,
+    #[error("sync root catalog cursor state is internally inconsistent")]
+    SyncRootCatalogInvalidCursorState,
 }
 
 #[cfg(test)]
@@ -1631,6 +1764,28 @@ mod tests {
             modified_unix_ms: None,
             trashed: false,
         }
+    }
+
+    fn prepare_root_snapshot(
+        storage: &mut Storage,
+        root: &SyncRoot,
+        items: &[RemoteItem],
+        fence: &str,
+        observed_at_unix_ms: i64,
+    ) {
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(&root.id, items, observed_at_unix_ms)
+            .unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(
+                &root.id,
+                &ChangeCursor::new(fence).unwrap(),
+                observed_at_unix_ms + 1,
+            )
+            .unwrap();
     }
 
     fn test_upsert(remote_id: &str, size_bytes: Option<u64>) -> RemoteChange {
@@ -2179,6 +2334,405 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn root_batch_commit_completes_catchup_and_advances_incrementally() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "root-batch",
+            provider,
+            account.subject,
+            "/tmp/root-batch",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let baseline = test_remote_item(
+            "old-file",
+            Some("remote-root"),
+            "old.txt",
+            RemoteItemKind::File,
+        );
+        prepare_root_snapshot(
+            &mut storage,
+            &root,
+            std::slice::from_ref(&baseline),
+            "bootstrap-fence",
+            10,
+        );
+
+        let new_file = test_remote_item(
+            "new-file",
+            Some("remote-root"),
+            "new.txt",
+            RemoteItemKind::File,
+        );
+        let mutations = vec![
+            SyncRootCatalogMutation::DeleteSubtree {
+                remote_id: baseline.remote_id.clone(),
+            },
+            SyncRootCatalogMutation::Upsert(new_file.clone()),
+        ];
+
+        let result = storage
+            .commit_sync_root_catalog_batch_and_cursor(
+                &root.id,
+                &ChangeCursor::new("bootstrap-fence").unwrap(),
+                &mutations,
+                &ChangeCursor::new("checkpoint-one").unwrap(),
+                20,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SyncRootCatalogBatchCommit {
+                mutations_applied: 2,
+                authoritative_items: 1,
+                completed_initial_catchup: true,
+            }
+        );
+        assert!(
+            storage
+                .sync_root_remote_item(&root.id, "old-file")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage.sync_root_remote_item(&root.id, "new-file").unwrap(),
+            Some(new_file)
+        );
+
+        let state = storage.sync_root_remote_inventory_state(&root.id).unwrap();
+        assert!(state.snapshot_complete);
+        assert!(state.catchup_complete);
+        assert_eq!(state.item_count, 1);
+        assert_eq!(
+            state.catchup_from_cursor.unwrap().as_str(),
+            "bootstrap-fence"
+        );
+        assert_eq!(
+            storage
+                .sync_root_change_cursor(&root.id)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "checkpoint-one"
+        );
+
+        let result = storage
+            .commit_sync_root_catalog_batch_and_cursor(
+                &root.id,
+                &ChangeCursor::new("checkpoint-one").unwrap(),
+                &[],
+                &ChangeCursor::new("checkpoint-two").unwrap(),
+                30,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SyncRootCatalogBatchCommit {
+                mutations_applied: 0,
+                authoritative_items: 1,
+                completed_initial_catchup: false,
+            }
+        );
+        assert_eq!(
+            storage
+                .sync_root_change_cursor(&root.id)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "checkpoint-two"
+        );
+    }
+
+    #[test]
+    fn root_batch_failure_rolls_back_catalog_and_cursor() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "root-rollback",
+            provider,
+            account.subject,
+            "/tmp/root-rollback",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let baseline = test_remote_item(
+            "baseline",
+            Some("remote-root"),
+            "baseline.txt",
+            RemoteItemKind::File,
+        );
+        prepare_root_snapshot(
+            &mut storage,
+            &root,
+            std::slice::from_ref(&baseline),
+            "rollback-fence",
+            10,
+        );
+
+        let valid = test_remote_item(
+            "valid-before-failure",
+            Some("remote-root"),
+            "valid.txt",
+            RemoteItemKind::File,
+        );
+        let invalid = RemoteItem {
+            remote_id: "too-large".into(),
+            parent_remote_id: Some("remote-root".into()),
+            name: "too-large.bin".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(u64::MAX),
+            modified_unix_ms: None,
+            trashed: false,
+        };
+
+        let error = storage
+            .commit_sync_root_catalog_batch_and_cursor(
+                &root.id,
+                &ChangeCursor::new("rollback-fence").unwrap(),
+                &[
+                    SyncRootCatalogMutation::Upsert(valid),
+                    SyncRootCatalogMutation::Upsert(invalid),
+                ],
+                &ChangeCursor::new("must-not-persist").unwrap(),
+                20,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::NumericOverflow));
+        assert!(
+            storage
+                .sync_root_remote_item(&root.id, "valid-before-failure")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage.sync_root_remote_item(&root.id, "baseline").unwrap(),
+            Some(baseline)
+        );
+        assert!(storage.sync_root_change_cursor(&root.id).unwrap().is_none());
+
+        let state = storage.sync_root_remote_inventory_state(&root.id).unwrap();
+        assert!(state.snapshot_complete);
+        assert!(!state.catchup_complete);
+        assert_eq!(state.item_count, 1);
+        assert_eq!(
+            state.catchup_from_cursor.unwrap().as_str(),
+            "rollback-fence"
+        );
+    }
+
+    #[test]
+    fn root_batch_rejects_cursor_mismatch_without_mutation() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "root-mismatch",
+            provider,
+            account.subject,
+            "/tmp/root-mismatch",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        prepare_root_snapshot(&mut storage, &root, &[], "actual-fence", 10);
+
+        let item = test_remote_item(
+            "must-not-appear",
+            Some("remote-root"),
+            "nope.txt",
+            RemoteItemKind::File,
+        );
+
+        let error = storage
+            .commit_sync_root_catalog_batch_and_cursor(
+                &root.id,
+                &ChangeCursor::new("wrong-fence").unwrap(),
+                &[SyncRootCatalogMutation::Upsert(item)],
+                &ChangeCursor::new("must-not-persist").unwrap(),
+                20,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::SyncRootCatalogExpectedCursorMismatch
+        ));
+        assert_eq!(
+            storage.sync_root_remote_inventory_count(&root.id).unwrap(),
+            0
+        );
+        assert!(storage.sync_root_change_cursor(&root.id).unwrap().is_none());
+        assert!(
+            !storage
+                .sync_root_remote_inventory_state(&root.id)
+                .unwrap()
+                .catchup_complete
+        );
+    }
+
+    #[test]
+    fn root_batch_mutations_are_isolated_between_roots() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root_one = SyncRoot::new(
+            "batch-root-one",
+            provider.clone(),
+            account.subject.clone(),
+            "/tmp/batch-root-one",
+            Some("remote-root-one".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        let root_two = SyncRoot::new(
+            "batch-root-two",
+            provider,
+            account.subject,
+            "/tmp/batch-root-two",
+            Some("remote-root-two".into()),
+            SyncMode::ReceiveOnly,
+            3,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root_one).unwrap();
+        storage.insert_sync_root(&root_two).unwrap();
+
+        let shared_one = test_remote_item(
+            "shared-id",
+            Some("remote-root-one"),
+            "same.txt",
+            RemoteItemKind::File,
+        );
+        let shared_two = test_remote_item(
+            "shared-id",
+            Some("remote-root-two"),
+            "same.txt",
+            RemoteItemKind::File,
+        );
+
+        prepare_root_snapshot(
+            &mut storage,
+            &root_one,
+            std::slice::from_ref(&shared_one),
+            "fence-one",
+            10,
+        );
+        prepare_root_snapshot(
+            &mut storage,
+            &root_two,
+            std::slice::from_ref(&shared_two),
+            "fence-two",
+            20,
+        );
+
+        storage
+            .commit_sync_root_catalog_batch_and_cursor(
+                &root_one.id,
+                &ChangeCursor::new("fence-one").unwrap(),
+                &[SyncRootCatalogMutation::DeleteSubtree {
+                    remote_id: "shared-id".into(),
+                }],
+                &ChangeCursor::new("root-one-next").unwrap(),
+                30,
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .sync_root_remote_item(&root_one.id, "shared-id")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_item(&root_two.id, "shared-id")
+                .unwrap(),
+            Some(shared_two)
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_inventory_state(&root_one.id)
+                .unwrap()
+                .item_count,
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_inventory_state(&root_two.id)
+                .unwrap()
+                .item_count,
+            1
+        );
+        assert!(
+            storage
+                .sync_root_change_cursor(&root_two.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn root_batch_requires_authoritative_snapshot() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "root-without-snapshot",
+            provider,
+            account.subject,
+            "/tmp/root-without-snapshot",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let error = storage
+            .commit_sync_root_catalog_batch_and_cursor(
+                &root.id,
+                &ChangeCursor::new("missing-fence").unwrap(),
+                &[],
+                &ChangeCursor::new("next").unwrap(),
+                10,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::SyncRootCatalogSnapshotMissing
+        ));
     }
 
     #[test]

@@ -516,3 +516,37 @@ That advance must be introduced together with an atomic root-catalog mutation
 commit so catalog changes and cursor movement cannot diverge.
 
 No Drive request, file transfer, or sync-tree mutation is introduced here.
+
+## Phase 4S — Atomic selected-root catalog batch commit
+
+The storage layer can now atomically commit a fully resolved selected-root
+change batch together with its durable root cursor.
+
+`SyncRootCatalogMutation` intentionally contains only storage-ready operations:
+
+- `Upsert(RemoteItem)`
+- `DeleteSubtree { remote_id }`
+
+Provider membership resolution, root revalidation, and subtree hydration must
+happen before these mutations are submitted.
+
+`commit_sync_root_catalog_batch_and_cursor` enforces the durable baseline:
+
+- an authoritative root snapshot must already exist
+- before initial catch-up completes, `expected_cursor` must match
+  `catchup_from_cursor` and no incremental `change_cursor` may exist
+- after catch-up, `expected_cursor` must match the current per-root
+  `change_cursor`
+- cursor mismatch fails before any catalog mutation
+- all mutations, recursive deletes, `item_count`, catch-up completion, and
+  `change_cursor` advancement are committed in one SQLite transaction
+- any failure rolls the entire batch back, including the cursor
+- an empty mutation batch may still advance the cursor safely
+- identical provider IDs in another sync root remain isolated
+
+A new successful baseline-to-checkpoint commit transitions
+`catchup_complete` to true. Later commits remain incremental and use the durable
+per-root change cursor.
+
+Phase 4S is storage-only. It introduces no Drive request, keyring access, file
+transfer, local sync-tree mutation, or live selected-root catch-up.
