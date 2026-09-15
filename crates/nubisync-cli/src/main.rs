@@ -70,6 +70,14 @@ fn run() -> Result<(), CliError> {
         [sync, roots, status] if sync == "sync" && roots == "roots" && status == "status" => {
             sync_roots_status()
         }
+        [sync, roots, inventory, limit, value]
+            if sync == "sync"
+                && roots == "roots"
+                && inventory == "inventory"
+                && limit == "--limit" =>
+        {
+            sync_root_inventory(parse_inventory_limit(value)?)
+        }
         [sync, roots, add, mode_flag, mode_value]
             if sync == "sync" && roots == "roots" && add == "add" && mode_flag == "--mode" =>
         {
@@ -148,6 +156,7 @@ USAGE:
   nubisync auth google refresh
   nubisync auth google logout
   nubisync sync roots status
+  nubisync sync roots inventory --limit <1-10000>
   nubisync sync roots add --mode receive_only
   nubisync sync roots add --mode receive_only --dry-run
   nubisync drive changes
@@ -511,6 +520,252 @@ fn sync_roots_add(mode: SyncMode, dry_run: bool) -> Result<(), CliError> {
     println!("INVENTORY_PERSISTED=no");
     println!("FILESYSTEM_MUTATION=no");
     println!("FILE_CONTENT_ACCESSED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SyncRootInventoryStats {
+    pages_fetched: u64,
+    folders_visited: u64,
+    observed_items: u64,
+    supported_items: u64,
+    files: u64,
+    folders: u64,
+    unsupported_provider_native: u64,
+    limit_reached: bool,
+    traversal_complete: bool,
+    staged_items_before_clear: u64,
+}
+
+fn sync_root_inventory(max_items: u64) -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.is_empty() {
+        println!("SYNC_ROOT_INVENTORY=SKIPPED");
+        println!("REASON=no_configured_root");
+        println!("NETWORK_CHECK=not_performed");
+        println!("STAGING_MODIFIED=no");
+        println!("AUTHORITATIVE_CATALOG_MODIFIED=no");
+        println!("ROOT_CATALOG_STATE_MODIFIED=no");
+        println!("PROVIDER_CURSOR_MODIFIED=no");
+        println!("REMOTE_EVENTS_MODIFIED=no");
+        return Ok(());
+    }
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_INVENTORY=SKIPPED");
+        println!("REASON=multiple_roots_require_selector");
+        println!("NETWORK_CHECK=not_performed");
+        println!("STAGING_MODIFIED=no");
+        println!("AUTHORITATIVE_CATALOG_MODIFIED=no");
+        println!("ROOT_CATALOG_STATE_MODIFIED=no");
+        println!("PROVIDER_CURSOR_MODIFIED=no");
+        println!("REMOTE_EVENTS_MODIFIED=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootInventorySelectionFailed)?;
+
+    let remote_root_id = root
+        .remote_root_id
+        .clone()
+        .ok_or(CliError::SyncRootInventoryRemoteRootMissing)?;
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_INVENTORY_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("SYNC_ROOT_INVENTORY_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_INVENTORY_STAGE=validate_remote_root");
+    api.validate_folder_root(&remote_root_id)?;
+
+    storage.begin_sync_root_remote_inventory_staging(&root.id)?;
+
+    let observed_at_unix_ms = unix_time_ms()?;
+
+    let scan_result = (|| -> Result<SyncRootInventoryStats, CliError> {
+        let mut folder_queue = VecDeque::new();
+        let mut seen_folders = HashSet::new();
+
+        seen_folders.insert(remote_root_id.clone());
+        folder_queue.push_back(remote_root_id);
+
+        let mut pages_fetched = 0_u64;
+        let mut folders_visited = 0_u64;
+        let mut observed_items = 0_u64;
+        let mut supported_items = 0_u64;
+        let mut files = 0_u64;
+        let mut folders = 0_u64;
+        let mut unsupported_provider_native = 0_u64;
+        let mut limit_reached = false;
+
+        'folders: while let Some(parent_remote_id) = folder_queue.pop_front() {
+            folders_visited += 1;
+
+            let mut continuation = None;
+            let mut seen_continuations = HashSet::new();
+
+            loop {
+                if observed_items >= max_items {
+                    limit_reached = true;
+                    break 'folders;
+                }
+
+                if pages_fetched >= 10_000 {
+                    return Err(CliError::SyncRootInventoryPageLimitExceeded);
+                }
+
+                let remaining = (max_items - observed_items).min(1000);
+                let page_size =
+                    u16::try_from(remaining).map_err(|_| CliError::InvalidInventoryLimit)?;
+
+                let page_number = pages_fetched + 1;
+                println!("SYNC_ROOT_INVENTORY_FETCH_PAGE={page_number}");
+
+                let page = api.list_folder_children_page(
+                    &parent_remote_id,
+                    continuation.as_ref(),
+                    page_size,
+                )?;
+                pages_fetched += 1;
+
+                storage.stage_sync_root_remote_inventory_items(
+                    &root.id,
+                    &page.items,
+                    observed_at_unix_ms,
+                )?;
+
+                for item in &page.items {
+                    if item.kind == RemoteItemKind::Folder
+                        && seen_folders.insert(item.remote_id.clone())
+                    {
+                        folder_queue.push_back(item.remote_id.clone());
+                    }
+                }
+
+                let page_items = page.supported_items + page.unsupported_provider_native;
+                observed_items += page_items;
+                supported_items += page.supported_items;
+                files += page.file_count;
+                folders += page.folder_count;
+                unsupported_provider_native += page.unsupported_provider_native;
+
+                println!(
+                    "SYNC_ROOT_INVENTORY_PAGE_COMPLETE={} OBSERVED_SO_FAR={} FILES_SO_FAR={} FOLDERS_SO_FAR={} QUEUED_FOLDERS={}",
+                    pages_fetched,
+                    observed_items,
+                    files,
+                    folders,
+                    folder_queue.len()
+                );
+
+                match page.continuation {
+                    Some(next) => {
+                        if !seen_continuations.insert(next.as_str().to_owned()) {
+                            return Err(CliError::SyncRootInventoryPaginationLoop);
+                        }
+
+                        continuation = Some(next);
+
+                        if observed_items >= max_items {
+                            limit_reached = true;
+                            break 'folders;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        let traversal_complete = !limit_reached && folder_queue.is_empty();
+        let staged_items_before_clear =
+            storage.staged_sync_root_remote_inventory_count(&root.id)?;
+
+        Ok(SyncRootInventoryStats {
+            pages_fetched,
+            folders_visited,
+            observed_items,
+            supported_items,
+            files,
+            folders,
+            unsupported_provider_native,
+            limit_reached,
+            traversal_complete,
+            staged_items_before_clear,
+        })
+    })();
+
+    // Bounded inventory is never authoritative. Always attempt to remove staging,
+    // including when the provider scan itself failed.
+    storage.clear_sync_root_remote_inventory_staging(&root.id)?;
+
+    let stats = scan_result?;
+
+    println!("SYNC_ROOT_INVENTORY=PASS");
+    println!("MODE=bounded_recursive");
+    println!("MAX_ITEMS={max_items}");
+    println!("TRAVERSAL_COMPLETE={}", yes_no(stats.traversal_complete));
+    println!("LIMIT_REACHED={}", yes_no(stats.limit_reached));
+    println!("PAGES_FETCHED={}", stats.pages_fetched);
+    println!("FOLDERS_VISITED={}", stats.folders_visited);
+    println!("OBSERVED_ITEMS={}", stats.observed_items);
+    println!("SUPPORTED_ITEMS={}", stats.supported_items);
+    println!("FILES={}", stats.files);
+    println!("FOLDERS={}", stats.folders);
+    println!(
+        "UNSUPPORTED_PROVIDER_NATIVE={}",
+        stats.unsupported_provider_native
+    );
+    println!(
+        "STAGED_ITEMS_BEFORE_CLEAR={}",
+        stats.staged_items_before_clear
+    );
+    println!("STAGING_CLEARED=yes");
+    println!("REMOTE_ROOT_CONTAINER_INCLUDED=no");
+    println!("AUTHORITATIVE_CATALOG_MODIFIED=no");
+    println!("ROOT_CATALOG_STATE_MODIFIED=no");
+    println!("PROVIDER_CURSOR_MODIFIED=no");
+    println!("REMOTE_EVENTS_MODIFIED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("FILESYSTEM_MUTATION=no");
     println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
@@ -1800,4 +2055,12 @@ enum CliError {
     LocalSyncDirectoryHomeUnsupported,
     #[error("local sync directory must be empty for initial receive-only registration")]
     LocalSyncDirectoryNotEmpty,
+    #[error("sync root inventory selection failed")]
+    SyncRootInventorySelectionFailed,
+    #[error("configured sync root does not have a remote root identifier")]
+    SyncRootInventoryRemoteRootMissing,
+    #[error("sync root inventory pagination repeated a continuation token")]
+    SyncRootInventoryPaginationLoop,
+    #[error("sync root inventory pagination exceeded the safety limit")]
+    SyncRootInventoryPageLimitExceeded,
 }

@@ -369,3 +369,31 @@ compatibility. New selected-root bootstrap work must use the root-scoped tables.
 local paths, remote IDs, filenames, or provider metadata.
 
 Phase 4M performs no Drive request and registers no sync root.
+
+## Phase 4N — Bounded sync-root inventory integration
+
+NubiSync can now run the recursive Drive traversal through a configured sync
+root and exercise the root-scoped staging tables introduced in Phase 4M.
+
+Development command:
+
+`nubisync sync roots inventory --limit <1-10000>`
+
+Safety behavior:
+
+- zero configured roots: skip before keyring or network access
+- more than one configured root: skip until an explicit selector exists
+- exactly one root: validate that remote folder, traverse it breadth-first, and
+  stage supported descendants under that `sync_root_id`
+- bounded staging is always cleared before the command returns successfully
+- no authoritative root snapshot or root inventory state is committed
+- no provider cursor or remote event journal is modified
+- the selected remote folder itself is the container and is not cataloged as a
+  child item
+
+If the bounded provider scan returns an error, NubiSync still attempts to clear
+root-scoped staging before returning the scan error.
+
+Phase 4N intentionally does not offer a full/persistent root bootstrap. Safe
+subtree catch-up semantics for the account-wide Drive change stream must be
+defined before a selected-root snapshot can become authoritative.
