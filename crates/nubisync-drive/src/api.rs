@@ -99,6 +99,21 @@ impl GoogleDriveApi {
         })
     }
 
+    /// Returns a fresh cursor representing the current Drive change boundary.
+    ///
+    /// The opaque cursor is never printed by this provider.
+    pub fn current_change_cursor(&self) -> Result<ChangeCursor, DriveApiError> {
+        let response: StartPageTokenResponse = self
+            .client
+            .get(GOOGLE_DRIVE_START_PAGE_TOKEN_ENDPOINT)
+            .bearer_auth(self.access_token.as_str())
+            .send()?
+            .error_for_status()?
+            .json()?;
+
+        ChangeCursor::new(response.start_page_token).map_err(DriveApiError::from)
+    }
+
     /// Lists one metadata-only inventory page for ordinary Drive items
     /// owned by the current user.
     ///

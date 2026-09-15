@@ -322,6 +322,10 @@ fn drive_catalog_status() -> Result<(), CliError> {
     println!("DRIVE_CATALOG_STATUS=PASS");
     println!("SNAPSHOT_COMPLETE={}", yes_no(state.snapshot_complete));
     println!("CATCHUP_COMPLETE={}", yes_no(state.catchup_complete));
+    println!(
+        "CATCHUP_CURSOR_PRESENT={}",
+        yes_no(state.catchup_from_cursor.is_some())
+    );
     println!("STATE_ITEM_COUNT={}", state.item_count);
     println!("AUTHORITATIVE_ITEMS={authoritative_items}");
     println!("STAGING_ITEMS={staging_items}");
@@ -387,6 +391,13 @@ fn drive_inventory(max_items: Option<u64>) -> Result<(), CliError> {
     if user.sub != account.subject {
         return Err(CliError::GoogleAccountMismatch);
     }
+
+    let bootstrap_fence = if max_items.is_none() {
+        println!("DRIVE_INVENTORY_STAGE=capture_bootstrap_fence");
+        Some(api.current_change_cursor()?)
+    } else {
+        None
+    };
 
     storage.begin_remote_inventory_staging(&provider, &account.subject)?;
     let observed_at_unix_ms = unix_time_ms()?;
@@ -472,9 +483,14 @@ fn drive_inventory(max_items: Option<u64>) -> Result<(), CliError> {
     let staged_items = storage.staged_remote_inventory_count(&provider, &account.subject)?;
     let authoritative_snapshot_committed = inventory_complete && max_items.is_none();
     let authoritative_items = if authoritative_snapshot_committed {
+        let bootstrap_fence = bootstrap_fence
+            .as_ref()
+            .ok_or(CliError::MissingInventoryBootstrapFence)?;
+
         u64::try_from(storage.commit_remote_inventory_snapshot(
             &provider,
             &account.subject,
+            bootstrap_fence,
             unix_time_ms()?,
         )?)
         .map_err(|_| CliError::NumericOverflow)?
@@ -996,4 +1012,6 @@ enum CliError {
     Io(#[from] std::io::Error),
     #[error("OAuth callback URL was invalid")]
     Url(#[from] url::ParseError),
+    #[error("full inventory completed without its bootstrap change fence")]
+    MissingInventoryBootstrapFence,
 }

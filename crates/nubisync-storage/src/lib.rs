@@ -9,18 +9,21 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteInventoryState {
     pub snapshot_complete: bool,
     pub catchup_complete: bool,
     pub item_count: u64,
     pub snapshot_completed_at_unix_ms: Option<i64>,
+    pub catchup_from_cursor: Option<ChangeCursor>,
 }
 
 impl RemoteInventoryState {
-    pub fn ready_for_reconciliation(self) -> bool {
+    pub fn ready_for_reconciliation(&self) -> bool {
         self.snapshot_complete && self.catchup_complete
     }
 }
@@ -58,6 +61,15 @@ impl Storage {
 
     fn migrate(&mut self) -> Result<(), StorageError> {
         let transaction = self.connection.transaction()?;
+        let current_version: i64 =
+            transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        if current_version > SCHEMA_VERSION {
+            return Err(StorageError::UnsupportedSchemaVersion {
+                found: current_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
 
         transaction.execute_batch(
             "
@@ -184,12 +196,20 @@ impl Storage {
                     item_count >= 0
                 ),
                 snapshot_completed_at_unix_ms INTEGER,
+                catchup_from_cursor TEXT,
                 PRIMARY KEY (provider, account_subject),
                 FOREIGN KEY (provider, account_subject)
                     REFERENCES accounts(provider, subject) ON DELETE CASCADE
             );
             ",
         )?;
+
+        if current_version == 4 {
+            transaction.execute(
+                "ALTER TABLE remote_inventory_state ADD COLUMN catchup_from_cursor TEXT",
+                [],
+            )?;
+        }
 
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -421,6 +441,7 @@ impl Storage {
         &mut self,
         provider: &ProviderId,
         account_subject: &str,
+        catchup_from_cursor: &ChangeCursor,
         completed_at_unix_ms: i64,
     ) -> Result<usize, StorageError> {
         let transaction = self.connection.transaction()?;
@@ -466,18 +487,21 @@ impl Storage {
                 snapshot_complete,
                 catchup_complete,
                 item_count,
-                snapshot_completed_at_unix_ms
-             ) VALUES (?1, ?2, 1, 0, ?3, ?4)
+                snapshot_completed_at_unix_ms,
+                catchup_from_cursor
+             ) VALUES (?1, ?2, 1, 0, ?3, ?4, ?5)
              ON CONFLICT(provider, account_subject) DO UPDATE SET
                 snapshot_complete = 1,
                 catchup_complete = 0,
                 item_count = excluded.item_count,
-                snapshot_completed_at_unix_ms = excluded.snapshot_completed_at_unix_ms",
+                snapshot_completed_at_unix_ms = excluded.snapshot_completed_at_unix_ms,
+                catchup_from_cursor = excluded.catchup_from_cursor",
             params![
                 provider.as_str(),
                 account_subject,
                 item_count,
-                completed_at_unix_ms
+                completed_at_unix_ms,
+                catchup_from_cursor.as_str()
             ],
         )?;
 
@@ -496,36 +520,50 @@ impl Storage {
         provider: &ProviderId,
         account_subject: &str,
     ) -> Result<RemoteInventoryState, StorageError> {
-        let row: Option<(i64, i64, i64, Option<i64>)> = self
+        let row: Option<RemoteInventoryStateRow> = self
             .connection
             .query_row(
                 "SELECT
                     snapshot_complete,
                     catchup_complete,
                     item_count,
-                    snapshot_completed_at_unix_ms
+                    snapshot_completed_at_unix_ms,
+                    catchup_from_cursor
                  FROM remote_inventory_state
                  WHERE provider = ?1 AND account_subject = ?2",
                 params![provider.as_str(), account_subject],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
 
         match row {
-            Some((snapshot_complete, catchup_complete, item_count, completed_at)) => {
-                Ok(RemoteInventoryState {
-                    snapshot_complete: snapshot_complete != 0,
-                    catchup_complete: catchup_complete != 0,
-                    item_count: u64::try_from(item_count)
-                        .map_err(|_| StorageError::NumericOverflow)?,
-                    snapshot_completed_at_unix_ms: completed_at,
-                })
-            }
+            Some((
+                snapshot_complete,
+                catchup_complete,
+                item_count,
+                completed_at,
+                catchup_from_cursor,
+            )) => Ok(RemoteInventoryState {
+                snapshot_complete: snapshot_complete != 0,
+                catchup_complete: catchup_complete != 0,
+                item_count: u64::try_from(item_count).map_err(|_| StorageError::NumericOverflow)?,
+                snapshot_completed_at_unix_ms: completed_at,
+                catchup_from_cursor: catchup_from_cursor.map(ChangeCursor::new).transpose()?,
+            }),
             None => Ok(RemoteInventoryState {
                 snapshot_complete: false,
                 catchup_complete: false,
                 item_count: 0,
                 snapshot_completed_at_unix_ms: None,
+                catchup_from_cursor: None,
             }),
         }
     }
@@ -719,6 +757,8 @@ pub enum StorageError {
     NumericOverflow,
     #[error("internal inventory table selection is invalid")]
     InvalidInternalTable,
+    #[error("SQLite schema version {found} is newer than supported version {supported}")]
+    UnsupportedSchemaVersion { found: i64, supported: i64 },
 }
 
 #[cfg(test)]
@@ -850,7 +890,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             storage
-                .commit_remote_inventory_snapshot(&provider, &account.subject, 3)
+                .commit_remote_inventory_snapshot(
+                    &provider,
+                    &account.subject,
+                    &ChangeCursor::new("bootstrap-fence").unwrap(),
+                    3,
+                )
                 .unwrap(),
             2
         );
@@ -883,6 +928,7 @@ mod tests {
         assert!(!state.catchup_complete);
         assert_eq!(state.item_count, 0);
         assert_eq!(state.snapshot_completed_at_unix_ms, None);
+        assert!(state.catchup_from_cursor.is_none());
         assert!(!state.ready_for_reconciliation());
     }
 
@@ -905,7 +951,12 @@ mod tests {
             .stage_remote_inventory_items(&provider, &account.subject, &[item], 2)
             .unwrap();
         storage
-            .commit_remote_inventory_snapshot(&provider, &account.subject, 3)
+            .commit_remote_inventory_snapshot(
+                &provider,
+                &account.subject,
+                &ChangeCursor::new("bootstrap-fence").unwrap(),
+                3,
+            )
             .unwrap();
 
         let state = storage
@@ -916,6 +967,14 @@ mod tests {
         assert!(!state.catchup_complete);
         assert_eq!(state.item_count, 1);
         assert_eq!(state.snapshot_completed_at_unix_ms, Some(3));
+        assert_eq!(
+            state.catchup_from_cursor.as_ref().unwrap().as_str(),
+            "bootstrap-fence"
+        );
+        assert_eq!(
+            format!("{:?}", state.catchup_from_cursor.as_ref().unwrap()),
+            "ChangeCursor([redacted])"
+        );
         assert!(!state.ready_for_reconciliation());
     }
 

@@ -112,3 +112,23 @@ Offline aggregate status is available with:
 `nubisync drive catalog status`
 
 The status command performs no network request and prints no remote metadata.
+
+## Phase 4D — Bootstrap change fence
+
+A full remote inventory is not instantaneous. Files can change while inventory
+pages are being collected.
+
+Before an explicit `drive inventory --full` starts its metadata scan, NubiSync
+requests a fresh Drive start page token and keeps it as an opaque bootstrap fence.
+
+Bounded development probes do not request or persist this fence.
+
+If and only if the full inventory reaches the end of pagination, snapshot
+promotion stores the authoritative snapshot, `snapshot_complete=yes`,
+`catchup_complete=no`, the opaque catch-up cursor and the completion timestamp
+in the same SQLite transaction.
+
+The normal provider polling cursor is not modified by snapshot promotion.
+
+The bootstrap cursor is local synchronization metadata. It is never printed or
+sent as telemetry. `drive catalog status` reports only whether it exists.
