@@ -397,3 +397,28 @@ root-scoped staging before returning the scan error.
 Phase 4N intentionally does not offer a full/persistent root bootstrap. Safe
 subtree catch-up semantics for the account-wide Drive change stream must be
 defined before a selected-root snapshot can become authoritative.
+
+## Phase 4O — Transactional root-catalog mutation primitives
+
+The root-scoped catalog can now support the structural mutations needed by a
+future selected-root change-stream catch-up.
+
+Storage primitives include:
+
+- reading one root-scoped remote item
+- transactional upsert of one non-trashed remote item
+- treating a trashed upsert as subtree removal
+- recursive subtree removal using `parent_remote_id`
+- durable `item_count` refresh inside the same transaction
+
+Subtree deletion is keyed by `sync_root_id`, so identical provider IDs in a
+different sync root remain untouched.
+
+The recursive deletion anchor does not need to exist as a stored catalog row.
+This intentionally supports the selected remote root container itself, which is
+not cataloged as a child item: deleting that virtual root ID clears all cataloged
+descendants for that sync root.
+
+Phase 4O performs no network access, no filesystem mutation, and does not advance
+a provider cursor or mark catch-up complete. Provider-side subtree membership
+resolution remains a later phase.

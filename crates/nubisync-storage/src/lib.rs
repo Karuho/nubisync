@@ -13,6 +13,7 @@ use thiserror::Error;
 const SCHEMA_VERSION: i64 = 6;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
+type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteInventoryState {
@@ -606,6 +607,96 @@ impl Storage {
         u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
     }
 
+    pub fn sync_root_remote_item(
+        &self,
+        sync_root_id: &str,
+        remote_id: &str,
+    ) -> Result<Option<RemoteItem>, StorageError> {
+        let row: Option<SyncRootRemoteItemRow> = self
+            .connection
+            .query_row(
+                "SELECT
+                    parent_remote_id,
+                    name,
+                    item_kind,
+                    size_bytes,
+                    trashed
+                 FROM sync_root_remote_items
+                 WHERE sync_root_id = ?1 AND remote_id = ?2",
+                params![sync_root_id, remote_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((parent_remote_id, name, item_kind, size_bytes, trashed)) = row else {
+            return Ok(None);
+        };
+
+        let kind = match item_kind.as_str() {
+            "file" => RemoteItemKind::File,
+            "folder" => RemoteItemKind::Folder,
+            _ => return Err(StorageError::InvalidStoredRemoteItemKind),
+        };
+
+        let size_bytes = size_bytes
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| StorageError::NumericOverflow)?;
+
+        Ok(Some(RemoteItem {
+            remote_id: remote_id.to_owned(),
+            parent_remote_id,
+            name,
+            kind,
+            size_bytes,
+            modified_unix_ms: None,
+            trashed: trashed != 0,
+        }))
+    }
+
+    pub fn upsert_sync_root_remote_item(
+        &mut self,
+        sync_root_id: &str,
+        item: &RemoteItem,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction()?;
+
+        if item.trashed {
+            delete_sync_root_subtree_in_transaction(&transaction, sync_root_id, &item.remote_id)?;
+        } else {
+            upsert_sync_root_catalog_item(&transaction, sync_root_id, item, observed_at_unix_ms)?;
+        }
+
+        refresh_sync_root_catalog_count(&transaction, sync_root_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_sync_root_remote_subtree(
+        &mut self,
+        sync_root_id: &str,
+        remote_id: &str,
+    ) -> Result<u64, StorageError> {
+        let transaction = self.connection.transaction()?;
+
+        let deleted =
+            delete_sync_root_subtree_in_transaction(&transaction, sync_root_id, remote_id)?;
+
+        refresh_sync_root_catalog_count(&transaction, sync_root_id)?;
+        transaction.commit()?;
+
+        u64::try_from(deleted).map_err(|_| StorageError::NumericOverflow)
+    }
+
     pub fn sync_root_catalog_state_count(
         &self,
         provider: &ProviderId,
@@ -1067,6 +1158,101 @@ impl Storage {
     }
 }
 
+fn upsert_sync_root_catalog_item(
+    transaction: &Transaction<'_>,
+    sync_root_id: &str,
+    item: &RemoteItem,
+    observed_at_unix_ms: i64,
+) -> Result<(), StorageError> {
+    let item_kind = match item.kind {
+        RemoteItemKind::File => "file",
+        RemoteItemKind::Folder => "folder",
+    };
+
+    let size_bytes = item
+        .size_bytes
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| StorageError::NumericOverflow)?;
+
+    transaction.execute(
+        "INSERT INTO sync_root_remote_items (
+            sync_root_id,
+            remote_id,
+            parent_remote_id,
+            name,
+            item_kind,
+            size_bytes,
+            trashed,
+            observed_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
+         ON CONFLICT(sync_root_id, remote_id) DO UPDATE SET
+            parent_remote_id = excluded.parent_remote_id,
+            name = excluded.name,
+            item_kind = excluded.item_kind,
+            size_bytes = excluded.size_bytes,
+            trashed = 0,
+            observed_at_unix_ms = excluded.observed_at_unix_ms",
+        params![
+            sync_root_id,
+            item.remote_id,
+            item.parent_remote_id,
+            item.name,
+            item_kind,
+            size_bytes,
+            observed_at_unix_ms
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn delete_sync_root_subtree_in_transaction(
+    transaction: &Transaction<'_>,
+    sync_root_id: &str,
+    remote_id: &str,
+) -> Result<usize, StorageError> {
+    let deleted = transaction.execute(
+        "WITH RECURSIVE subtree(remote_id) AS (
+            SELECT ?2
+            UNION
+            SELECT child.remote_id
+            FROM sync_root_remote_items AS child
+            INNER JOIN subtree AS parent
+                ON child.parent_remote_id = parent.remote_id
+            WHERE child.sync_root_id = ?1
+         )
+         DELETE FROM sync_root_remote_items
+         WHERE sync_root_id = ?1
+           AND remote_id IN (SELECT remote_id FROM subtree)",
+        params![sync_root_id, remote_id],
+    )?;
+
+    Ok(deleted)
+}
+
+fn refresh_sync_root_catalog_count(
+    transaction: &Transaction<'_>,
+    sync_root_id: &str,
+) -> Result<(), StorageError> {
+    let item_count: i64 = transaction.query_row(
+        "SELECT COUNT(*)
+         FROM sync_root_remote_items
+         WHERE sync_root_id = ?1",
+        params![sync_root_id],
+        |row| row.get(0),
+    )?;
+
+    transaction.execute(
+        "UPDATE sync_root_remote_inventory_state
+         SET item_count = ?2
+         WHERE sync_root_id = ?1",
+        params![sync_root_id, item_count],
+    )?;
+
+    Ok(())
+}
+
 fn insert_sync_root_inventory_item(
     transaction: &Transaction<'_>,
     sync_root_id: &str,
@@ -1351,6 +1537,8 @@ pub enum StorageError {
     NumericOverflow,
     #[error("internal inventory table selection is invalid")]
     InvalidInternalTable,
+    #[error("stored root-catalog item kind is invalid")]
+    InvalidStoredRemoteItemKind,
     #[error("SQLite schema version {found} is newer than supported version {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     #[error("remote catalog does not have a complete authoritative snapshot")]
@@ -1375,6 +1563,23 @@ mod tests {
             Some("Test User".into()),
         )
         .unwrap()
+    }
+
+    fn test_remote_item(
+        remote_id: &str,
+        parent_remote_id: Option<&str>,
+        name: &str,
+        kind: RemoteItemKind,
+    ) -> RemoteItem {
+        RemoteItem {
+            remote_id: remote_id.into(),
+            parent_remote_id: parent_remote_id.map(str::to_owned),
+            name: name.into(),
+            kind,
+            size_bytes: Some(10),
+            modified_unix_ms: None,
+            trashed: false,
+        }
     }
 
     fn test_upsert(remote_id: &str, size_bytes: Option<u64>) -> RemoteChange {
@@ -1595,6 +1800,195 @@ mod tests {
                 .sync_root_catalog_item_count(&provider, &account.subject)
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn root_catalog_mutations_are_recursive_isolated_and_counted() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root_one = SyncRoot::new(
+            "root-one",
+            provider.clone(),
+            account.subject.clone(),
+            "/tmp/root-one",
+            Some("remote-root-one".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        let root_two = SyncRoot::new(
+            "root-two",
+            provider.clone(),
+            account.subject.clone(),
+            "/tmp/root-two",
+            Some("remote-root-two".into()),
+            SyncMode::ReceiveOnly,
+            3,
+        )
+        .unwrap();
+
+        storage.insert_sync_root(&root_one).unwrap();
+        storage.insert_sync_root(&root_two).unwrap();
+
+        let root_one_items = vec![
+            test_remote_item(
+                "folder-a",
+                Some("remote-root-one"),
+                "folder-a",
+                RemoteItemKind::Folder,
+            ),
+            test_remote_item(
+                "file-under-a",
+                Some("folder-a"),
+                "nested.txt",
+                RemoteItemKind::File,
+            ),
+            test_remote_item(
+                "sibling",
+                Some("remote-root-one"),
+                "sibling.txt",
+                RemoteItemKind::File,
+            ),
+        ];
+        let root_two_items = vec![
+            test_remote_item(
+                "folder-a",
+                Some("remote-root-two"),
+                "folder-a",
+                RemoteItemKind::Folder,
+            ),
+            test_remote_item(
+                "file-under-a",
+                Some("folder-a"),
+                "nested.txt",
+                RemoteItemKind::File,
+            ),
+        ];
+
+        storage
+            .begin_sync_root_remote_inventory_staging(&root_one.id)
+            .unwrap();
+        storage
+            .begin_sync_root_remote_inventory_staging(&root_two.id)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(&root_one.id, &root_one_items, 4)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(&root_two.id, &root_two_items, 5)
+            .unwrap();
+
+        storage
+            .commit_sync_root_remote_inventory_snapshot(
+                &root_one.id,
+                &ChangeCursor::new("fence-one").unwrap(),
+                6,
+            )
+            .unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(
+                &root_two.id,
+                &ChangeCursor::new("fence-two").unwrap(),
+                7,
+            )
+            .unwrap();
+
+        let deleted = storage
+            .delete_sync_root_remote_subtree(&root_one.id, "folder-a")
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        assert!(
+            storage
+                .sync_root_remote_item(&root_one.id, "folder-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .sync_root_remote_item(&root_one.id, "file-under-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .sync_root_remote_item(&root_one.id, "sibling")
+                .unwrap()
+                .is_some()
+        );
+
+        // The same remote IDs in another root are untouched.
+        assert!(
+            storage
+                .sync_root_remote_item(&root_two.id, "folder-a")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .sync_root_remote_item(&root_two.id, "file-under-a")
+                .unwrap()
+                .is_some()
+        );
+
+        let state = storage
+            .sync_root_remote_inventory_state(&root_one.id)
+            .unwrap();
+        assert_eq!(state.item_count, 1);
+
+        let new_item = test_remote_item(
+            "new-file",
+            Some("remote-root-one"),
+            "new.txt",
+            RemoteItemKind::File,
+        );
+        storage
+            .upsert_sync_root_remote_item(&root_one.id, &new_item, 8)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .sync_root_remote_item(&root_one.id, "new-file")
+                .unwrap(),
+            Some(new_item)
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_inventory_state(&root_one.id)
+                .unwrap()
+                .item_count,
+            2
+        );
+
+        // The selected remote root container is intentionally virtual/not stored.
+        // Deleting from that ID still clears every descendant in this root.
+        let deleted = storage
+            .delete_sync_root_remote_subtree(&root_one.id, "remote-root-one")
+            .unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(
+            storage
+                .sync_root_remote_inventory_count(&root_one.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_inventory_state(&root_one.id)
+                .unwrap()
+                .item_count,
+            0
+        );
+
+        assert_eq!(
+            storage
+                .sync_root_remote_inventory_count(&root_two.id)
+                .unwrap(),
+            2
         );
     }
 
