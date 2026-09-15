@@ -291,3 +291,33 @@ for My Drive's root folder.
 Phase 4J intentionally does not persist a sync root. Registration remains an
 explicit later operation once both a remote folder and local directory have been
 chosen.
+
+## Phase 4K — Explicit sync-root registration
+
+NubiSync can now explicitly register a durable sync root after both sides have
+been validated.
+
+Development command:
+
+`nubisync sync roots add --mode receive_only`
+
+The local directory and Drive folder ID are requested interactively so they are
+not placed in shell history by the command itself.
+
+Registration requirements:
+
+- local path must already exist
+- local path must be absolute
+- local root cannot itself be a symbolic link
+- remote root must pass Phase 4J Drive folder validation
+- duplicate local roots are rejected
+- duplicate remote root identifiers are rejected
+- registration is insert-only; an existing root is never overwritten
+
+Only `receive_only` is accepted in this phase. The domain model retains
+`two_way` and `mirror_local_to_remote`, but the CLI fails closed for those modes
+until transfer/write semantics exist.
+
+Registration writes only NubiSync configuration metadata to SQLite. It does not
+scan the tree, download content, mutate the selected local directory, or perform
+a Drive write.

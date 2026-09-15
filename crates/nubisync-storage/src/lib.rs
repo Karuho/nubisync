@@ -290,7 +290,7 @@ impl Storage {
         Ok(accounts)
     }
 
-    pub fn upsert_sync_root(&self, root: &SyncRoot) -> Result<(), StorageError> {
+    pub fn insert_sync_root(&self, root: &SyncRoot) -> Result<(), StorageError> {
         self.connection.execute(
             "INSERT INTO sync_roots (
                 id,
@@ -300,13 +300,7 @@ impl Storage {
                 remote_root_id,
                 mode,
                 created_at_unix_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(id) DO UPDATE SET
-                provider = excluded.provider,
-                account_subject = excluded.account_subject,
-                local_path = excluded.local_path,
-                remote_root_id = excluded.remote_root_id,
-                mode = excluded.mode",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 root.id,
                 root.provider.as_str(),
@@ -1118,7 +1112,7 @@ mod tests {
         )
         .unwrap();
 
-        storage.upsert_sync_root(&root).unwrap();
+        storage.insert_sync_root(&root).unwrap();
 
         let roots = storage
             .list_sync_roots(&provider, &account.subject)
@@ -1131,6 +1125,47 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn sync_root_registration_is_insert_only() {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "sync-root-1",
+            provider.clone(),
+            account.subject.clone(),
+            "/tmp/nubisync-one",
+            Some("remote-one".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+
+        storage.insert_sync_root(&root).unwrap();
+
+        let duplicate_id = SyncRoot::new(
+            "sync-root-1",
+            provider.clone(),
+            account.subject.clone(),
+            "/tmp/nubisync-two",
+            Some("remote-two".into()),
+            SyncMode::ReceiveOnly,
+            3,
+        )
+        .unwrap();
+
+        assert!(storage.insert_sync_root(&duplicate_id).is_err());
+
+        let roots = storage
+            .list_sync_roots(&provider, &account.subject)
+            .unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].local_path, "/tmp/nubisync-one");
+        assert_eq!(roots[0].remote_root_id.as_deref(), Some("remote-one"));
     }
 
     #[test]

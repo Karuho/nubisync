@@ -6,7 +6,9 @@
 #![forbid(unsafe_code)]
 
 use nubisync_auth::{KeyringSecretStore, SecretKey, SecretStore, SecretValue};
-use nubisync_core::{ProviderAccount, ProviderId, RemoteChange, RemoteItemKind};
+use nubisync_core::{
+    ProviderAccount, ProviderId, RemoteChange, RemoteItemKind, SyncMode, SyncRoot,
+};
 use nubisync_drive::{GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig};
 use nubisync_storage::Storage;
 use std::{
@@ -67,6 +69,11 @@ fn run() -> Result<(), CliError> {
         }
         [sync, roots, status] if sync == "sync" && roots == "roots" && status == "status" => {
             sync_roots_status()
+        }
+        [sync, roots, add, mode_flag, mode_value]
+            if sync == "sync" && roots == "roots" && add == "add" && mode_flag == "--mode" =>
+        {
+            sync_roots_add(parse_sync_root_mode(mode_value)?)
         }
         [drive, changes] if drive == "drive" && changes == "changes" => drive_changes(),
         [drive, catalog, status]
@@ -132,6 +139,7 @@ USAGE:
   nubisync auth google refresh
   nubisync auth google logout
   nubisync sync roots status
+  nubisync sync roots add --mode receive_only
   nubisync drive changes
   nubisync drive catalog status
   nubisync drive catalog catchup
@@ -324,6 +332,137 @@ fn google_logout() -> Result<(), CliError> {
     println!("REFRESH_TOKEN_REMOVED=yes");
     println!("CLIENT_CONFIG_RETAINED=yes");
     println!("LOCAL_METADATA_RETAINED=yes");
+
+    Ok(())
+}
+
+fn parse_sync_root_mode(value: &str) -> Result<SyncMode, CliError> {
+    let mode = SyncMode::parse(value)?;
+
+    if mode != SyncMode::ReceiveOnly {
+        return Err(CliError::SyncRootModeNotYetSupported);
+    }
+
+    Ok(mode)
+}
+
+fn validate_local_sync_directory(value: &str) -> Result<String, CliError> {
+    if value.trim().is_empty() {
+        return Err(CliError::InvalidLocalSyncDirectory);
+    }
+
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(CliError::LocalSyncDirectoryMustBeAbsolute);
+    }
+
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|_| CliError::LocalSyncDirectoryUnavailable)?;
+
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::LocalSyncDirectorySymlinkUnsupported);
+    }
+
+    if !metadata.is_dir() {
+        return Err(CliError::LocalSyncDirectoryNotDirectory);
+    }
+
+    let canonical = fs::canonicalize(path).map_err(|_| CliError::LocalSyncDirectoryUnavailable)?;
+
+    canonical
+        .into_os_string()
+        .into_string()
+        .map_err(|_| CliError::LocalSyncDirectoryNonUtf8)
+}
+
+fn sync_roots_add(mode: SyncMode) -> Result<(), CliError> {
+    let local_path_input = prompt_line("Local sync directory (absolute, existing): ")?;
+    let remote_root_id = prompt_line("Google Drive folder ID (or root): ")?;
+
+    let local_path = validate_local_sync_directory(&local_path_input)?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let existing_roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if existing_roots
+        .iter()
+        .any(|root| root.local_path == local_path)
+    {
+        return Err(CliError::LocalSyncDirectoryAlreadyRegistered);
+    }
+
+    if existing_roots
+        .iter()
+        .any(|root| root.remote_root_id.as_deref() == Some(remote_root_id.as_str()))
+    {
+        return Err(CliError::RemoteSyncRootAlreadyRegistered);
+    }
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_ADD_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("SYNC_ROOT_ADD_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_ADD_STAGE=validate_remote_root");
+    api.validate_folder_root(&remote_root_id)?;
+
+    let created_at_unix_ms = unix_time_ms()?;
+    let root = SyncRoot::new(
+        format!("sync-root-{created_at_unix_ms}"),
+        provider.clone(),
+        account.subject.clone(),
+        local_path,
+        Some(remote_root_id),
+        mode,
+        created_at_unix_ms,
+    )?;
+
+    storage.insert_sync_root(&root)?;
+
+    let configured_roots = storage.sync_root_count(&provider, &account.subject)?;
+
+    println!("SYNC_ROOT_ADD=PASS");
+    println!("MODE={}", mode.as_str());
+    println!("LOCAL_DIRECTORY_VERIFIED=yes");
+    println!("REMOTE_ROOT_VERIFIED=yes");
+    println!("SYNC_ROOT_PERSISTED=yes");
+    println!("CONFIGURED_ROOTS={configured_roots}");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("INVENTORY_PERSISTED=no");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
 }
@@ -1410,6 +1549,74 @@ fn unix_time_ms() -> Result<i64, CliError> {
     i64::try_from(duration.as_millis()).map_err(|_| CliError::ClockOverflow)
 }
 
+#[cfg(test)]
+mod sync_root_cli_tests {
+    use super::*;
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let unique = format!(
+            "nubisync-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn sync_root_mode_is_fail_closed_to_receive_only() {
+        assert_eq!(
+            parse_sync_root_mode("receive_only").unwrap(),
+            SyncMode::ReceiveOnly
+        );
+        assert!(matches!(
+            parse_sync_root_mode("two_way"),
+            Err(CliError::SyncRootModeNotYetSupported)
+        ));
+        assert!(matches!(
+            parse_sync_root_mode("mirror_local_to_remote"),
+            Err(CliError::SyncRootModeNotYetSupported)
+        ));
+    }
+
+    #[test]
+    fn local_sync_directory_must_exist_and_be_absolute_directory() {
+        let path = temp_test_dir("root");
+        fs::create_dir(&path).unwrap();
+
+        let validated = validate_local_sync_directory(path.to_str().unwrap()).unwrap();
+        assert_eq!(PathBuf::from(validated), fs::canonicalize(&path).unwrap());
+
+        fs::remove_dir(&path).unwrap();
+
+        assert!(matches!(
+            validate_local_sync_directory("relative/path"),
+            Err(CliError::LocalSyncDirectoryMustBeAbsolute)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_sync_directory_rejects_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let target = temp_test_dir("target");
+        let link = temp_test_dir("link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(matches!(
+            validate_local_sync_directory(link.to_str().unwrap()),
+            Err(CliError::LocalSyncDirectorySymlinkUnsupported)
+        ));
+
+        fs::remove_file(&link).unwrap();
+        fs::remove_dir(&target).unwrap();
+    }
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     #[error("invalid command; run `nubisync help`")]
@@ -1496,4 +1703,22 @@ enum CliError {
     DriveFolderTreePaginationLoop,
     #[error("Drive folder tree pagination exceeded the safety limit")]
     DriveFolderTreePageLimitExceeded,
+    #[error("only receive_only sync roots are supported in this alpha phase")]
+    SyncRootModeNotYetSupported,
+    #[error("local sync directory is invalid")]
+    InvalidLocalSyncDirectory,
+    #[error("local sync directory must be an absolute path")]
+    LocalSyncDirectoryMustBeAbsolute,
+    #[error("local sync directory does not exist or cannot be inspected")]
+    LocalSyncDirectoryUnavailable,
+    #[error("local sync directory cannot be a symbolic link")]
+    LocalSyncDirectorySymlinkUnsupported,
+    #[error("local sync path is not a directory")]
+    LocalSyncDirectoryNotDirectory,
+    #[error("local sync directory is not representable as UTF-8")]
+    LocalSyncDirectoryNonUtf8,
+    #[error("local sync directory is already registered")]
+    LocalSyncDirectoryAlreadyRegistered,
+    #[error("remote Drive sync root is already registered")]
+    RemoteSyncRootAlreadyRegistered,
 }
