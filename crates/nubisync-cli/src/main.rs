@@ -315,7 +315,7 @@ fn drive_inventory(max_items: Option<u64>) -> Result<(), CliError> {
         return Err(CliError::NoLocalGoogleAccount);
     }
 
-    let storage = Storage::open(&db_path)?;
+    let mut storage = Storage::open(&db_path)?;
     let provider = ProviderId::new("google-drive")?;
     let account = single_google_account(storage.list_accounts(&provider)?)?;
 
@@ -344,6 +344,9 @@ fn drive_inventory(max_items: Option<u64>) -> Result<(), CliError> {
     if user.sub != account.subject {
         return Err(CliError::GoogleAccountMismatch);
     }
+
+    storage.begin_remote_inventory_staging(&provider, &account.subject)?;
+    let observed_at_unix_ms = unix_time_ms()?;
 
     let mut continuation = None;
     let mut seen_continuations = HashSet::new();
@@ -379,6 +382,12 @@ fn drive_inventory(max_items: Option<u64>) -> Result<(), CliError> {
 
         let page = api.list_inventory_page(continuation.as_ref(), page_size)?;
         pages_fetched += 1;
+        storage.stage_remote_inventory_items(
+            &provider,
+            &account.subject,
+            &page.items,
+            observed_at_unix_ms,
+        )?;
 
         let page_items = page.supported_items + page.unsupported_provider_native;
         observed_items += page_items;
@@ -417,6 +426,16 @@ fn drive_inventory(max_items: Option<u64>) -> Result<(), CliError> {
         }
     }
 
+    let staged_items = storage.staged_remote_inventory_count(&provider, &account.subject)?;
+    let authoritative_snapshot_committed = inventory_complete && max_items.is_none();
+    let authoritative_items = if authoritative_snapshot_committed {
+        u64::try_from(storage.commit_remote_inventory_snapshot(&provider, &account.subject)?)
+            .map_err(|_| CliError::NumericOverflow)?
+    } else {
+        storage.clear_remote_inventory_staging(&provider, &account.subject)?;
+        storage.remote_inventory_count(&provider, &account.subject)?
+    };
+
     println!("DRIVE_INVENTORY=PASS");
     println!(
         "MODE={}",
@@ -438,7 +457,20 @@ fn drive_inventory(max_items: Option<u64>) -> Result<(), CliError> {
     println!("FILES={files}");
     println!("FOLDERS={folders}");
     println!("UNSUPPORTED_PROVIDER_NATIVE={unsupported_provider_native}");
-    println!("INVENTORY_PERSISTED=no");
+    println!("STAGED_ITEMS={staged_items}");
+    println!(
+        "AUTHORITATIVE_SNAPSHOT_COMMITTED={}",
+        yes_no(authoritative_snapshot_committed)
+    );
+    println!("AUTHORITATIVE_ITEMS={authoritative_items}");
+    println!(
+        "STAGING_CLEARED={}",
+        yes_no(!authoritative_snapshot_committed)
+    );
+    println!(
+        "INVENTORY_PERSISTED={}",
+        yes_no(authoritative_snapshot_committed)
+    );
     println!("PROVIDER_CURSOR_MODIFIED=no");
     println!("REMOTE_EVENTS_MODIFIED=no");
     println!("REMOTE_METADATA_PRINTED=no");
@@ -869,6 +901,8 @@ enum CliError {
     DriveInventoryPageLimitExceeded,
     #[error("inventory limit must be an integer between 1 and 10000")]
     InvalidInventoryLimit,
+    #[error("numeric value does not fit CLI counters")]
+    NumericOverflow,
     #[error("Google Drive change stream ended without a durable checkpoint")]
     DriveChangeStreamMissingCheckpoint,
     #[error("stored Google OAuth client configuration is missing")]

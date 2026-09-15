@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub struct Storage {
     connection: Connection,
@@ -125,6 +125,37 @@ impl Storage {
 
             CREATE INDEX IF NOT EXISTS remote_events_pending_idx
             ON remote_events(provider, account_subject, status, id);
+
+
+            CREATE TABLE IF NOT EXISTS remote_items (
+                provider TEXT NOT NULL,
+                account_subject TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                parent_remote_id TEXT,
+                name TEXT NOT NULL,
+                item_kind TEXT NOT NULL CHECK (item_kind IN ('file', 'folder')),
+                size_bytes INTEGER,
+                trashed INTEGER NOT NULL DEFAULT 0 CHECK (trashed IN (0, 1)),
+                observed_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (provider, account_subject, remote_id),
+                FOREIGN KEY (provider, account_subject)
+                    REFERENCES accounts(provider, subject) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS remote_inventory_staging (
+                provider TEXT NOT NULL,
+                account_subject TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                parent_remote_id TEXT,
+                name TEXT NOT NULL,
+                item_kind TEXT NOT NULL CHECK (item_kind IN ('file', 'folder')),
+                size_bytes INTEGER,
+                trashed INTEGER NOT NULL DEFAULT 0 CHECK (trashed IN (0, 1)),
+                observed_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (provider, account_subject, remote_id),
+                FOREIGN KEY (provider, account_subject)
+                    REFERENCES accounts(provider, subject) ON DELETE CASCADE
+            );
             ",
         )?;
 
@@ -296,6 +327,96 @@ impl Storage {
         Ok(changes.len())
     }
 
+    pub fn begin_remote_inventory_staging(
+        &self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM remote_inventory_staging WHERE provider = ?1 AND account_subject = ?2",
+            params![provider.as_str(), account_subject],
+        )?;
+        Ok(())
+    }
+
+    pub fn stage_remote_inventory_items(
+        &mut self,
+        provider: &ProviderId,
+        account_subject: &str,
+        items: &[RemoteItem],
+        observed_at_unix_ms: i64,
+    ) -> Result<usize, StorageError> {
+        let transaction = self.connection.transaction()?;
+        for item in items {
+            insert_inventory_item(
+                &transaction,
+                provider,
+                account_subject,
+                item,
+                observed_at_unix_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(items.len())
+    }
+
+    pub fn staged_remote_inventory_count(
+        &self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<u64, StorageError> {
+        count_inventory(
+            &self.connection,
+            "remote_inventory_staging",
+            provider,
+            account_subject,
+        )
+    }
+
+    pub fn clear_remote_inventory_staging(
+        &self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM remote_inventory_staging WHERE provider = ?1 AND account_subject = ?2",
+            params![provider.as_str(), account_subject],
+        )?;
+        Ok(())
+    }
+
+    pub fn commit_remote_inventory_snapshot(
+        &mut self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<usize, StorageError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM remote_items WHERE provider = ?1 AND account_subject = ?2",
+            params![provider.as_str(), account_subject],
+        )?;
+        let inserted = transaction.execute(
+            "INSERT INTO remote_items (provider, account_subject, remote_id, parent_remote_id, name, item_kind, size_bytes, trashed, observed_at_unix_ms)
+             SELECT provider, account_subject, remote_id, parent_remote_id, name, item_kind, size_bytes, trashed, observed_at_unix_ms
+             FROM remote_inventory_staging WHERE provider = ?1 AND account_subject = ?2",
+            params![provider.as_str(), account_subject],
+        )?;
+        transaction.execute(
+            "DELETE FROM remote_inventory_staging WHERE provider = ?1 AND account_subject = ?2",
+            params![provider.as_str(), account_subject],
+        )?;
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn remote_inventory_count(
+        &self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<u64, StorageError> {
+        count_inventory(&self.connection, "remote_items", provider, account_subject)
+    }
+
     pub fn pending_remote_event_count(
         &self,
         provider: &ProviderId,
@@ -315,6 +436,59 @@ impl Storage {
 
         u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
     }
+}
+
+fn insert_inventory_item(
+    transaction: &Transaction<'_>,
+    provider: &ProviderId,
+    account_subject: &str,
+    item: &RemoteItem,
+    observed_at_unix_ms: i64,
+) -> Result<(), StorageError> {
+    let item_kind = match item.kind {
+        RemoteItemKind::File => "file",
+        RemoteItemKind::Folder => "folder",
+    };
+    let size_bytes = item
+        .size_bytes
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| StorageError::NumericOverflow)?;
+    transaction.execute(
+        "INSERT INTO remote_inventory_staging (provider, account_subject, remote_id, parent_remote_id, name, item_kind, size_bytes, trashed, observed_at_unix_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(provider, account_subject, remote_id) DO UPDATE SET
+           parent_remote_id = excluded.parent_remote_id,
+           name = excluded.name,
+           item_kind = excluded.item_kind,
+           size_bytes = excluded.size_bytes,
+           trashed = excluded.trashed,
+           observed_at_unix_ms = excluded.observed_at_unix_ms",
+        params![provider.as_str(), account_subject, item.remote_id, item.parent_remote_id, item.name, item_kind, size_bytes, i64::from(item.trashed), observed_at_unix_ms],
+    )?;
+    Ok(())
+}
+
+fn count_inventory(
+    connection: &Connection,
+    table: &'static str,
+    provider: &ProviderId,
+    account_subject: &str,
+) -> Result<u64, StorageError> {
+    let sql = match table {
+        "remote_items" => {
+            "SELECT COUNT(*) FROM remote_items WHERE provider = ?1 AND account_subject = ?2"
+        }
+        "remote_inventory_staging" => {
+            "SELECT COUNT(*) FROM remote_inventory_staging WHERE provider = ?1 AND account_subject = ?2"
+        }
+        _ => return Err(StorageError::InvalidInternalTable),
+    };
+    let count: i64 =
+        connection.query_row(sql, params![provider.as_str(), account_subject], |row| {
+            row.get(0)
+        })?;
+    u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
 }
 
 fn insert_remote_event(
@@ -422,6 +596,8 @@ pub enum StorageError {
     Core(#[from] nubisync_core::CoreError),
     #[error("numeric value does not fit SQLite storage")]
     NumericOverflow,
+    #[error("internal inventory table selection is invalid")]
+    InvalidInternalTable,
 }
 
 #[cfg(test)]
@@ -490,6 +666,85 @@ mod tests {
 
         assert_eq!(loaded.as_str(), cursor.as_str());
         assert_eq!(format!("{loaded:?}"), "ChangeCursor([redacted])");
+    }
+
+    #[test]
+    fn bounded_inventory_staging_can_be_discarded() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+        let item = match test_upsert("file-1", Some(10)) {
+            RemoteChange::Upsert(item) => item,
+            RemoteChange::Delete { .. } => unreachable!(),
+        };
+        storage
+            .begin_remote_inventory_staging(&provider, &account.subject)
+            .unwrap();
+        storage
+            .stage_remote_inventory_items(&provider, &account.subject, &[item], 2)
+            .unwrap();
+        assert_eq!(
+            storage
+                .staged_remote_inventory_count(&provider, &account.subject)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .remote_inventory_count(&provider, &account.subject)
+                .unwrap(),
+            0
+        );
+        storage
+            .clear_remote_inventory_staging(&provider, &account.subject)
+            .unwrap();
+        assert_eq!(
+            storage
+                .staged_remote_inventory_count(&provider, &account.subject)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn complete_inventory_promotes_staging() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+        let first = match test_upsert("file-1", Some(10)) {
+            RemoteChange::Upsert(item) => item,
+            _ => unreachable!(),
+        };
+        let second = match test_upsert("file-2", Some(20)) {
+            RemoteChange::Upsert(item) => item,
+            _ => unreachable!(),
+        };
+        storage
+            .begin_remote_inventory_staging(&provider, &account.subject)
+            .unwrap();
+        storage
+            .stage_remote_inventory_items(&provider, &account.subject, &[first, second], 2)
+            .unwrap();
+        assert_eq!(
+            storage
+                .commit_remote_inventory_snapshot(&provider, &account.subject)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            storage
+                .remote_inventory_count(&provider, &account.subject)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            storage
+                .staged_remote_inventory_count(&provider, &account.subject)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

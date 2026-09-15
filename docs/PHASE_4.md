@@ -71,3 +71,19 @@ A complete scan is explicit:
 A bounded probe reports `INVENTORY_COMPLETE=no` and `LIMIT_REACHED=yes` when
 the cap is reached. It does not persist inventory metadata, alter the durable
 change cursor, or modify the pending remote-event journal.
+
+
+## Phase 4B — Durable inventory staging
+
+SQLite schema version 3 separates temporary inventory collection from the
+complete authoritative remote snapshot.
+
+Bounded probes stage supported file/folder metadata and then discard that
+staging data. They never replace the authoritative snapshot.
+
+Only an explicit `drive inventory --full` run that reaches the end of Drive
+pagination may atomically promote staging into `remote_items`.
+
+This keeps routine development tests short while preventing a partial inventory
+from ever masquerading as complete state. Provider cursors and pending remote
+change events remain untouched.

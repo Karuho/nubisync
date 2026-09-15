@@ -15,7 +15,7 @@ const GOOGLE_DRIVE_CHANGES_ENDPOINT: &str = "https://www.googleapis.com/drive/v3
 const GOOGLE_DRIVE_FILES_ENDPOINT: &str = "https://www.googleapis.com/drive/v3/files";
 const GOOGLE_DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 const GOOGLE_DRIVE_INVENTORY_FIELDS: &str =
-    "nextPageToken,incompleteSearch,files(id,name,mimeType,trashed)";
+    "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,trashed)";
 const GOOGLE_DRIVE_CHANGES_FIELDS: &str = concat!(
     "nextPageToken,newStartPageToken,",
     "changes(changeType,fileId,removed,",
@@ -218,6 +218,7 @@ struct StartPageTokenResponse {
 
 #[derive(Debug)]
 pub struct DriveInventoryPage {
+    pub items: Vec<RemoteItem>,
     pub continuation: Option<ContinuationToken>,
     pub supported_items: u64,
     pub file_count: u64,
@@ -246,6 +247,7 @@ impl FileListResponse {
             .map(ContinuationToken::new)
             .transpose()?;
 
+        let mut items = Vec::new();
         let mut file_count = 0_u64;
         let mut folder_count = 0_u64;
         let mut unsupported_provider_native = 0_u64;
@@ -256,7 +258,6 @@ impl FileListResponse {
                     code: "missing_file_identity_metadata",
                 });
             }
-
             if file.trashed {
                 return Err(DriveApiError::InvalidInventoryPage {
                     code: "trashed_item_returned",
@@ -265,14 +266,17 @@ impl FileListResponse {
 
             if file.mime_type == GOOGLE_DRIVE_FOLDER_MIME_TYPE {
                 folder_count += 1;
+                items.push(file.into_remote_item(RemoteItemKind::Folder)?);
             } else if file.mime_type.starts_with("application/vnd.google-apps.") {
                 unsupported_provider_native += 1;
             } else {
                 file_count += 1;
+                items.push(file.into_remote_item(RemoteItemKind::File)?);
             }
         }
 
         Ok(DriveInventoryPage {
+            items,
             continuation,
             supported_items: file_count + folder_count,
             file_count,
@@ -289,7 +293,24 @@ struct GoogleInventoryFile {
     #[serde(rename = "mimeType")]
     mime_type: String,
     #[serde(default)]
+    parents: Vec<String>,
+    size: Option<String>,
+    #[serde(default)]
     trashed: bool,
+}
+
+impl GoogleInventoryFile {
+    fn into_remote_item(self, kind: RemoteItemKind) -> Result<RemoteItem, DriveApiError> {
+        Ok(RemoteItem {
+            remote_id: self.id,
+            parent_remote_id: self.parents.into_iter().next(),
+            name: self.name,
+            kind,
+            size_bytes: parse_optional_u64(self.size.as_deref(), "file.size")?,
+            modified_unix_ms: None,
+            trashed: self.trashed,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,18 +499,24 @@ mod tests {
                     id: "file-1".into(),
                     name: "example.txt".into(),
                     mime_type: "text/plain".into(),
+                    parents: vec!["root".into()],
+                    size: Some("12".into()),
                     trashed: false,
                 },
                 GoogleInventoryFile {
                     id: "folder-1".into(),
                     name: "Folder".into(),
                     mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+                    parents: vec!["root".into()],
+                    size: None,
                     trashed: false,
                 },
                 GoogleInventoryFile {
                     id: "native-1".into(),
                     name: "Native Doc".into(),
                     mime_type: "application/vnd.google-apps.document".into(),
+                    parents: vec!["root".into()],
+                    size: None,
                     trashed: false,
                 },
             ],
@@ -497,6 +524,7 @@ mod tests {
 
         let page = response.into_inventory_page().unwrap();
 
+        assert_eq!(page.items.len(), 2);
         assert_eq!(page.supported_items, 2);
         assert_eq!(page.file_count, 1);
         assert_eq!(page.folder_count, 1);
