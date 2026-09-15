@@ -11,7 +11,8 @@ use nubisync_core::{
 };
 use nubisync_daemon::{
     bootstrap_selected_root_snapshot, collect_selected_root_change_window_page,
-    execute_completed_selected_root_change_window, plan_selected_root_local_materialization,
+    execute_completed_selected_root_change_window, materialize_selected_root_directories,
+    plan_selected_root_local_materialization,
 };
 use nubisync_drive::{GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig};
 use nubisync_storage::Storage;
@@ -89,6 +90,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_reconcile_plan()
+        }
+        [sync, roots, materialize_directories, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && materialize_directories == "materialize-directories"
+                && approve == "--approve" =>
+        {
+            sync_roots_materialize_directories()
         }
         [sync, roots, inventory, limit, value]
             if sync == "sync"
@@ -178,6 +187,7 @@ USAGE:
   nubisync sync roots status
   nubisync sync roots metadata-step --approve
   nubisync sync roots reconcile-plan --approve
+  nubisync sync roots materialize-directories --approve
   nubisync sync roots inventory --limit <1-10000>
   nubisync sync roots add --mode receive_only
   nubisync sync roots add --mode receive_only --dry-run
@@ -610,6 +620,73 @@ fn sync_roots_reconcile_plan() -> Result<(), CliError> {
     println!("FILESYSTEM_READ=metadata_only");
     println!("FILESYSTEM_MUTATION=no");
     println!("FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_materialize_directories() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.is_empty() {
+        println!("SYNC_ROOT_DIRECTORY_MATERIALIZATION=SKIPPED");
+        println!("REASON=no_configured_root");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_DIRECTORY_MATERIALIZATION=SKIPPED");
+        println!("REASON=multiple_roots_require_selector");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+    let result = materialize_selected_root_directories(&storage, root)?;
+
+    println!("SYNC_ROOT_DIRECTORY_MATERIALIZATION=PASS");
+    println!("MODE=receive_only");
+    println!("REMOTE_DIRECTORIES={}", result.remote_directories);
+    println!("DIRECTORIES_CREATED={}", result.created_directories);
+    println!(
+        "DIRECTORIES_ALREADY_PRESENT={}",
+        result.existing_directories
+    );
+    println!("PENDING_FILES={}", result.pending_files);
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=no");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!(
+        "FILESYSTEM_MUTATION={}",
+        yes_no(result.created_directories > 0)
+    );
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("FILES_CREATED=0");
+    println!("FILES_DELETED=0");
+    println!("DIRECTORIES_REMOVED=0");
     println!("ROOT_PATH_PRINTED=no");
     println!("LOCAL_NAMES_PRINTED=no");
     println!("REMOTE_ROOT_ID_PRINTED=no");

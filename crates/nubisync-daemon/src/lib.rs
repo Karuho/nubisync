@@ -10,22 +10,89 @@ use nubisync_storage::{
     Storage, StorageError, SyncRootCatalogBatchCommit, SyncRootCatalogMutation,
 };
 use nubisync_sync::{
-    LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyMaterializationPlan,
+    LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyDirectoryTarget, ReceiveOnlyMaterializationPlan,
     ReceiveOnlyMaterializationPlanError, RootCatalogMutationPlan, RootCatalogProjection,
     RootCatalogProjectionError, RootCatalogResolution, RootChangeMembership,
-    plan_receive_only_materialization,
+    plan_receive_only_directory_targets, plan_receive_only_materialization,
 };
 use std::{
     collections::{HashSet, VecDeque},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootDirectoryMaterialization {
+    pub remote_directories: usize,
+    pub created_directories: usize,
+    pub existing_directories: usize,
+    pub pending_files: usize,
+}
 
 pub fn plan_selected_root_local_materialization(
     storage: &Storage,
     sync_root: &SyncRoot,
 ) -> Result<ReceiveOnlyMaterializationPlan, SelectedRootExecutorError> {
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+
+    plan_receive_only_materialization(&remote_items, &local_entries)
+        .map_err(SelectedRootExecutorError::from)
+}
+
+pub fn materialize_selected_root_directories(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootDirectoryMaterialization, SelectedRootExecutorError> {
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let preflight = plan_receive_only_materialization(&remote_items, &local_entries)?;
+
+    if !preflight.ready_for_directory_phase() {
+        return Err(SelectedRootExecutorError::LocalDirectoryPhaseBlocked);
+    }
+
+    let targets = plan_receive_only_directory_targets(&remote_items)?;
+    if targets.len() != preflight.remote_directories {
+        return Err(SelectedRootExecutorError::LocalDirectoryTargetCountMismatch);
+    }
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let outcome = apply_selected_root_directory_targets(&root_path, &targets)?;
+
+    let post_result = (|| {
+        let post_entries = scan_selected_root_local_tree(sync_root)?;
+        let post_plan = plan_receive_only_materialization(&remote_items, &post_entries)?;
+
+        if !post_plan.ready_for_directory_phase()
+            || post_plan.missing_directories != 0
+            || post_plan.matching_directories != post_plan.remote_directories
+            || outcome.created_paths.len() + outcome.existing_directories
+                != post_plan.remote_directories
+        {
+            return Err(SelectedRootExecutorError::LocalDirectoryPostconditionFailed);
+        }
+
+        Ok(SelectedRootDirectoryMaterialization {
+            remote_directories: post_plan.remote_directories,
+            created_directories: outcome.created_paths.len(),
+            existing_directories: outcome.existing_directories,
+            pending_files: post_plan.remote_files,
+        })
+    })();
+
+    match post_result {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            rollback_created_directories(&outcome.created_paths)?;
+            Err(error)
+        }
+    }
+}
+
+fn selected_root_materialization_inputs(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<(Vec<RemoteItem>, Vec<LocalTreeEntry>), SelectedRootExecutorError> {
     if sync_root.mode != nubisync_core::SyncMode::ReceiveOnly {
         return Err(SelectedRootExecutorError::LocalPlanModeUnsupported);
     }
@@ -61,13 +128,12 @@ pub fn plan_selected_root_local_materialization(
 
     let local_entries = scan_selected_root_local_tree(sync_root)?;
 
-    plan_receive_only_materialization(&remote_items, &local_entries)
-        .map_err(SelectedRootExecutorError::from)
+    Ok((remote_items, local_entries))
 }
 
-fn scan_selected_root_local_tree(
+fn validated_selected_root_path(
     sync_root: &SyncRoot,
-) -> Result<Vec<LocalTreeEntry>, SelectedRootExecutorError> {
+) -> Result<PathBuf, SelectedRootExecutorError> {
     let configured_root = PathBuf::from(&sync_root.local_path);
 
     let root_metadata = fs::symlink_metadata(&configured_root)
@@ -88,6 +154,13 @@ fn scan_selected_root_local_tree(
         return Err(SelectedRootExecutorError::LocalRootIdentityChanged);
     }
 
+    Ok(configured_root)
+}
+
+fn scan_selected_root_local_tree(
+    sync_root: &SyncRoot,
+) -> Result<Vec<LocalTreeEntry>, SelectedRootExecutorError> {
+    let configured_root = validated_selected_root_path(sync_root)?;
     let mut queue = VecDeque::from([(configured_root, String::new())]);
     let mut entries = Vec::new();
 
@@ -138,6 +211,110 @@ fn scan_selected_root_local_tree(
     }
 
     Ok(entries)
+}
+
+struct DirectoryApplyOutcome {
+    created_paths: Vec<PathBuf>,
+    existing_directories: usize,
+}
+
+fn apply_selected_root_directory_targets(
+    root_path: &Path,
+    targets: &[ReceiveOnlyDirectoryTarget],
+) -> Result<DirectoryApplyOutcome, SelectedRootExecutorError> {
+    let mut created_paths = Vec::new();
+    let mut existing_directories = 0_usize;
+
+    let apply_result = (|| {
+        for target in targets {
+            let target_path = root_path.join(target.relative_path());
+
+            if !target_path.starts_with(root_path) {
+                return Err(SelectedRootExecutorError::LocalDirectoryTargetEscapedRoot);
+            }
+
+            match fs::symlink_metadata(&target_path) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(SelectedRootExecutorError::LocalDirectoryTargetConflict);
+                    }
+
+                    let canonical_target = fs::canonicalize(&target_path)
+                        .map_err(|_| SelectedRootExecutorError::LocalFilesystemInspectionFailed)?;
+                    if !canonical_target.starts_with(root_path) {
+                        return Err(SelectedRootExecutorError::LocalDirectoryTargetEscapedRoot);
+                    }
+
+                    existing_directories = existing_directories
+                        .checked_add(1)
+                        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(SelectedRootExecutorError::LocalFilesystemInspectionFailed);
+                }
+            }
+
+            let parent = target_path
+                .parent()
+                .ok_or(SelectedRootExecutorError::LocalDirectoryParentInvalid)?;
+            let parent_metadata = fs::symlink_metadata(parent)
+                .map_err(|_| SelectedRootExecutorError::LocalDirectoryParentInvalid)?;
+
+            if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+                return Err(SelectedRootExecutorError::LocalDirectoryParentInvalid);
+            }
+
+            let canonical_parent = fs::canonicalize(parent)
+                .map_err(|_| SelectedRootExecutorError::LocalDirectoryParentInvalid)?;
+            if !canonical_parent.starts_with(root_path) {
+                return Err(SelectedRootExecutorError::LocalDirectoryParentInvalid);
+            }
+
+            fs::create_dir(&target_path)
+                .map_err(|_| SelectedRootExecutorError::LocalDirectoryCreateFailed)?;
+            created_paths.push(target_path.clone());
+
+            let created_metadata = fs::symlink_metadata(&target_path)
+                .map_err(|_| SelectedRootExecutorError::LocalDirectoryPostconditionFailed)?;
+            if created_metadata.file_type().is_symlink() || !created_metadata.is_dir() {
+                return Err(SelectedRootExecutorError::LocalDirectoryPostconditionFailed);
+            }
+
+            let canonical_target = fs::canonicalize(&target_path)
+                .map_err(|_| SelectedRootExecutorError::LocalDirectoryPostconditionFailed)?;
+            if !canonical_target.starts_with(root_path) {
+                return Err(SelectedRootExecutorError::LocalDirectoryTargetEscapedRoot);
+            }
+        }
+
+        Ok(())
+    })();
+
+    if let Err(error) = apply_result {
+        rollback_created_directories(&created_paths)?;
+        return Err(error);
+    }
+
+    Ok(DirectoryApplyOutcome {
+        created_paths,
+        existing_directories,
+    })
+}
+
+fn rollback_created_directories(
+    created_paths: &[PathBuf],
+) -> Result<(), SelectedRootExecutorError> {
+    for path in created_paths.iter().rev() {
+        match fs::remove_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(SelectedRootExecutorError::LocalDirectoryRollbackFailed),
+        }
+    }
+
+    Ok(())
 }
 
 pub trait SelectedRootProvider {
@@ -829,6 +1006,22 @@ pub enum SelectedRootExecutorError {
     LocalFilesystemInspectionFailed,
     #[error("local sync tree scan exceeded its safety limit")]
     LocalScanSafetyLimitExceeded,
+    #[error("local directory materialization is blocked by local-only entries or type conflicts")]
+    LocalDirectoryPhaseBlocked,
+    #[error("local directory target count mismatched the remote directory plan")]
+    LocalDirectoryTargetCountMismatch,
+    #[error("local directory target conflicts with an existing filesystem entry")]
+    LocalDirectoryTargetConflict,
+    #[error("local directory target escaped the configured sync root")]
+    LocalDirectoryTargetEscapedRoot,
+    #[error("local directory parent is unavailable, unsafe, or outside the sync root")]
+    LocalDirectoryParentInvalid,
+    #[error("local directory creation failed")]
+    LocalDirectoryCreateFailed,
+    #[error("local directory materialization postcondition failed")]
+    LocalDirectoryPostconditionFailed,
+    #[error("local directory materialization rollback failed")]
+    LocalDirectoryRollbackFailed,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
     #[error("selected-root change window requires an authoritative snapshot")]
@@ -969,6 +1162,89 @@ mod tests {
         std::fs::remove_file(root.join("link")).unwrap();
         std::fs::remove_dir(root).unwrap();
         std::fs::remove_dir(outside).unwrap();
+    }
+
+    fn directory_materialization_item(
+        remote_id: &str,
+        parent_remote_id: &str,
+        name: &str,
+        kind: RemoteItemKind,
+    ) -> RemoteItem {
+        RemoteItem {
+            remote_id: remote_id.into(),
+            parent_remote_id: Some(parent_remote_id.into()),
+            name: name.into(),
+            kind,
+            size_bytes: None,
+            modified_unix_ms: None,
+            trashed: false,
+        }
+    }
+
+    #[test]
+    fn directory_targets_create_parent_before_child_and_are_idempotent() {
+        let root = local_plan_temp_dir("materialize-directories");
+        std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+
+        let remote_items = vec![
+            directory_materialization_item(
+                "folder",
+                "selected-root",
+                "docs",
+                RemoteItemKind::Folder,
+            ),
+            directory_materialization_item("nested", "folder", "nested", RemoteItemKind::Folder),
+        ];
+        let targets = plan_receive_only_directory_targets(&remote_items).unwrap();
+
+        let first = apply_selected_root_directory_targets(&root, &targets).unwrap();
+        assert_eq!(first.created_paths.len(), 2);
+        assert_eq!(first.existing_directories, 0);
+        assert!(root.join("docs").is_dir());
+        assert!(root.join("docs/nested").is_dir());
+
+        let second = apply_selected_root_directory_targets(&root, &targets).unwrap();
+        assert_eq!(second.created_paths.len(), 0);
+        assert_eq!(second.existing_directories, 2);
+
+        std::fs::remove_dir(root.join("docs/nested")).unwrap();
+        std::fs::remove_dir(root.join("docs")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn directory_target_failure_rolls_back_only_directories_created_by_run() {
+        let root = local_plan_temp_dir("materialize-rollback");
+        std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::write(root.join("second"), b"existing-local-file").unwrap();
+
+        let remote_items = vec![
+            directory_materialization_item(
+                "first",
+                "selected-root",
+                "first",
+                RemoteItemKind::Folder,
+            ),
+            directory_materialization_item(
+                "second",
+                "selected-root",
+                "second",
+                RemoteItemKind::Folder,
+            ),
+        ];
+        let targets = plan_receive_only_directory_targets(&remote_items).unwrap();
+
+        assert!(matches!(
+            apply_selected_root_directory_targets(&root, &targets),
+            Err(SelectedRootExecutorError::LocalDirectoryTargetConflict)
+        ));
+        assert!(!root.join("first").exists());
+        assert!(root.join("second").is_file());
+
+        std::fs::remove_file(root.join("second")).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     struct FakeProvider {

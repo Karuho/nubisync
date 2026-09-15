@@ -476,106 +476,37 @@ pub enum ReceiveOnlyMaterializationPlanError {
     DuplicateRemoteId,
     DuplicateSiblingName,
     IncompleteRemoteCatalog,
+    InvalidRemoteParentKind,
     RemotePathCollision,
     InvalidLocalRelativePath,
     DuplicateLocalPath,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReceiveOnlyDirectoryTarget {
+    relative_path: String,
+}
+
+impl ReceiveOnlyDirectoryTarget {
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+}
+
+impl std::fmt::Debug for ReceiveOnlyDirectoryTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReceiveOnlyDirectoryTarget")
+            .field("relative_path", &"[redacted]")
+            .finish()
+    }
 }
 
 pub fn plan_receive_only_materialization(
     remote_items: &[RemoteItem],
     local_entries: &[LocalTreeEntry],
 ) -> Result<ReceiveOnlyMaterializationPlan, ReceiveOnlyMaterializationPlanError> {
-    let mut remote_ids = HashSet::with_capacity(remote_items.len());
-    let mut external_parent_ids = HashSet::new();
-    let mut children_by_parent: HashMap<&str, Vec<&RemoteItem>> = HashMap::new();
-    let mut sibling_names = HashSet::with_capacity(remote_items.len());
-
-    for item in remote_items {
-        if item.remote_id.trim().is_empty() || item.parent_remote_id.is_none() || item.trashed {
-            return Err(ReceiveOnlyMaterializationPlanError::InvalidRemoteItem);
-        }
-
-        validate_safe_remote_name(&item.name)?;
-
-        if !remote_ids.insert(item.remote_id.as_str()) {
-            return Err(ReceiveOnlyMaterializationPlanError::DuplicateRemoteId);
-        }
-    }
-
-    for item in remote_items {
-        let parent_remote_id = item
-            .parent_remote_id
-            .as_deref()
-            .ok_or(ReceiveOnlyMaterializationPlanError::InvalidRemoteItem)?;
-
-        if !sibling_names.insert((parent_remote_id.to_owned(), item.name.clone())) {
-            return Err(ReceiveOnlyMaterializationPlanError::DuplicateSiblingName);
-        }
-
-        if !remote_ids.contains(parent_remote_id) {
-            external_parent_ids.insert(parent_remote_id);
-        }
-
-        children_by_parent
-            .entry(parent_remote_id)
-            .or_default()
-            .push(item);
-    }
-
-    let mut expected_paths = HashMap::with_capacity(remote_items.len());
-
-    if !remote_items.is_empty() {
-        if external_parent_ids.len() != 1 {
-            return Err(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog);
-        }
-
-        let root_remote_id = *external_parent_ids
-            .iter()
-            .next()
-            .ok_or(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog)?;
-
-        let mut queue: VecDeque<(&RemoteItem, String)> = VecDeque::new();
-
-        if let Some(top_level) = children_by_parent.get(root_remote_id) {
-            let mut top_level = top_level.clone();
-            top_level.sort_by(|left, right| left.remote_id.cmp(&right.remote_id));
-
-            for item in top_level {
-                queue.push_back((item, item.name.clone()));
-            }
-        }
-
-        let mut visited = HashSet::with_capacity(remote_items.len());
-
-        while let Some((item, relative_path)) = queue.pop_front() {
-            if !visited.insert(item.remote_id.as_str()) {
-                return Err(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog);
-            }
-
-            if expected_paths
-                .insert(relative_path.clone(), item.kind)
-                .is_some()
-            {
-                return Err(ReceiveOnlyMaterializationPlanError::RemotePathCollision);
-            }
-
-            if let Some(children) = children_by_parent.get(item.remote_id.as_str()) {
-                let mut children = children.clone();
-                children.sort_by(|left, right| left.remote_id.cmp(&right.remote_id));
-
-                for child in children {
-                    let child_path = format!("{relative_path}/{}", child.name);
-                    validate_safe_relative_path(&child_path)?;
-                    queue.push_back((child, child_path));
-                }
-            }
-        }
-
-        if visited.len() != remote_items.len() {
-            return Err(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog);
-        }
-    }
-
+    let expected_paths = build_remote_expected_paths(remote_items)?;
     let mut local_by_path = HashMap::with_capacity(local_entries.len());
 
     for entry in local_entries {
@@ -590,12 +521,12 @@ pub fn plan_receive_only_materialization(
     }
 
     let remote_directories = expected_paths
-        .values()
-        .filter(|kind| **kind == RemoteItemKind::Folder)
+        .iter()
+        .filter(|(_, kind)| *kind == RemoteItemKind::Folder)
         .count();
     let remote_files = expected_paths
-        .values()
-        .filter(|kind| **kind == RemoteItemKind::File)
+        .iter()
+        .filter(|(_, kind)| *kind == RemoteItemKind::File)
         .count();
 
     let mut missing_directories = 0_usize;
@@ -619,9 +550,14 @@ pub fn plan_receive_only_materialization(
         }
     }
 
+    let expected_path_names = expected_paths
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect::<HashSet<_>>();
+
     let local_only_entries = local_by_path
         .keys()
-        .filter(|path| !expected_paths.contains_key(*path))
+        .filter(|path| !expected_path_names.contains(path.as_str()))
         .count();
 
     Ok(ReceiveOnlyMaterializationPlan {
@@ -636,6 +572,137 @@ pub fn plan_receive_only_materialization(
         local_only_entries,
         type_conflicts,
     })
+}
+
+pub fn plan_receive_only_directory_targets(
+    remote_items: &[RemoteItem],
+) -> Result<Vec<ReceiveOnlyDirectoryTarget>, ReceiveOnlyMaterializationPlanError> {
+    Ok(build_remote_expected_paths(remote_items)?
+        .into_iter()
+        .filter_map(|(relative_path, kind)| {
+            (kind == RemoteItemKind::Folder).then_some(ReceiveOnlyDirectoryTarget { relative_path })
+        })
+        .collect())
+}
+
+fn build_remote_expected_paths(
+    remote_items: &[RemoteItem],
+) -> Result<Vec<(String, RemoteItemKind)>, ReceiveOnlyMaterializationPlanError> {
+    if remote_items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut remote_ids = HashSet::with_capacity(remote_items.len());
+    let mut kind_by_id = HashMap::with_capacity(remote_items.len());
+
+    for item in remote_items {
+        if item.remote_id.trim().is_empty() || item.parent_remote_id.is_none() || item.trashed {
+            return Err(ReceiveOnlyMaterializationPlanError::InvalidRemoteItem);
+        }
+
+        validate_safe_remote_name(&item.name)?;
+
+        if !remote_ids.insert(item.remote_id.as_str()) {
+            return Err(ReceiveOnlyMaterializationPlanError::DuplicateRemoteId);
+        }
+
+        kind_by_id.insert(item.remote_id.as_str(), item.kind);
+    }
+
+    let mut external_parent_ids = HashSet::new();
+    let mut children_by_parent: HashMap<&str, Vec<&RemoteItem>> = HashMap::new();
+    let mut sibling_names = HashSet::with_capacity(remote_items.len());
+
+    for item in remote_items {
+        let parent_remote_id = item
+            .parent_remote_id
+            .as_deref()
+            .ok_or(ReceiveOnlyMaterializationPlanError::InvalidRemoteItem)?;
+
+        if !sibling_names.insert((parent_remote_id, item.name.as_str())) {
+            return Err(ReceiveOnlyMaterializationPlanError::DuplicateSiblingName);
+        }
+
+        match kind_by_id.get(parent_remote_id) {
+            Some(RemoteItemKind::Folder) => {}
+            Some(RemoteItemKind::File) => {
+                return Err(ReceiveOnlyMaterializationPlanError::InvalidRemoteParentKind);
+            }
+            None => {
+                external_parent_ids.insert(parent_remote_id);
+            }
+        }
+
+        children_by_parent
+            .entry(parent_remote_id)
+            .or_default()
+            .push(item);
+    }
+
+    if external_parent_ids.len() != 1 {
+        return Err(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog);
+    }
+
+    let root_remote_id = *external_parent_ids
+        .iter()
+        .next()
+        .ok_or(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog)?;
+
+    let mut queue: VecDeque<(&RemoteItem, String)> = VecDeque::new();
+
+    if let Some(top_level) = children_by_parent.get(root_remote_id) {
+        let mut top_level = top_level.clone();
+        top_level.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.remote_id.cmp(&right.remote_id))
+        });
+
+        for item in top_level {
+            queue.push_back((item, item.name.clone()));
+        }
+    }
+
+    let mut visited = HashSet::with_capacity(remote_items.len());
+    let mut seen_paths = HashSet::with_capacity(remote_items.len());
+    let mut expected_paths = Vec::with_capacity(remote_items.len());
+
+    while let Some((item, relative_path)) = queue.pop_front() {
+        validate_safe_relative_path(&relative_path)?;
+
+        if !visited.insert(item.remote_id.as_str()) {
+            return Err(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog);
+        }
+
+        if !seen_paths.insert(relative_path.clone()) {
+            return Err(ReceiveOnlyMaterializationPlanError::RemotePathCollision);
+        }
+
+        expected_paths.push((relative_path.clone(), item.kind));
+
+        if item.kind == RemoteItemKind::Folder
+            && let Some(children) = children_by_parent.get(item.remote_id.as_str())
+        {
+            let mut children = children.clone();
+            children.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then_with(|| left.remote_id.cmp(&right.remote_id))
+            });
+
+            for child in children {
+                let child_path = format!("{relative_path}/{}", child.name);
+                validate_safe_relative_path(&child_path)?;
+                queue.push_back((child, child_path));
+            }
+        }
+    }
+
+    if visited.len() != remote_items.len() {
+        return Err(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog);
+    }
+
+    Ok(expected_paths)
 }
 
 fn validate_safe_remote_name(name: &str) -> Result<(), ReceiveOnlyMaterializationPlanError> {
@@ -813,6 +880,41 @@ mod tests {
         assert!(debug.contains("[redacted]"));
         assert!(!debug.contains("private"));
         assert!(!debug.contains("folder"));
+    }
+
+    #[test]
+    fn directory_targets_are_parent_first_and_debug_redacted() {
+        let folder =
+            materialization_item("folder", "selected-root", "docs", RemoteItemKind::Folder);
+        let nested = materialization_item("nested", "folder", "nested", RemoteItemKind::Folder);
+        let file = materialization_item("file", "nested", "readme.txt", RemoteItemKind::File);
+
+        let targets = plan_receive_only_directory_targets(&[folder, nested, file]).unwrap();
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].relative_path(), "docs");
+        assert_eq!(targets[1].relative_path(), "docs/nested");
+
+        let debug = format!("{targets:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("docs"));
+        assert!(!debug.contains("nested"));
+    }
+
+    #[test]
+    fn materialization_rejects_children_of_remote_files() {
+        let file = materialization_item(
+            "file-parent",
+            "selected-root",
+            "file.bin",
+            RemoteItemKind::File,
+        );
+        let child = materialization_item("child", "file-parent", "child", RemoteItemKind::Folder);
+
+        assert_eq!(
+            plan_receive_only_materialization(&[file, child], &[]).unwrap_err(),
+            ReceiveOnlyMaterializationPlanError::InvalidRemoteParentKind
+        );
     }
 
     #[test]
