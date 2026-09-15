@@ -453,3 +453,42 @@ Phase 4P.
 This phase deliberately does not yet apply account-wide change events to a
 selected-root catalog. Folder moves into a selected root still require explicit
 subtree hydration semantics.
+
+## Phase 4Q — Deterministic selected-root change planner
+
+Before account-wide Drive changes are applied to a selected subtree, NubiSync
+now plans each change using a pure provider-neutral state machine.
+
+Inputs:
+
+- the provider `RemoteChange`
+- membership relative to the selected root: `Root`, `Descendant`, `Outside`, or
+  `UnresolvedDelete`
+- whether that remote ID was already present in the root catalog
+
+Possible actions:
+
+- `Ignore`
+- `RevalidateRoot`
+- `UpsertItem`
+- `DeleteSubtree`
+- `HydrateSubtree`
+
+Important semantics:
+
+- changes to the selected root container always require root revalidation
+- an ordinary descendant file can be upserted directly
+- a newly observed descendant folder requires complete subtree hydration before
+  the change batch may commit
+- a previously cataloged item that moves outside the selected root deletes its
+  previous catalog subtree
+- a removed Drive change has no membership metadata, so catalog presence decides
+  whether an existing subtree must be deleted
+- impossible change/context combinations fail closed with
+  `InvalidChangeContext`
+
+The planner is pure and performs no network request, SQLite mutation, cursor
+advance, file transfer, or filesystem mutation.
+
+Phase 4Q does not implement subtree hydration itself and does not yet consume a
+real selected-root change batch.
