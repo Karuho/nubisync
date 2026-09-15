@@ -1308,6 +1308,189 @@ impl Storage {
         })
     }
 
+    pub fn commit_sync_root_catalog_change_window(
+        &mut self,
+        sync_root_id: &str,
+        expected_base_cursor: &ChangeCursor,
+        expected_checkpoint: &ChangeCursor,
+        expected_change_count: u64,
+        mutations: &[SyncRootCatalogMutation],
+        observed_at_unix_ms: i64,
+    ) -> Result<SyncRootCatalogBatchCommit, StorageError> {
+        let expected_change_count =
+            i64::try_from(expected_change_count).map_err(|_| StorageError::NumericOverflow)?;
+
+        let transaction = self.connection.transaction()?;
+
+        let window: Option<SyncRootChangeWindowStateRow> = transaction
+            .query_row(
+                "SELECT
+                    base_cursor,
+                    continuation,
+                    checkpoint,
+                    page_count,
+                    change_count
+                 FROM sync_root_change_window_state
+                 WHERE sync_root_id = ?1",
+                params![sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((base_cursor, continuation, checkpoint, _page_count, change_count)) = window
+        else {
+            return Err(StorageError::SyncRootChangeWindowMissing);
+        };
+
+        if continuation.is_some() || checkpoint.is_none() {
+            return Err(StorageError::SyncRootChangeWindowIncomplete);
+        }
+
+        if base_cursor != expected_base_cursor.as_str() {
+            return Err(StorageError::SyncRootChangeWindowBaseCursorMismatch);
+        }
+
+        if checkpoint.as_deref() != Some(expected_checkpoint.as_str()) {
+            return Err(StorageError::SyncRootChangeWindowCheckpointMismatch);
+        }
+
+        if change_count != expected_change_count {
+            return Err(StorageError::SyncRootChangeWindowChangeCountMismatch);
+        }
+
+        let stored_event_count: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_change_window_events
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+
+        if stored_event_count != change_count {
+            return Err(StorageError::SyncRootChangeWindowChangeCountMismatch);
+        }
+
+        let state: Option<SyncRootCursorStateRow> = transaction
+            .query_row(
+                "SELECT
+                    snapshot_complete,
+                    catchup_complete,
+                    catchup_from_cursor,
+                    change_cursor
+                 FROM sync_root_remote_inventory_state
+                 WHERE sync_root_id = ?1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+
+        let Some((snapshot_complete, catchup_complete, catchup_from_cursor, change_cursor)) = state
+        else {
+            return Err(StorageError::SyncRootCatalogSnapshotMissing);
+        };
+
+        if snapshot_complete == 0 {
+            return Err(StorageError::SyncRootCatalogSnapshotMissing);
+        }
+
+        let completed_initial_catchup = catchup_complete == 0;
+
+        let current_cursor = if completed_initial_catchup {
+            if change_cursor.is_some() {
+                return Err(StorageError::SyncRootCatalogInvalidCursorState);
+            }
+
+            catchup_from_cursor
+                .as_deref()
+                .ok_or(StorageError::SyncRootCatalogCatchupCursorMissing)?
+        } else {
+            change_cursor
+                .as_deref()
+                .ok_or(StorageError::SyncRootCatalogChangeCursorMissing)?
+        };
+
+        if current_cursor != expected_base_cursor.as_str() {
+            return Err(StorageError::SyncRootCatalogExpectedCursorMismatch);
+        }
+
+        for mutation in mutations {
+            match mutation {
+                SyncRootCatalogMutation::Upsert(item) => {
+                    if item.trashed || item.remote_id.trim().is_empty() {
+                        return Err(StorageError::InvalidSyncRootCatalogMutation);
+                    }
+
+                    upsert_sync_root_catalog_item(
+                        &transaction,
+                        sync_root_id,
+                        item,
+                        observed_at_unix_ms,
+                    )?;
+                }
+                SyncRootCatalogMutation::DeleteSubtree { remote_id } => {
+                    if remote_id.trim().is_empty() {
+                        return Err(StorageError::InvalidSyncRootCatalogMutation);
+                    }
+
+                    delete_sync_root_subtree_in_transaction(&transaction, sync_root_id, remote_id)?;
+                }
+            }
+        }
+
+        refresh_sync_root_catalog_count(&transaction, sync_root_id)?;
+
+        let authoritative_items_i64: i64 = transaction.query_row(
+            "SELECT item_count
+             FROM sync_root_remote_inventory_state
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        let authoritative_items =
+            u64::try_from(authoritative_items_i64).map_err(|_| StorageError::NumericOverflow)?;
+
+        transaction.execute(
+            "UPDATE sync_root_remote_inventory_state
+             SET
+                catchup_complete = 1,
+                change_cursor = ?2
+             WHERE sync_root_id = ?1",
+            params![sync_root_id, expected_checkpoint.as_str()],
+        )?;
+
+        transaction.execute(
+            "DELETE FROM sync_root_change_window_events
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_change_window_tokens
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_change_window_state
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+
+        transaction.commit()?;
+
+        Ok(SyncRootCatalogBatchCommit {
+            mutations_applied: mutations.len(),
+            authoritative_items,
+            completed_initial_catchup,
+        })
+    }
+
     pub fn sync_root_change_cursor(
         &self,
         sync_root_id: &str,
@@ -2215,6 +2398,14 @@ pub enum StorageError {
     SyncRootChangeWindowContinuationMismatch,
     #[error("sync root change window is already complete")]
     SyncRootChangeWindowAlreadyComplete,
+    #[error("sync root change window is missing")]
+    SyncRootChangeWindowMissing,
+    #[error("sync root change window is incomplete")]
+    SyncRootChangeWindowIncomplete,
+    #[error("sync root change window checkpoint does not match")]
+    SyncRootChangeWindowCheckpointMismatch,
+    #[error("sync root change window change count does not match")]
+    SyncRootChangeWindowChangeCountMismatch,
     #[error("sync root change window pagination token repeated")]
     SyncRootChangeWindowPaginationLoop,
     #[error("sync root change window exceeded a safety limit")]
@@ -2871,6 +3062,231 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn completed_change_window_commits_and_clears_atomically() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "window-commit",
+            provider,
+            account.subject,
+            "/tmp/window-commit",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+        prepare_root_snapshot(&mut storage, &root, &[], "fence", 10);
+
+        let item = test_remote_item(
+            "file",
+            Some("remote-root"),
+            "file.txt",
+            RemoteItemKind::File,
+        );
+        let page = nubisync_core::ChangePage {
+            changes: vec![RemoteChange::Upsert(item.clone())],
+            continuation: None,
+            checkpoint: Some(ChangeCursor::new("checkpoint").unwrap()),
+        };
+        storage
+            .stage_sync_root_change_window_page(
+                &root.id,
+                &ChangeCursor::new("fence").unwrap(),
+                None,
+                &page,
+            )
+            .unwrap();
+
+        let commit = storage
+            .commit_sync_root_catalog_change_window(
+                &root.id,
+                &ChangeCursor::new("fence").unwrap(),
+                &ChangeCursor::new("checkpoint").unwrap(),
+                1,
+                &[SyncRootCatalogMutation::Upsert(item.clone())],
+                20,
+            )
+            .unwrap();
+
+        assert!(commit.completed_initial_catchup);
+        assert_eq!(commit.mutations_applied, 1);
+        assert_eq!(commit.authoritative_items, 1);
+        assert_eq!(
+            storage.list_sync_root_remote_items(&root.id).unwrap(),
+            vec![item]
+        );
+        assert_eq!(
+            storage
+                .sync_root_change_cursor(&root.id)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "checkpoint"
+        );
+        assert!(
+            storage
+                .sync_root_remote_inventory_state(&root.id)
+                .unwrap()
+                .catchup_complete
+        );
+        assert!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .sync_root_change_window_changes(&root.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_change_window_commit_preserves_window_and_catalog() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "window-commit-rollback",
+            provider,
+            account.subject,
+            "/tmp/window-commit-rollback",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+        prepare_root_snapshot(&mut storage, &root, &[], "fence", 10);
+
+        let page = nubisync_core::ChangePage {
+            changes: vec![],
+            continuation: None,
+            checkpoint: Some(ChangeCursor::new("checkpoint").unwrap()),
+        };
+        storage
+            .stage_sync_root_change_window_page(
+                &root.id,
+                &ChangeCursor::new("fence").unwrap(),
+                None,
+                &page,
+            )
+            .unwrap();
+
+        let invalid = RemoteItem {
+            remote_id: "bad".into(),
+            parent_remote_id: Some("remote-root".into()),
+            name: "bad.txt".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(1),
+            modified_unix_ms: None,
+            trashed: true,
+        };
+
+        let error = storage
+            .commit_sync_root_catalog_change_window(
+                &root.id,
+                &ChangeCursor::new("fence").unwrap(),
+                &ChangeCursor::new("checkpoint").unwrap(),
+                0,
+                &[SyncRootCatalogMutation::Upsert(invalid)],
+                20,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::InvalidSyncRootCatalogMutation
+        ));
+        assert!(
+            storage
+                .list_sync_root_remote_items(&root.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(storage.sync_root_change_cursor(&root.id).unwrap().is_none());
+        assert!(
+            !storage
+                .sync_root_remote_inventory_state(&root.id)
+                .unwrap()
+                .catchup_complete
+        );
+        assert!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .unwrap()
+                .is_complete()
+        );
+    }
+
+    #[test]
+    fn incomplete_change_window_cannot_be_committed() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "window-incomplete",
+            provider,
+            account.subject,
+            "/tmp/window-incomplete",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+        prepare_root_snapshot(&mut storage, &root, &[], "fence", 10);
+
+        let page = nubisync_core::ChangePage {
+            changes: vec![],
+            continuation: Some(ContinuationToken::new("page-two").unwrap()),
+            checkpoint: None,
+        };
+        storage
+            .stage_sync_root_change_window_page(
+                &root.id,
+                &ChangeCursor::new("fence").unwrap(),
+                None,
+                &page,
+            )
+            .unwrap();
+
+        let error = storage
+            .commit_sync_root_catalog_change_window(
+                &root.id,
+                &ChangeCursor::new("fence").unwrap(),
+                &ChangeCursor::new("never").unwrap(),
+                0,
+                &[],
+                20,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::SyncRootChangeWindowIncomplete
+        ));
+        assert!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(storage.sync_root_change_cursor(&root.id).unwrap().is_none());
     }
 
     #[test]

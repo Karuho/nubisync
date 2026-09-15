@@ -718,3 +718,30 @@ Phase 4X still does not execute the staged window, clear it, expose live CLI
 catch-up, download contents, write Drive data, or mutate the local sync tree.
 The next phase must consume the durable window safely and combine its deletion
 with the Phase 4S catalog/cursor commit semantics.
+
+## Phase 4Y — Atomic durable-window execution
+
+A complete selected-root change window can now be consumed without creating a
+cursor/window split-brain state.
+
+The daemon loads the immutable completed window, verifies its durable change
+count, runs the same selected-root membership/hydration/projection rules used by
+the direct batch executor, and only then asks storage to commit.
+
+Storage validates again, inside one SQLite transaction:
+
+- the window still exists and is complete
+- its base cursor matches the expected selected-root durable cursor
+- its checkpoint matches the expected final provider checkpoint
+- its stored event count matches the durable window count
+- the selected-root snapshot/cursor state is still current
+
+The same transaction applies catalog mutations, refreshes item count, advances
+`change_cursor`, and deletes window events, seen pagination tokens, and window
+state. Any failure rolls everything back, leaving the complete window available
+for retry.
+
+Phase 4Y does not expose live bootstrap/catch-up commands, download file
+content, write Drive data, or mutate the local sync tree. The next integration
+phase can compose bootstrap -> durable page collection -> atomic window
+execution behind a controlled explicit surface.

@@ -252,6 +252,116 @@ pub fn collect_selected_root_change_window_page<P: SelectedRootChangeProvider>(
     })
 }
 
+pub fn execute_completed_selected_root_change_window<P: SelectedRootProvider>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    observed_at_unix_ms: i64,
+) -> Result<SelectedRootBatchExecution, SelectedRootExecutorError> {
+    let window = storage
+        .sync_root_change_window_state(&sync_root.id)?
+        .ok_or(SelectedRootExecutorError::ChangeWindowMissing)?;
+
+    if !window.is_complete() {
+        return Err(SelectedRootExecutorError::ChangeWindowIncomplete);
+    }
+
+    let checkpoint = window
+        .checkpoint
+        .as_ref()
+        .ok_or(SelectedRootExecutorError::ChangeWindowIncomplete)?
+        .clone();
+
+    let changes = storage.sync_root_change_window_changes(&sync_root.id)?;
+    let actual_change_count =
+        u64::try_from(changes.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+
+    if actual_change_count != window.change_count {
+        return Err(SelectedRootExecutorError::ChangeWindowChangeCountMismatch);
+    }
+
+    let configured_remote_root_id = sync_root
+        .remote_root_id
+        .as_deref()
+        .ok_or(SelectedRootExecutorError::MissingRemoteRoot)?;
+
+    let root_identity = provider.resolve_root(configured_remote_root_id)?;
+    let canonical_root_id = provider.canonical_root_id(&root_identity).to_owned();
+
+    if canonical_root_id.trim().is_empty() {
+        return Err(SelectedRootExecutorError::InvalidCanonicalRoot);
+    }
+
+    let durable_items = storage.list_sync_root_remote_items(&sync_root.id)?;
+    let mut projection = RootCatalogProjection::new(&canonical_root_id, &durable_items)?;
+
+    let mut mutation_plans = Vec::new();
+    let mut hydrated_items = 0_usize;
+    let mut root_revalidations = 0_usize;
+
+    for change in &changes {
+        let membership =
+            resolve_change_membership(provider, &root_identity, &canonical_root_id, change)?;
+
+        let hydration = match change {
+            RemoteChange::Upsert(item)
+                if membership == RootChangeMembership::Descendant
+                    && item.kind == RemoteItemKind::Folder
+                    && !item.trashed
+                    && !projection.contains(&item.remote_id) =>
+            {
+                let items = provider.hydrate_folder(item)?;
+                hydrated_items = hydrated_items
+                    .checked_add(items.len())
+                    .ok_or(SelectedRootExecutorError::CountOverflow)?;
+                Some(items)
+            }
+            _ => None,
+        };
+
+        match projection.apply_change(change, membership, hydration)? {
+            RootCatalogResolution::Noop => {}
+            RootCatalogResolution::Mutations(mut planned) => {
+                mutation_plans.append(&mut planned);
+            }
+            RootCatalogResolution::RevalidateRoot => {
+                root_revalidations = root_revalidations
+                    .checked_add(1)
+                    .ok_or(SelectedRootExecutorError::CountOverflow)?;
+
+                let revalidated = provider.resolve_root(configured_remote_root_id)?;
+                if provider.canonical_root_id(&revalidated) != canonical_root_id {
+                    return Err(SelectedRootExecutorError::RootIdentityChanged);
+                }
+            }
+        }
+    }
+
+    projection.validate_complete()?;
+
+    let storage_mutations = mutation_plans
+        .into_iter()
+        .map(into_storage_mutation)
+        .collect::<Vec<_>>();
+
+    let commit = storage.commit_sync_root_catalog_change_window(
+        &sync_root.id,
+        &window.base_cursor,
+        &checkpoint,
+        window.change_count,
+        &storage_mutations,
+        observed_at_unix_ms,
+    )?;
+
+    Ok(execution_result(
+        changes.len(),
+        storage_mutations.len(),
+        hydrated_items,
+        root_revalidations,
+        commit,
+    ))
+}
+
 pub fn bootstrap_selected_root_snapshot<P: SelectedRootBootstrapProvider>(
     provider: &P,
     storage: &mut Storage,
@@ -571,6 +681,12 @@ pub enum SelectedRootExecutorError {
     ChangeWindowSnapshotMissing,
     #[error("selected-root change window durable cursor is missing")]
     ChangeWindowCursorMissing,
+    #[error("selected-root completed change window is missing")]
+    ChangeWindowMissing,
+    #[error("selected-root change window is not complete")]
+    ChangeWindowIncomplete,
+    #[error("selected-root durable change count does not match its state")]
+    ChangeWindowChangeCountMismatch,
     #[error("selected-root authoritative snapshot is already complete")]
     BootstrapSnapshotAlreadyComplete,
     #[error("selected-root bootstrap returned invalid item metadata")]
@@ -904,6 +1020,150 @@ mod tests {
             SelectedRootExecutorError::ChangeWindowSnapshotMissing
         ));
         assert_eq!(provider.calls.get(), 0);
+    }
+
+    #[test]
+    fn completed_change_window_executes_and_disappears_atomically() {
+        let (mut storage, root) = storage_with_root(&[], "fence");
+        let provider = FakeProvider::new("canonical-root");
+
+        let file = item("file", "canonical-root", RemoteItemKind::File);
+        let page = ChangePage {
+            changes: vec![RemoteChange::Upsert(file.clone())],
+            continuation: None,
+            checkpoint: Some(ChangeCursor::new("checkpoint").unwrap()),
+        };
+        storage
+            .stage_sync_root_change_window_page(
+                &root.id,
+                &ChangeCursor::new("fence").unwrap(),
+                None,
+                &page,
+            )
+            .unwrap();
+
+        let result =
+            execute_completed_selected_root_change_window(&provider, &mut storage, &root, 20)
+                .unwrap();
+
+        assert_eq!(
+            result,
+            SelectedRootBatchExecution {
+                provider_changes: 1,
+                storage_mutations: 1,
+                authoritative_items: 1,
+                hydrated_items: 0,
+                root_revalidations: 0,
+                completed_initial_catchup: true,
+            }
+        );
+        assert_eq!(
+            storage.list_sync_root_remote_items(&root.id).unwrap(),
+            vec![file]
+        );
+        assert_eq!(
+            storage
+                .sync_root_change_cursor(&root.id)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "checkpoint"
+        );
+        assert!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .sync_root_change_window_changes(&root.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn incomplete_change_window_is_not_executed() {
+        let (mut storage, root) = storage_with_root(&[], "fence");
+        let provider = FakeProvider::new("canonical-root");
+
+        let page = ChangePage {
+            changes: vec![],
+            continuation: Some(ContinuationToken::new("page-two").unwrap()),
+            checkpoint: None,
+        };
+        storage
+            .stage_sync_root_change_window_page(
+                &root.id,
+                &ChangeCursor::new("fence").unwrap(),
+                None,
+                &page,
+            )
+            .unwrap();
+
+        let error =
+            execute_completed_selected_root_change_window(&provider, &mut storage, &root, 20)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SelectedRootExecutorError::ChangeWindowIncomplete
+        ));
+        assert_eq!(provider.root_resolutions.get(), 0);
+        assert!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(storage.sync_root_change_cursor(&root.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_window_projection_preserves_window_and_cursor() {
+        let (mut storage, root) = storage_with_root(&[], "fence");
+        let provider = FakeProvider::new("canonical-root");
+
+        let orphan = item("orphan", "missing-parent", RemoteItemKind::File);
+        let page = ChangePage {
+            changes: vec![RemoteChange::Upsert(orphan)],
+            continuation: None,
+            checkpoint: Some(ChangeCursor::new("checkpoint").unwrap()),
+        };
+        storage
+            .stage_sync_root_change_window_page(
+                &root.id,
+                &ChangeCursor::new("fence").unwrap(),
+                None,
+                &page,
+            )
+            .unwrap();
+
+        let error =
+            execute_completed_selected_root_change_window(&provider, &mut storage, &root, 20)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SelectedRootExecutorError::Projection(
+                RootCatalogProjectionError::IncompleteProjectedCatalog
+            )
+        ));
+        assert!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .unwrap()
+                .is_complete()
+        );
+        assert!(storage.sync_root_change_cursor(&root.id).unwrap().is_none());
+        assert!(
+            storage
+                .list_sync_root_remote_items(&root.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     struct FakeBootstrapProvider {
