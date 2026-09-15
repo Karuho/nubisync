@@ -11,7 +11,10 @@ const GOOGLE_DRIVE_ABOUT_ENDPOINT: &str = "https://www.googleapis.com/drive/v3/a
 const GOOGLE_DRIVE_START_PAGE_TOKEN_ENDPOINT: &str =
     "https://www.googleapis.com/drive/v3/changes/startPageToken";
 const GOOGLE_DRIVE_CHANGES_ENDPOINT: &str = "https://www.googleapis.com/drive/v3/changes";
+const GOOGLE_DRIVE_FILES_ENDPOINT: &str = "https://www.googleapis.com/drive/v3/files";
 const GOOGLE_DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
+const GOOGLE_DRIVE_INVENTORY_FIELDS: &str =
+    "nextPageToken,incompleteSearch,files(id,name,mimeType,trashed)";
 const GOOGLE_DRIVE_CHANGES_FIELDS: &str = concat!(
     "nextPageToken,newStartPageToken,",
     "changes(changeType,fileId,removed,",
@@ -91,6 +94,35 @@ impl GoogleDriveApi {
             )?,
             change_cursor,
         })
+    }
+
+    /// Lists one metadata-only inventory page for ordinary Drive items
+    /// owned by the current user.
+    ///
+    /// Provider-native Google Workspace items and shortcuts are counted but
+    /// not exposed as supported ordinary files in this phase.
+    pub fn list_inventory_page(
+        &self,
+        continuation: Option<&ContinuationToken>,
+    ) -> Result<DriveInventoryPage, DriveApiError> {
+        let mut request = self
+            .client
+            .get(GOOGLE_DRIVE_FILES_ENDPOINT)
+            .bearer_auth(self.access_token.as_str())
+            .query(&[
+                ("q", "'me' in owners and trashed = false"),
+                ("corpora", "user"),
+                ("spaces", "drive"),
+                ("pageSize", "1000"),
+                ("fields", GOOGLE_DRIVE_INVENTORY_FIELDS),
+            ]);
+
+        if let Some(token) = continuation {
+            request = request.query(&[("pageToken", token.as_str())]);
+        }
+
+        let response: FileListResponse = request.send()?.error_for_status()?.json()?;
+        response.into_inventory_page()
     }
 
     /// Reads one page of the user's My Drive change stream.
@@ -173,6 +205,82 @@ struct StorageQuota {
 struct StartPageTokenResponse {
     #[serde(rename = "startPageToken")]
     start_page_token: String,
+}
+
+#[derive(Debug)]
+pub struct DriveInventoryPage {
+    pub continuation: Option<ContinuationToken>,
+    pub supported_items: u64,
+    pub file_count: u64,
+    pub folder_count: u64,
+    pub unsupported_provider_native: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileListResponse {
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+    #[serde(rename = "incompleteSearch", default)]
+    incomplete_search: bool,
+    #[serde(default)]
+    files: Vec<GoogleInventoryFile>,
+}
+
+impl FileListResponse {
+    fn into_inventory_page(self) -> Result<DriveInventoryPage, DriveApiError> {
+        if self.incomplete_search {
+            return Err(DriveApiError::IncompleteInventorySearch);
+        }
+
+        let continuation = self
+            .next_page_token
+            .map(ContinuationToken::new)
+            .transpose()?;
+
+        let mut file_count = 0_u64;
+        let mut folder_count = 0_u64;
+        let mut unsupported_provider_native = 0_u64;
+
+        for file in self.files {
+            if file.id.trim().is_empty() || file.name.is_empty() || file.mime_type.is_empty() {
+                return Err(DriveApiError::InvalidInventoryPage {
+                    code: "missing_file_identity_metadata",
+                });
+            }
+
+            if file.trashed {
+                return Err(DriveApiError::InvalidInventoryPage {
+                    code: "trashed_item_returned",
+                });
+            }
+
+            if file.mime_type == GOOGLE_DRIVE_FOLDER_MIME_TYPE {
+                folder_count += 1;
+            } else if file.mime_type.starts_with("application/vnd.google-apps.") {
+                unsupported_provider_native += 1;
+            } else {
+                file_count += 1;
+            }
+        }
+
+        Ok(DriveInventoryPage {
+            continuation,
+            supported_items: file_count + folder_count,
+            file_count,
+            folder_count,
+            unsupported_provider_native,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleInventoryFile {
+    id: String,
+    name: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    #[serde(default)]
+    trashed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,6 +434,10 @@ pub enum DriveApiError {
     InvalidNumericField { field: &'static str },
     #[error("Google Drive change page is invalid: {code}")]
     InvalidChangePage { code: &'static str },
+    #[error("Google Drive inventory search was incomplete")]
+    IncompleteInventorySearch,
+    #[error("Google Drive inventory page is invalid: {code}")]
+    InvalidInventoryPage { code: &'static str },
 }
 
 #[cfg(test)]
@@ -342,6 +454,59 @@ mod tests {
         assert!(matches!(
             parse_optional_u64(Some("not-a-number"), "test"),
             Err(DriveApiError::InvalidNumericField { field: "test" })
+        ));
+    }
+
+    #[test]
+    fn inventory_page_counts_supported_and_native_items() {
+        let response = FileListResponse {
+            next_page_token: Some("next-inventory-page".into()),
+            incomplete_search: false,
+            files: vec![
+                GoogleInventoryFile {
+                    id: "file-1".into(),
+                    name: "example.txt".into(),
+                    mime_type: "text/plain".into(),
+                    trashed: false,
+                },
+                GoogleInventoryFile {
+                    id: "folder-1".into(),
+                    name: "Folder".into(),
+                    mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+                    trashed: false,
+                },
+                GoogleInventoryFile {
+                    id: "native-1".into(),
+                    name: "Native Doc".into(),
+                    mime_type: "application/vnd.google-apps.document".into(),
+                    trashed: false,
+                },
+            ],
+        };
+
+        let page = response.into_inventory_page().unwrap();
+
+        assert_eq!(page.supported_items, 2);
+        assert_eq!(page.file_count, 1);
+        assert_eq!(page.folder_count, 1);
+        assert_eq!(page.unsupported_provider_native, 1);
+        assert_eq!(
+            format!("{:?}", page.continuation.unwrap()),
+            "ContinuationToken([redacted])"
+        );
+    }
+
+    #[test]
+    fn inventory_page_rejects_incomplete_search() {
+        let response = FileListResponse {
+            next_page_token: None,
+            incomplete_search: true,
+            files: Vec::new(),
+        };
+
+        assert!(matches!(
+            response.into_inventory_page(),
+            Err(DriveApiError::IncompleteInventorySearch)
         ));
     }
 

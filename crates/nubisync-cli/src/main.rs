@@ -66,6 +66,7 @@ fn run() -> Result<(), CliError> {
             google_logout()
         }
         [drive, changes] if drive == "drive" && changes == "changes" => drive_changes(),
+        [drive, inventory] if drive == "drive" && inventory == "inventory" => drive_inventory(),
         [auth, keyring, check] if auth == "auth" && keyring == "keyring" && check == "check" => {
             keyring_check()
         }
@@ -91,6 +92,7 @@ USAGE:
   nubisync auth google refresh
   nubisync auth google logout
   nubisync drive changes
+  nubisync drive inventory
 
 GOOGLE DEVELOPMENT CLIENT CONFIG:
   Store the development Desktop OAuth client directly in the OS credential store:
@@ -274,6 +276,89 @@ fn google_logout() -> Result<(), CliError> {
     println!("REFRESH_TOKEN_REMOVED=yes");
     println!("CLIENT_CONFIG_RETAINED=yes");
     println!("LOCAL_METADATA_RETAINED=yes");
+
+    Ok(())
+}
+
+fn drive_inventory() -> Result<(), CliError> {
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    let mut continuation = None;
+    let mut seen_continuations = HashSet::new();
+    let mut pages_fetched = 0_u64;
+    let mut supported_items = 0_u64;
+    let mut files = 0_u64;
+    let mut folders = 0_u64;
+    let mut unsupported_provider_native = 0_u64;
+
+    loop {
+        if pages_fetched >= 10_000 {
+            return Err(CliError::DriveInventoryPageLimitExceeded);
+        }
+
+        let page = api.list_inventory_page(continuation.as_ref())?;
+        pages_fetched += 1;
+        supported_items += page.supported_items;
+        files += page.file_count;
+        folders += page.folder_count;
+        unsupported_provider_native += page.unsupported_provider_native;
+
+        match page.continuation {
+            Some(next) => {
+                if !seen_continuations.insert(next.as_str().to_owned()) {
+                    return Err(CliError::DriveInventoryPaginationLoop);
+                }
+                continuation = Some(next);
+            }
+            None => break,
+        }
+    }
+
+    println!("DRIVE_INVENTORY=PASS");
+    println!("PAGES_FETCHED={pages_fetched}");
+    println!("SUPPORTED_ITEMS={supported_items}");
+    println!("FILES={files}");
+    println!("FOLDERS={folders}");
+    println!("UNSUPPORTED_PROVIDER_NATIVE={unsupported_provider_native}");
+    println!("INVENTORY_PERSISTED=no");
+    println!("PROVIDER_CURSOR_MODIFIED=no");
+    println!("REMOTE_EVENTS_MODIFIED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
 }
@@ -693,6 +778,10 @@ enum CliError {
     DriveChangePaginationLoop,
     #[error("Google Drive change pagination exceeded the safety limit")]
     DriveChangePageLimitExceeded,
+    #[error("Google Drive inventory pagination repeated a continuation token")]
+    DriveInventoryPaginationLoop,
+    #[error("Google Drive inventory pagination exceeded the safety limit")]
+    DriveInventoryPageLimitExceeded,
     #[error("Google Drive change stream ended without a durable checkpoint")]
     DriveChangeStreamMissingCheckpoint,
     #[error("stored Google OAuth client configuration is missing")]
