@@ -265,3 +265,29 @@ mutation.
 
 This phase intentionally does not create a sync root yet. Remote-folder
 validation and explicit root registration remain separate operations.
+
+## Phase 4J — Remote sync-root validation
+
+Before a remote folder can become a durable sync root, NubiSync validates that
+the selected Drive identifier resolves to a live folder within the currently
+supported My Drive ownership scope.
+
+Development command:
+
+`nubisync drive folder validate <remote-folder-id>`
+
+The validation performs one metadata-only `files.get` request and requests only:
+
+- MIME type
+- trashed state
+- ownership state
+
+It does not request the folder name, path, children, file content, or write
+permissions.
+
+The special Drive identifier `root` is accepted as a valid candidate identifier
+for My Drive's root folder.
+
+Phase 4J intentionally does not persist a sync root. Registration remains an
+explicit later operation once both a remote folder and local directory have been
+chosen.

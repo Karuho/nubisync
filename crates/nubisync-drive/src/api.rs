@@ -114,6 +114,25 @@ impl GoogleDriveApi {
         ChangeCursor::new(response.start_page_token).map_err(DriveApiError::from)
     }
 
+    /// Validates one candidate My Drive sync root using metadata only.
+    ///
+    /// The provider fetches no file content and does not expose the remote ID
+    /// in the returned value or logs.
+    pub fn validate_folder_root(&self, remote_root_id: &str) -> Result<(), DriveApiError> {
+        validate_drive_file_id(remote_root_id)?;
+
+        let metadata: DriveFolderRootMetadata = self
+            .client
+            .get(format!("{GOOGLE_DRIVE_FILES_ENDPOINT}/{remote_root_id}"))
+            .bearer_auth(self.access_token.as_str())
+            .query(&[("fields", "mimeType,trashed,ownedByMe")])
+            .send()?
+            .error_for_status()?
+            .json()?;
+
+        validate_folder_root_metadata(&metadata)
+    }
+
     /// Lists one metadata-only inventory page for ordinary Drive items
     /// owned by the current user.
     ///
@@ -236,6 +255,16 @@ pub struct DriveProbe {
     pub usage_in_drive_bytes: Option<u64>,
     pub max_upload_size_bytes: Option<u64>,
     pub change_cursor: ChangeCursor,
+}
+
+#[derive(Debug, Deserialize)]
+struct DriveFolderRootMetadata {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    #[serde(default)]
+    trashed: bool,
+    #[serde(rename = "ownedByMe", default)]
+    owned_by_me: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +531,35 @@ struct GoogleFile {
     trashed: bool,
 }
 
+fn validate_drive_file_id(value: &str) -> Result<(), DriveApiError> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(DriveApiError::InvalidRemoteRootId);
+    }
+
+    Ok(())
+}
+
+fn validate_folder_root_metadata(metadata: &DriveFolderRootMetadata) -> Result<(), DriveApiError> {
+    if metadata.mime_type != GOOGLE_DRIVE_FOLDER_MIME_TYPE {
+        return Err(DriveApiError::RemoteRootNotFolder);
+    }
+
+    if metadata.trashed {
+        return Err(DriveApiError::RemoteRootTrashed);
+    }
+
+    if !metadata.owned_by_me {
+        return Err(DriveApiError::RemoteRootNotOwnedByUser);
+    }
+
+    Ok(())
+}
+
 fn escape_drive_query_literal(value: &str) -> Result<String, DriveApiError> {
     if value.trim().is_empty() {
         return Err(DriveApiError::InvalidInventoryParentId);
@@ -547,11 +605,73 @@ pub enum DriveApiError {
     InvalidInventoryPage { code: &'static str },
     #[error("Google Drive inventory parent identifier is invalid")]
     InvalidInventoryParentId,
+    #[error("Google Drive remote root identifier is invalid")]
+    InvalidRemoteRootId,
+    #[error("Google Drive remote root is not a folder")]
+    RemoteRootNotFolder,
+    #[error("Google Drive remote root is trashed")]
+    RemoteRootTrashed,
+    #[error("Google Drive remote root is outside the supported My Drive ownership scope")]
+    RemoteRootNotOwnedByUser,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_root_id_accepts_root_alias_and_drive_id_shape() {
+        assert!(validate_drive_file_id("root").is_ok());
+        assert!(validate_drive_file_id("1AbC_def-123").is_ok());
+        assert!(matches!(
+            validate_drive_file_id("bad/id"),
+            Err(DriveApiError::InvalidRemoteRootId)
+        ));
+        assert!(matches!(
+            validate_drive_file_id(""),
+            Err(DriveApiError::InvalidRemoteRootId)
+        ));
+    }
+
+    #[test]
+    fn remote_root_metadata_requires_owned_live_folder() {
+        let valid = DriveFolderRootMetadata {
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+            trashed: false,
+            owned_by_me: true,
+        };
+        assert!(validate_folder_root_metadata(&valid).is_ok());
+
+        let file = DriveFolderRootMetadata {
+            mime_type: "text/plain".into(),
+            trashed: false,
+            owned_by_me: true,
+        };
+        assert!(matches!(
+            validate_folder_root_metadata(&file),
+            Err(DriveApiError::RemoteRootNotFolder)
+        ));
+
+        let trashed = DriveFolderRootMetadata {
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+            trashed: true,
+            owned_by_me: true,
+        };
+        assert!(matches!(
+            validate_folder_root_metadata(&trashed),
+            Err(DriveApiError::RemoteRootTrashed)
+        ));
+
+        let not_owned = DriveFolderRootMetadata {
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+            trashed: false,
+            owned_by_me: false,
+        };
+        assert!(matches!(
+            validate_folder_root_metadata(&not_owned),
+            Err(DriveApiError::RemoteRootNotOwnedByUser)
+        ));
+    }
 
     #[test]
     fn folder_children_query_is_scoped_and_escapes_literals() {

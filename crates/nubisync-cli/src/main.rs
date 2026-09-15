@@ -82,6 +82,11 @@ fn run() -> Result<(), CliError> {
         [drive, inventory] if drive == "drive" && inventory == "inventory" => {
             drive_inventory(Some(20))
         }
+        [drive, folder, validate, remote_root_id]
+            if drive == "drive" && folder == "folder" && validate == "validate" =>
+        {
+            drive_folder_validate(remote_root_id)
+        }
         [drive, folder, probe, parent_id, limit, value]
             if drive == "drive" && folder == "folder" && probe == "probe" && limit == "--limit" =>
         {
@@ -130,6 +135,7 @@ USAGE:
   nubisync drive changes
   nubisync drive catalog status
   nubisync drive catalog catchup
+  nubisync drive folder validate <remote-folder-id>
   nubisync drive folder probe <remote-folder-id> --limit <1-1000>
   nubisync drive folder tree <remote-folder-id> --limit <1-10000>
   nubisync drive inventory
@@ -505,6 +511,62 @@ fn drive_catalog_status() -> Result<(), CliError> {
     );
     println!("NETWORK_CHECK=not_performed");
     println!("REMOTE_METADATA_PRINTED=no");
+
+    Ok(())
+}
+
+fn drive_folder_validate(remote_root_id: &str) -> Result<(), CliError> {
+    println!("DRIVE_FOLDER_VALIDATE_STAGE=local_session");
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("DRIVE_FOLDER_VALIDATE_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("DRIVE_FOLDER_VALIDATE_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("DRIVE_FOLDER_VALIDATE_STAGE=validate_remote_root");
+    api.validate_folder_root(remote_root_id)?;
+
+    println!("DRIVE_FOLDER_VALIDATE=PASS");
+    println!("REMOTE_ROOT_KIND=folder");
+    println!("REMOTE_ROOT_OWNERSHIP=my_drive");
+    println!("REMOTE_ROOT_TRASHED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("INVENTORY_PERSISTED=no");
+    println!("SYNC_ROOT_PERSISTED=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
 }
