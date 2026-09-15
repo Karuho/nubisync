@@ -410,6 +410,263 @@ fn validate_hydration(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTreeEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalTreeEntry {
+    relative_path: String,
+    pub kind: LocalTreeEntryKind,
+}
+
+impl LocalTreeEntry {
+    pub fn new(
+        relative_path: impl Into<String>,
+        kind: LocalTreeEntryKind,
+    ) -> Result<Self, ReceiveOnlyMaterializationPlanError> {
+        let relative_path = relative_path.into();
+        validate_safe_relative_path(&relative_path)?;
+        Ok(Self {
+            relative_path,
+            kind,
+        })
+    }
+
+    fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+}
+
+impl std::fmt::Debug for LocalTreeEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalTreeEntry")
+            .field("kind", &self.kind)
+            .field("relative_path", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiveOnlyMaterializationPlan {
+    pub remote_items: usize,
+    pub remote_directories: usize,
+    pub remote_files: usize,
+    pub local_entries: usize,
+    pub missing_directories: usize,
+    pub missing_files: usize,
+    pub matching_directories: usize,
+    pub existing_files_unverified: usize,
+    pub local_only_entries: usize,
+    pub type_conflicts: usize,
+}
+
+impl ReceiveOnlyMaterializationPlan {
+    pub fn ready_for_directory_phase(&self) -> bool {
+        self.type_conflicts == 0 && self.local_only_entries == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiveOnlyMaterializationPlanError {
+    InvalidRemoteItem,
+    UnsafeRemoteName,
+    DuplicateRemoteId,
+    DuplicateSiblingName,
+    IncompleteRemoteCatalog,
+    RemotePathCollision,
+    InvalidLocalRelativePath,
+    DuplicateLocalPath,
+}
+
+pub fn plan_receive_only_materialization(
+    remote_items: &[RemoteItem],
+    local_entries: &[LocalTreeEntry],
+) -> Result<ReceiveOnlyMaterializationPlan, ReceiveOnlyMaterializationPlanError> {
+    let mut remote_ids = HashSet::with_capacity(remote_items.len());
+    let mut external_parent_ids = HashSet::new();
+    let mut children_by_parent: HashMap<&str, Vec<&RemoteItem>> = HashMap::new();
+    let mut sibling_names = HashSet::with_capacity(remote_items.len());
+
+    for item in remote_items {
+        if item.remote_id.trim().is_empty() || item.parent_remote_id.is_none() || item.trashed {
+            return Err(ReceiveOnlyMaterializationPlanError::InvalidRemoteItem);
+        }
+
+        validate_safe_remote_name(&item.name)?;
+
+        if !remote_ids.insert(item.remote_id.as_str()) {
+            return Err(ReceiveOnlyMaterializationPlanError::DuplicateRemoteId);
+        }
+    }
+
+    for item in remote_items {
+        let parent_remote_id = item
+            .parent_remote_id
+            .as_deref()
+            .ok_or(ReceiveOnlyMaterializationPlanError::InvalidRemoteItem)?;
+
+        if !sibling_names.insert((parent_remote_id.to_owned(), item.name.clone())) {
+            return Err(ReceiveOnlyMaterializationPlanError::DuplicateSiblingName);
+        }
+
+        if !remote_ids.contains(parent_remote_id) {
+            external_parent_ids.insert(parent_remote_id);
+        }
+
+        children_by_parent
+            .entry(parent_remote_id)
+            .or_default()
+            .push(item);
+    }
+
+    let mut expected_paths = HashMap::with_capacity(remote_items.len());
+
+    if !remote_items.is_empty() {
+        if external_parent_ids.len() != 1 {
+            return Err(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog);
+        }
+
+        let root_remote_id = *external_parent_ids
+            .iter()
+            .next()
+            .ok_or(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog)?;
+
+        let mut queue: VecDeque<(&RemoteItem, String)> = VecDeque::new();
+
+        if let Some(top_level) = children_by_parent.get(root_remote_id) {
+            let mut top_level = top_level.clone();
+            top_level.sort_by(|left, right| left.remote_id.cmp(&right.remote_id));
+
+            for item in top_level {
+                queue.push_back((item, item.name.clone()));
+            }
+        }
+
+        let mut visited = HashSet::with_capacity(remote_items.len());
+
+        while let Some((item, relative_path)) = queue.pop_front() {
+            if !visited.insert(item.remote_id.as_str()) {
+                return Err(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog);
+            }
+
+            if expected_paths
+                .insert(relative_path.clone(), item.kind)
+                .is_some()
+            {
+                return Err(ReceiveOnlyMaterializationPlanError::RemotePathCollision);
+            }
+
+            if let Some(children) = children_by_parent.get(item.remote_id.as_str()) {
+                let mut children = children.clone();
+                children.sort_by(|left, right| left.remote_id.cmp(&right.remote_id));
+
+                for child in children {
+                    let child_path = format!("{relative_path}/{}", child.name);
+                    validate_safe_relative_path(&child_path)?;
+                    queue.push_back((child, child_path));
+                }
+            }
+        }
+
+        if visited.len() != remote_items.len() {
+            return Err(ReceiveOnlyMaterializationPlanError::IncompleteRemoteCatalog);
+        }
+    }
+
+    let mut local_by_path = HashMap::with_capacity(local_entries.len());
+
+    for entry in local_entries {
+        validate_safe_relative_path(entry.relative_path())?;
+
+        if local_by_path
+            .insert(entry.relative_path().to_owned(), entry.kind)
+            .is_some()
+        {
+            return Err(ReceiveOnlyMaterializationPlanError::DuplicateLocalPath);
+        }
+    }
+
+    let remote_directories = expected_paths
+        .values()
+        .filter(|kind| **kind == RemoteItemKind::Folder)
+        .count();
+    let remote_files = expected_paths
+        .values()
+        .filter(|kind| **kind == RemoteItemKind::File)
+        .count();
+
+    let mut missing_directories = 0_usize;
+    let mut missing_files = 0_usize;
+    let mut matching_directories = 0_usize;
+    let mut existing_files_unverified = 0_usize;
+    let mut type_conflicts = 0_usize;
+
+    for (relative_path, remote_kind) in &expected_paths {
+        match (remote_kind, local_by_path.get(relative_path.as_str())) {
+            (RemoteItemKind::Folder, None) => missing_directories += 1,
+            (RemoteItemKind::File, None) => missing_files += 1,
+            (RemoteItemKind::Folder, Some(LocalTreeEntryKind::Directory)) => {
+                matching_directories += 1
+            }
+            (RemoteItemKind::File, Some(LocalTreeEntryKind::File)) => {
+                existing_files_unverified += 1
+            }
+            (RemoteItemKind::Folder, Some(LocalTreeEntryKind::File))
+            | (RemoteItemKind::File, Some(LocalTreeEntryKind::Directory)) => type_conflicts += 1,
+        }
+    }
+
+    let local_only_entries = local_by_path
+        .keys()
+        .filter(|path| !expected_paths.contains_key(*path))
+        .count();
+
+    Ok(ReceiveOnlyMaterializationPlan {
+        remote_items: remote_items.len(),
+        remote_directories,
+        remote_files,
+        local_entries: local_entries.len(),
+        missing_directories,
+        missing_files,
+        matching_directories,
+        existing_files_unverified,
+        local_only_entries,
+        type_conflicts,
+    })
+}
+
+fn validate_safe_remote_name(name: &str) -> Result<(), ReceiveOnlyMaterializationPlanError> {
+    if name.is_empty() || matches!(name, "." | "..") || name.contains('/') || name.contains('\0') {
+        return Err(ReceiveOnlyMaterializationPlanError::UnsafeRemoteName);
+    }
+
+    Ok(())
+}
+
+fn validate_safe_relative_path(
+    relative_path: &str,
+) -> Result<(), ReceiveOnlyMaterializationPlanError> {
+    if relative_path.is_empty()
+        || relative_path.starts_with('/')
+        || relative_path.ends_with('/')
+        || relative_path.contains('\0')
+    {
+        return Err(ReceiveOnlyMaterializationPlanError::InvalidLocalRelativePath);
+    }
+
+    for component in relative_path.split('/') {
+        if component.is_empty() || matches!(component, "." | "..") {
+            return Err(ReceiveOnlyMaterializationPlanError::InvalidLocalRelativePath);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Divergence {
     pub local_changed_since_checkpoint: bool,
     pub remote_changed_since_checkpoint: bool,
@@ -467,6 +724,95 @@ mod tests {
             modified_unix_ms: None,
             trashed,
         }
+    }
+
+    fn materialization_item(
+        remote_id: &str,
+        parent_remote_id: &str,
+        name: &str,
+        kind: RemoteItemKind,
+    ) -> RemoteItem {
+        RemoteItem {
+            remote_id: remote_id.into(),
+            parent_remote_id: Some(parent_remote_id.into()),
+            name: name.into(),
+            kind,
+            size_bytes: None,
+            modified_unix_ms: None,
+            trashed: false,
+        }
+    }
+
+    #[test]
+    fn materialization_plan_counts_missing_remote_tree() {
+        let folder =
+            materialization_item("folder", "selected-root", "folder", RemoteItemKind::Folder);
+        let file = materialization_item("file", "folder", "file.txt", RemoteItemKind::File);
+
+        let plan = plan_receive_only_materialization(&[folder, file], &[]).unwrap();
+
+        assert_eq!(plan.remote_items, 2);
+        assert_eq!(plan.remote_directories, 1);
+        assert_eq!(plan.remote_files, 1);
+        assert_eq!(plan.local_entries, 0);
+        assert_eq!(plan.missing_directories, 1);
+        assert_eq!(plan.missing_files, 1);
+        assert_eq!(plan.type_conflicts, 0);
+        assert!(plan.ready_for_directory_phase());
+    }
+
+    #[test]
+    fn materialization_plan_rejects_unsafe_names_and_duplicate_siblings() {
+        let unsafe_item = materialization_item(
+            "unsafe",
+            "selected-root",
+            "../escape",
+            RemoteItemKind::Folder,
+        );
+
+        assert_eq!(
+            plan_receive_only_materialization(&[unsafe_item], &[]).unwrap_err(),
+            ReceiveOnlyMaterializationPlanError::UnsafeRemoteName
+        );
+
+        let first = materialization_item("one", "selected-root", "same", RemoteItemKind::Folder);
+        let second = materialization_item("two", "selected-root", "same", RemoteItemKind::File);
+
+        assert_eq!(
+            plan_receive_only_materialization(&[first, second], &[]).unwrap_err(),
+            ReceiveOnlyMaterializationPlanError::DuplicateSiblingName
+        );
+    }
+
+    #[test]
+    fn materialization_plan_detects_local_conflicts_without_mutating() {
+        let folder =
+            materialization_item("folder", "selected-root", "docs", RemoteItemKind::Folder);
+        let file =
+            materialization_item("file", "selected-root", "readme.txt", RemoteItemKind::File);
+
+        let local = vec![
+            LocalTreeEntry::new("docs", LocalTreeEntryKind::File).unwrap(),
+            LocalTreeEntry::new("readme.txt", LocalTreeEntryKind::File).unwrap(),
+            LocalTreeEntry::new("local-only", LocalTreeEntryKind::Directory).unwrap(),
+        ];
+
+        let plan = plan_receive_only_materialization(&[folder, file], &local).unwrap();
+
+        assert_eq!(plan.type_conflicts, 1);
+        assert_eq!(plan.existing_files_unverified, 1);
+        assert_eq!(plan.local_only_entries, 1);
+        assert!(!plan.ready_for_directory_phase());
+    }
+
+    #[test]
+    fn local_tree_entry_debug_redacts_relative_path() {
+        let entry = LocalTreeEntry::new("private/folder", LocalTreeEntryKind::Directory).unwrap();
+        let debug = format!("{entry:?}");
+
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("private"));
+        assert!(!debug.contains("folder"));
     }
 
     #[test]

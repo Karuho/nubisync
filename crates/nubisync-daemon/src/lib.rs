@@ -10,11 +10,135 @@ use nubisync_storage::{
     Storage, StorageError, SyncRootCatalogBatchCommit, SyncRootCatalogMutation,
 };
 use nubisync_sync::{
-    RootCatalogMutationPlan, RootCatalogProjection, RootCatalogProjectionError,
-    RootCatalogResolution, RootChangeMembership,
+    LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyMaterializationPlan,
+    ReceiveOnlyMaterializationPlanError, RootCatalogMutationPlan, RootCatalogProjection,
+    RootCatalogProjectionError, RootCatalogResolution, RootChangeMembership,
+    plan_receive_only_materialization,
 };
-use std::collections::{HashSet, VecDeque};
+use std::{
+    collections::{HashSet, VecDeque},
+    fs,
+    path::PathBuf,
+};
 use thiserror::Error;
+
+pub fn plan_selected_root_local_materialization(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<ReceiveOnlyMaterializationPlan, SelectedRootExecutorError> {
+    if sync_root.mode != nubisync_core::SyncMode::ReceiveOnly {
+        return Err(SelectedRootExecutorError::LocalPlanModeUnsupported);
+    }
+
+    let inventory = storage.sync_root_remote_inventory_state(&sync_root.id)?;
+
+    if !inventory.snapshot_complete {
+        return Err(SelectedRootExecutorError::LocalPlanSnapshotMissing);
+    }
+
+    if !inventory.catchup_complete {
+        return Err(SelectedRootExecutorError::LocalPlanCatchupIncomplete);
+    }
+
+    if storage
+        .sync_root_change_window_state(&sync_root.id)?
+        .is_some()
+    {
+        return Err(SelectedRootExecutorError::LocalPlanChangeWindowPending);
+    }
+
+    if storage.sync_root_change_cursor(&sync_root.id)?.is_none() {
+        return Err(SelectedRootExecutorError::LocalPlanCursorMissing);
+    }
+
+    let remote_items = storage.list_sync_root_remote_items(&sync_root.id)?;
+    let remote_item_count =
+        u64::try_from(remote_items.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+
+    if remote_item_count != inventory.item_count {
+        return Err(SelectedRootExecutorError::LocalPlanCatalogItemCountMismatch);
+    }
+
+    let local_entries = scan_selected_root_local_tree(sync_root)?;
+
+    plan_receive_only_materialization(&remote_items, &local_entries)
+        .map_err(SelectedRootExecutorError::from)
+}
+
+fn scan_selected_root_local_tree(
+    sync_root: &SyncRoot,
+) -> Result<Vec<LocalTreeEntry>, SelectedRootExecutorError> {
+    let configured_root = PathBuf::from(&sync_root.local_path);
+
+    let root_metadata = fs::symlink_metadata(&configured_root)
+        .map_err(|_| SelectedRootExecutorError::LocalRootUnavailable)?;
+
+    if root_metadata.file_type().is_symlink() {
+        return Err(SelectedRootExecutorError::LocalRootSymlinkUnsupported);
+    }
+
+    if !root_metadata.is_dir() {
+        return Err(SelectedRootExecutorError::LocalRootNotDirectory);
+    }
+
+    let canonical_root = fs::canonicalize(&configured_root)
+        .map_err(|_| SelectedRootExecutorError::LocalRootUnavailable)?;
+
+    if canonical_root != configured_root {
+        return Err(SelectedRootExecutorError::LocalRootIdentityChanged);
+    }
+
+    let mut queue = VecDeque::from([(configured_root, String::new())]);
+    let mut entries = Vec::new();
+
+    while let Some((absolute_parent, relative_parent)) = queue.pop_front() {
+        let directory = fs::read_dir(&absolute_parent)
+            .map_err(|_| SelectedRootExecutorError::LocalFilesystemInspectionFailed)?;
+
+        for entry in directory {
+            let entry =
+                entry.map_err(|_| SelectedRootExecutorError::LocalFilesystemInspectionFailed)?;
+
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| SelectedRootExecutorError::LocalEntryNonUtf8)?;
+
+            let relative_path = if relative_parent.is_empty() {
+                name
+            } else {
+                format!("{relative_parent}/{name}")
+            };
+
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|_| SelectedRootExecutorError::LocalFilesystemInspectionFailed)?;
+
+            if metadata.file_type().is_symlink() {
+                return Err(SelectedRootExecutorError::LocalEntrySymlinkUnsupported);
+            }
+
+            let kind = if metadata.is_dir() {
+                LocalTreeEntryKind::Directory
+            } else if metadata.is_file() {
+                LocalTreeEntryKind::File
+            } else {
+                return Err(SelectedRootExecutorError::LocalEntryTypeUnsupported);
+            };
+
+            entries.push(LocalTreeEntry::new(relative_path.clone(), kind)?);
+
+            if entries.len() > 1_000_000 {
+                return Err(SelectedRootExecutorError::LocalScanSafetyLimitExceeded);
+            }
+
+            if kind == LocalTreeEntryKind::Directory {
+                queue.push_back((entry.path(), relative_path));
+            }
+        }
+    }
+
+    Ok(entries)
+}
 
 pub trait SelectedRootProvider {
     type RootIdentity;
@@ -675,6 +799,36 @@ pub enum SelectedRootExecutorError {
     RootIdentityChanged,
     #[error("selected-root batch counter overflowed")]
     CountOverflow,
+    #[error("local materialization planning supports only receive_only roots")]
+    LocalPlanModeUnsupported,
+    #[error("local materialization planning requires an authoritative snapshot")]
+    LocalPlanSnapshotMissing,
+    #[error("local materialization planning requires completed initial catch-up")]
+    LocalPlanCatchupIncomplete,
+    #[error("local materialization planning requires a durable change cursor")]
+    LocalPlanCursorMissing,
+    #[error("local materialization planning requires no pending durable change window")]
+    LocalPlanChangeWindowPending,
+    #[error("local materialization planning catalog count mismatched durable state")]
+    LocalPlanCatalogItemCountMismatch,
+    #[error("configured local sync root is unavailable")]
+    LocalRootUnavailable,
+    #[error("configured local sync root cannot be a symbolic link")]
+    LocalRootSymlinkUnsupported,
+    #[error("configured local sync root is not a directory")]
+    LocalRootNotDirectory,
+    #[error("configured local sync root canonical identity changed")]
+    LocalRootIdentityChanged,
+    #[error("local sync tree contains a non-UTF-8 entry")]
+    LocalEntryNonUtf8,
+    #[error("local sync tree contains a symbolic link")]
+    LocalEntrySymlinkUnsupported,
+    #[error("local sync tree contains an unsupported filesystem entry type")]
+    LocalEntryTypeUnsupported,
+    #[error("local sync tree metadata inspection failed")]
+    LocalFilesystemInspectionFailed,
+    #[error("local sync tree scan exceeded its safety limit")]
+    LocalScanSafetyLimitExceeded,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
     #[error("selected-root change window requires an authoritative snapshot")]
@@ -707,6 +861,8 @@ pub enum SelectedRootExecutorError {
     Storage(Box<StorageError>),
     #[error("selected-root catalog projection failed: {0:?}")]
     Projection(RootCatalogProjectionError),
+    #[error("receive-only local materialization planning failed: {0:?}")]
+    MaterializationPlan(ReceiveOnlyMaterializationPlanError),
 }
 
 impl From<DriveApiError> for SelectedRootExecutorError {
@@ -727,6 +883,12 @@ impl From<RootCatalogProjectionError> for SelectedRootExecutorError {
     }
 }
 
+impl From<ReceiveOnlyMaterializationPlanError> for SelectedRootExecutorError {
+    fn from(error: ReceiveOnlyMaterializationPlanError) -> Self {
+        Self::MaterializationPlan(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,6 +897,79 @@ mod tests {
         cell::{Cell, RefCell},
         collections::{HashMap, VecDeque},
     };
+
+    fn local_plan_temp_dir(label: &str) -> PathBuf {
+        let unique = format!(
+            "nubisync-local-plan-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    fn local_plan_test_root(path: &std::path::Path) -> SyncRoot {
+        SyncRoot::new(
+            "local-plan-root",
+            ProviderId::new("google-drive").unwrap(),
+            "subject",
+            std::fs::canonicalize(path)
+                .unwrap()
+                .into_os_string()
+                .into_string()
+                .unwrap(),
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn local_scan_collects_metadata_without_exposing_paths() {
+        let root = local_plan_temp_dir("scan");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("folder")).unwrap();
+        std::fs::write(root.join("file.txt"), b"content-not-read-by-scan").unwrap();
+
+        let sync_root = local_plan_test_root(&root);
+        let entries = scan_selected_root_local_tree(&sync_root).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        let debug = format!("{entries:?}");
+        assert!(!debug.contains("file.txt"));
+        assert!(!debug.contains("folder"));
+
+        std::fs::remove_file(root.join("file.txt")).unwrap();
+        std::fs::remove_dir(root.join("folder")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_scan_rejects_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root = local_plan_temp_dir("symlink");
+        let outside = local_plan_temp_dir("outside");
+
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+
+        let sync_root = local_plan_test_root(&root);
+
+        assert!(matches!(
+            scan_selected_root_local_tree(&sync_root),
+            Err(SelectedRootExecutorError::LocalEntrySymlinkUnsupported)
+        ));
+
+        std::fs::remove_file(root.join("link")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir(outside).unwrap();
+    }
 
     struct FakeProvider {
         canonical_root_id: String,

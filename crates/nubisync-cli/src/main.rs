@@ -11,7 +11,7 @@ use nubisync_core::{
 };
 use nubisync_daemon::{
     bootstrap_selected_root_snapshot, collect_selected_root_change_window_page,
-    execute_completed_selected_root_change_window,
+    execute_completed_selected_root_change_window, plan_selected_root_local_materialization,
 };
 use nubisync_drive::{GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig};
 use nubisync_storage::Storage;
@@ -81,6 +81,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_metadata_step()
+        }
+        [sync, roots, reconcile_plan, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && reconcile_plan == "reconcile-plan"
+                && approve == "--approve" =>
+        {
+            sync_roots_reconcile_plan()
         }
         [sync, roots, inventory, limit, value]
             if sync == "sync"
@@ -169,6 +177,7 @@ USAGE:
   nubisync auth google logout
   nubisync sync roots status
   nubisync sync roots metadata-step --approve
+  nubisync sync roots reconcile-plan --approve
   nubisync sync roots inventory --limit <1-10000>
   nubisync sync roots add --mode receive_only
   nubisync sync roots add --mode receive_only --dry-run
@@ -531,6 +540,80 @@ fn sync_roots_metadata_step() -> Result<(), CliError> {
     println!("REMOTE_METADATA_PRINTED=no");
     println!("FILE_CONTENT_ACCESSED=no");
     println!("FILESYSTEM_MUTATION=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_reconcile_plan() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.is_empty() {
+        println!("SYNC_ROOT_RECONCILE_PLAN=SKIPPED");
+        println!("REASON=no_configured_root");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_RECONCILE_PLAN=SKIPPED");
+        println!("REASON=multiple_roots_require_selector");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    let plan = plan_selected_root_local_materialization(&storage, &root)?;
+
+    println!("SYNC_ROOT_RECONCILE_PLAN=PASS");
+    println!("MODE=receive_only");
+    println!("REMOTE_ITEMS={}", plan.remote_items);
+    println!("REMOTE_DIRECTORIES={}", plan.remote_directories);
+    println!("REMOTE_FILES={}", plan.remote_files);
+    println!("LOCAL_ENTRIES={}", plan.local_entries);
+    println!("MISSING_DIRECTORIES={}", plan.missing_directories);
+    println!("MISSING_FILES={}", plan.missing_files);
+    println!("MATCHING_DIRECTORIES={}", plan.matching_directories);
+    println!(
+        "EXISTING_FILES_UNVERIFIED={}",
+        plan.existing_files_unverified
+    );
+    println!("LOCAL_ONLY_ENTRIES={}", plan.local_only_entries);
+    println!("TYPE_CONFLICTS={}", plan.type_conflicts);
+    println!(
+        "READY_FOR_DIRECTORY_PHASE={}",
+        yes_no(plan.ready_for_directory_phase())
+    );
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=no");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
@@ -2264,6 +2347,8 @@ enum CliError {
     SyncRootInventorySelectionFailed,
     #[error("sync root metadata-step selection failed")]
     SyncRootMetadataStepSelectionFailed,
+    #[error("sync root reconciliation-plan selection failed")]
+    SyncRootReconcilePlanSelectionFailed,
     #[error("sync root metadata-step currently supports only receive_only roots")]
     SyncRootMetadataStepModeUnsupported,
     #[error("configured sync root does not have a remote root identifier")]
