@@ -10,7 +10,7 @@ use nubisync_core::{ProviderAccount, ProviderId, RemoteChange, RemoteItemKind};
 use nubisync_drive::{GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig};
 use nubisync_storage::Storage;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env, fs,
     io::{self, Write},
     path::PathBuf,
@@ -84,6 +84,11 @@ fn run() -> Result<(), CliError> {
         {
             drive_folder_probe(parent_id, parse_folder_probe_limit(value)?)
         }
+        [drive, folder, tree, root_id, limit, value]
+            if drive == "drive" && folder == "folder" && tree == "tree" && limit == "--limit" =>
+        {
+            drive_folder_tree(root_id, parse_folder_tree_limit(value)?)
+        }
         [drive, inventory, full]
             if drive == "drive" && inventory == "inventory" && full == "--full" =>
         {
@@ -122,6 +127,7 @@ USAGE:
   nubisync drive catalog status
   nubisync drive catalog catchup
   nubisync drive folder probe <remote-folder-id> --limit <1-1000>
+  nubisync drive folder tree <remote-folder-id> --limit <1-10000>
   nubisync drive inventory
   nubisync drive inventory --limit <1-10000>
   nubisync drive inventory --full
@@ -467,6 +473,167 @@ fn drive_catalog_status() -> Result<(), CliError> {
     );
     println!("NETWORK_CHECK=not_performed");
     println!("REMOTE_METADATA_PRINTED=no");
+
+    Ok(())
+}
+
+fn parse_folder_tree_limit(value: &str) -> Result<u64, CliError> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| CliError::InvalidFolderTreeLimit)?;
+
+    if !(1..=10_000).contains(&parsed) {
+        return Err(CliError::InvalidFolderTreeLimit);
+    }
+
+    Ok(parsed)
+}
+
+fn drive_folder_tree(root_remote_id: &str, max_items: u64) -> Result<(), CliError> {
+    println!("DRIVE_FOLDER_TREE_STAGE=local_session");
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("DRIVE_FOLDER_TREE_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("DRIVE_FOLDER_TREE_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    let mut folder_queue = VecDeque::new();
+    let mut seen_folders = HashSet::new();
+
+    seen_folders.insert(root_remote_id.to_owned());
+    folder_queue.push_back(root_remote_id.to_owned());
+
+    let mut pages_fetched = 0_u64;
+    let mut folders_visited = 0_u64;
+    let mut observed_items = 0_u64;
+    let mut supported_items = 0_u64;
+    let mut files = 0_u64;
+    let mut folders = 0_u64;
+    let mut unsupported_provider_native = 0_u64;
+    let mut limit_reached = false;
+
+    'folders: while let Some(parent_remote_id) = folder_queue.pop_front() {
+        folders_visited += 1;
+
+        let mut continuation = None;
+        let mut seen_continuations = HashSet::new();
+
+        loop {
+            if observed_items >= max_items {
+                limit_reached = true;
+                break 'folders;
+            }
+
+            if pages_fetched >= 10_000 {
+                return Err(CliError::DriveFolderTreePageLimitExceeded);
+            }
+
+            let remaining = (max_items - observed_items).min(1000);
+            let page_size =
+                u16::try_from(remaining).map_err(|_| CliError::InvalidFolderTreeLimit)?;
+
+            let page_number = pages_fetched + 1;
+            println!("DRIVE_FOLDER_TREE_FETCH_PAGE={page_number}");
+
+            let page =
+                api.list_folder_children_page(&parent_remote_id, continuation.as_ref(), page_size)?;
+            pages_fetched += 1;
+
+            for item in &page.items {
+                if item.kind == RemoteItemKind::Folder
+                    && seen_folders.insert(item.remote_id.clone())
+                {
+                    folder_queue.push_back(item.remote_id.clone());
+                }
+            }
+
+            let page_items = page.supported_items + page.unsupported_provider_native;
+            observed_items += page_items;
+            supported_items += page.supported_items;
+            files += page.file_count;
+            folders += page.folder_count;
+            unsupported_provider_native += page.unsupported_provider_native;
+
+            println!(
+                "DRIVE_FOLDER_TREE_PAGE_COMPLETE={} OBSERVED_SO_FAR={} FILES_SO_FAR={} FOLDERS_SO_FAR={} QUEUED_FOLDERS={}",
+                pages_fetched,
+                observed_items,
+                files,
+                folders,
+                folder_queue.len()
+            );
+
+            match page.continuation {
+                Some(next) => {
+                    if !seen_continuations.insert(next.as_str().to_owned()) {
+                        return Err(CliError::DriveFolderTreePaginationLoop);
+                    }
+
+                    continuation = Some(next);
+
+                    if observed_items >= max_items {
+                        limit_reached = true;
+                        break 'folders;
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
+    let traversal_complete = !limit_reached && folder_queue.is_empty();
+
+    println!("DRIVE_FOLDER_TREE=PASS");
+    println!("MODE=bounded_recursive");
+    println!("MAX_ITEMS={max_items}");
+    println!("TRAVERSAL_COMPLETE={}", yes_no(traversal_complete));
+    println!("LIMIT_REACHED={}", yes_no(limit_reached));
+    println!("PAGES_FETCHED={pages_fetched}");
+    println!("FOLDERS_VISITED={folders_visited}");
+    println!("OBSERVED_ITEMS={observed_items}");
+    println!("SUPPORTED_ITEMS={supported_items}");
+    println!("FILES={files}");
+    println!("FOLDERS={folders}");
+    println!("UNSUPPORTED_PROVIDER_NATIVE={unsupported_provider_native}");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_ITEM_IDS_PRINTED=no");
+    println!("INVENTORY_PERSISTED=no");
+    println!("PROVIDER_CURSOR_MODIFIED=no");
+    println!("REMOTE_EVENTS_MODIFIED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
 }
@@ -1229,4 +1396,10 @@ enum CliError {
     MissingCatalogCatchupCursor,
     #[error("folder probe limit must be an integer between 1 and 1000")]
     InvalidFolderProbeLimit,
+    #[error("folder tree limit must be an integer between 1 and 10000")]
+    InvalidFolderTreeLimit,
+    #[error("Drive folder tree pagination repeated a continuation token")]
+    DriveFolderTreePaginationLoop,
+    #[error("Drive folder tree pagination exceeded the safety limit")]
+    DriveFolderTreePageLimitExceeded,
 }

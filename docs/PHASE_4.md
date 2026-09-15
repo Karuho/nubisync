@@ -208,3 +208,33 @@ change cursor, journal event, filename, path, or Drive ID to CLI output.
 
 This is the foundation for a later recursive inventory rooted at a user-selected
 remote folder instead of requiring an account-wide My Drive scan.
+
+## Phase 4H — Bounded recursive folder traversal
+
+NubiSync can now walk a selected Drive folder tree recursively while enforcing a
+hard total-object limit.
+
+Development command:
+
+`nubisync drive folder tree <remote-folder-id> --limit <1-10000>`
+
+The traversal is breadth-first. Every discovered supported folder is queued for
+inspection, while ordinary files are counted and Google-native objects remain
+unsupported.
+
+The limit applies to total returned Drive objects, not only supported files.
+This keeps routine development probes predictable even for very large accounts.
+
+The recursive probe:
+
+- does not persist inventory
+- does not modify the provider cursor
+- does not modify the remote event journal
+- does not print the selected root ID, child IDs, names, or paths
+- does not access file contents
+- performs no Drive write
+
+A bounded traversal can report `TRAVERSAL_COMPLETE=no`; that is expected whenever
+the hard limit is reached before the selected tree has been exhausted.
+
+This traversal is the provider-side foundation for a durable sync root.
