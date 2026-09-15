@@ -87,3 +87,28 @@ pagination may atomically promote staging into `remote_items`.
 This keeps routine development tests short while preventing a partial inventory
 from ever masquerading as complete state. Provider cursors and pending remote
 change events remain untouched.
+
+## Phase 4C — Explicit remote baseline state
+
+An empty `remote_items` table is ambiguous by itself. It can mean either that no
+complete inventory has been built yet or that a completed inventory is genuinely
+empty.
+
+Schema version 4 adds `remote_inventory_state` with two independent readiness
+gates:
+
+- `snapshot_complete`: a full inventory reached the end of pagination and was
+  promoted atomically into `remote_items`
+- `catchup_complete`: post-snapshot Drive changes have been reconciled onto that
+  baseline
+
+A full snapshot promotion sets `snapshot_complete=yes` and deliberately resets
+`catchup_complete=no`.
+
+Phase 4C does not mark the catalog ready for filesystem reconciliation.
+
+Offline aggregate status is available with:
+
+`nubisync drive catalog status`
+
+The status command performs no network request and prints no remote metadata.

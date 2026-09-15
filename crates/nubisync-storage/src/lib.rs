@@ -9,7 +9,21 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteInventoryState {
+    pub snapshot_complete: bool,
+    pub catchup_complete: bool,
+    pub item_count: u64,
+    pub snapshot_completed_at_unix_ms: Option<i64>,
+}
+
+impl RemoteInventoryState {
+    pub fn ready_for_reconciliation(self) -> bool {
+        self.snapshot_complete && self.catchup_complete
+    }
+}
 
 pub struct Storage {
     connection: Connection,
@@ -153,6 +167,24 @@ impl Storage {
                 trashed INTEGER NOT NULL DEFAULT 0 CHECK (trashed IN (0, 1)),
                 observed_at_unix_ms INTEGER NOT NULL,
                 PRIMARY KEY (provider, account_subject, remote_id),
+                FOREIGN KEY (provider, account_subject)
+                    REFERENCES accounts(provider, subject) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS remote_inventory_state (
+                provider TEXT NOT NULL,
+                account_subject TEXT NOT NULL,
+                snapshot_complete INTEGER NOT NULL DEFAULT 0 CHECK (
+                    snapshot_complete IN (0, 1)
+                ),
+                catchup_complete INTEGER NOT NULL DEFAULT 0 CHECK (
+                    catchup_complete IN (0, 1)
+                ),
+                item_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                    item_count >= 0
+                ),
+                snapshot_completed_at_unix_ms INTEGER,
+                PRIMARY KEY (provider, account_subject),
                 FOREIGN KEY (provider, account_subject)
                     REFERENCES accounts(provider, subject) ON DELETE CASCADE
             );
@@ -389,24 +421,113 @@ impl Storage {
         &mut self,
         provider: &ProviderId,
         account_subject: &str,
+        completed_at_unix_ms: i64,
     ) -> Result<usize, StorageError> {
         let transaction = self.connection.transaction()?;
+
         transaction.execute(
             "DELETE FROM remote_items WHERE provider = ?1 AND account_subject = ?2",
             params![provider.as_str(), account_subject],
         )?;
+
         let inserted = transaction.execute(
-            "INSERT INTO remote_items (provider, account_subject, remote_id, parent_remote_id, name, item_kind, size_bytes, trashed, observed_at_unix_ms)
-             SELECT provider, account_subject, remote_id, parent_remote_id, name, item_kind, size_bytes, trashed, observed_at_unix_ms
-             FROM remote_inventory_staging WHERE provider = ?1 AND account_subject = ?2",
+            "INSERT INTO remote_items (
+                provider,
+                account_subject,
+                remote_id,
+                parent_remote_id,
+                name,
+                item_kind,
+                size_bytes,
+                trashed,
+                observed_at_unix_ms
+             )
+             SELECT
+                provider,
+                account_subject,
+                remote_id,
+                parent_remote_id,
+                name,
+                item_kind,
+                size_bytes,
+                trashed,
+                observed_at_unix_ms
+             FROM remote_inventory_staging
+             WHERE provider = ?1 AND account_subject = ?2",
             params![provider.as_str(), account_subject],
         )?;
+
+        let item_count = i64::try_from(inserted).map_err(|_| StorageError::NumericOverflow)?;
+
         transaction.execute(
-            "DELETE FROM remote_inventory_staging WHERE provider = ?1 AND account_subject = ?2",
+            "INSERT INTO remote_inventory_state (
+                provider,
+                account_subject,
+                snapshot_complete,
+                catchup_complete,
+                item_count,
+                snapshot_completed_at_unix_ms
+             ) VALUES (?1, ?2, 1, 0, ?3, ?4)
+             ON CONFLICT(provider, account_subject) DO UPDATE SET
+                snapshot_complete = 1,
+                catchup_complete = 0,
+                item_count = excluded.item_count,
+                snapshot_completed_at_unix_ms = excluded.snapshot_completed_at_unix_ms",
+            params![
+                provider.as_str(),
+                account_subject,
+                item_count,
+                completed_at_unix_ms
+            ],
+        )?;
+
+        transaction.execute(
+            "DELETE FROM remote_inventory_staging
+             WHERE provider = ?1 AND account_subject = ?2",
             params![provider.as_str(), account_subject],
         )?;
+
         transaction.commit()?;
         Ok(inserted)
+    }
+
+    pub fn remote_inventory_state(
+        &self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<RemoteInventoryState, StorageError> {
+        let row: Option<(i64, i64, i64, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT
+                    snapshot_complete,
+                    catchup_complete,
+                    item_count,
+                    snapshot_completed_at_unix_ms
+                 FROM remote_inventory_state
+                 WHERE provider = ?1 AND account_subject = ?2",
+                params![provider.as_str(), account_subject],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+
+        match row {
+            Some((snapshot_complete, catchup_complete, item_count, completed_at)) => {
+                Ok(RemoteInventoryState {
+                    snapshot_complete: snapshot_complete != 0,
+                    catchup_complete: catchup_complete != 0,
+                    item_count: u64::try_from(item_count)
+                        .map_err(|_| StorageError::NumericOverflow)?,
+                    snapshot_completed_at_unix_ms: completed_at,
+                })
+            }
+            None => Ok(RemoteInventoryState {
+                snapshot_complete: false,
+                catchup_complete: false,
+                item_count: 0,
+                snapshot_completed_at_unix_ms: None,
+            }),
+        }
     }
 
     pub fn remote_inventory_count(
@@ -729,7 +850,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             storage
-                .commit_remote_inventory_snapshot(&provider, &account.subject)
+                .commit_remote_inventory_snapshot(&provider, &account.subject, 3)
                 .unwrap(),
             2
         );
@@ -745,6 +866,57 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn inventory_state_defaults_to_not_ready() {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let state = storage
+            .remote_inventory_state(&provider, &account.subject)
+            .unwrap();
+
+        assert!(!state.snapshot_complete);
+        assert!(!state.catchup_complete);
+        assert_eq!(state.item_count, 0);
+        assert_eq!(state.snapshot_completed_at_unix_ms, None);
+        assert!(!state.ready_for_reconciliation());
+    }
+
+    #[test]
+    fn snapshot_promotion_marks_snapshot_complete_but_not_catchup_complete() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let item = match test_upsert("file-1", Some(10)) {
+            RemoteChange::Upsert(item) => item,
+            _ => unreachable!(),
+        };
+
+        storage
+            .begin_remote_inventory_staging(&provider, &account.subject)
+            .unwrap();
+        storage
+            .stage_remote_inventory_items(&provider, &account.subject, &[item], 2)
+            .unwrap();
+        storage
+            .commit_remote_inventory_snapshot(&provider, &account.subject, 3)
+            .unwrap();
+
+        let state = storage
+            .remote_inventory_state(&provider, &account.subject)
+            .unwrap();
+
+        assert!(state.snapshot_complete);
+        assert!(!state.catchup_complete);
+        assert_eq!(state.item_count, 1);
+        assert_eq!(state.snapshot_completed_at_unix_ms, Some(3));
+        assert!(!state.ready_for_reconciliation());
     }
 
     #[test]

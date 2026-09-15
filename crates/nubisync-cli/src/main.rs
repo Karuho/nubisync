@@ -66,6 +66,11 @@ fn run() -> Result<(), CliError> {
             google_logout()
         }
         [drive, changes] if drive == "drive" && changes == "changes" => drive_changes(),
+        [drive, catalog, status]
+            if drive == "drive" && catalog == "catalog" && status == "status" =>
+        {
+            drive_catalog_status()
+        }
         [drive, inventory] if drive == "drive" && inventory == "inventory" => {
             drive_inventory(Some(20))
         }
@@ -104,6 +109,7 @@ USAGE:
   nubisync auth google refresh
   nubisync auth google logout
   nubisync drive changes
+  nubisync drive catalog status
   nubisync drive inventory
   nubisync drive inventory --limit <1-10000>
   nubisync drive inventory --full
@@ -294,6 +300,43 @@ fn google_logout() -> Result<(), CliError> {
     Ok(())
 }
 
+fn drive_catalog_status() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let state = storage.remote_inventory_state(&provider, &account.subject)?;
+    let authoritative_items = storage.remote_inventory_count(&provider, &account.subject)?;
+    let staging_items = storage.staged_remote_inventory_count(&provider, &account.subject)?;
+    let pending_remote_events = storage.pending_remote_event_count(&provider, &account.subject)?;
+
+    let state_consistent = state.item_count == authoritative_items;
+    let ready_for_reconciliation =
+        state.ready_for_reconciliation() && state_consistent && staging_items == 0;
+
+    println!("DRIVE_CATALOG_STATUS=PASS");
+    println!("SNAPSHOT_COMPLETE={}", yes_no(state.snapshot_complete));
+    println!("CATCHUP_COMPLETE={}", yes_no(state.catchup_complete));
+    println!("STATE_ITEM_COUNT={}", state.item_count);
+    println!("AUTHORITATIVE_ITEMS={authoritative_items}");
+    println!("STAGING_ITEMS={staging_items}");
+    println!("PENDING_REMOTE_EVENTS={pending_remote_events}");
+    println!("STATE_CONSISTENT={}", yes_no(state_consistent));
+    println!(
+        "READY_FOR_RECONCILIATION={}",
+        yes_no(ready_for_reconciliation)
+    );
+    println!("NETWORK_CHECK=not_performed");
+    println!("REMOTE_METADATA_PRINTED=no");
+
+    Ok(())
+}
+
 fn parse_inventory_limit(value: &str) -> Result<u64, CliError> {
     let parsed = value
         .parse::<u64>()
@@ -429,8 +472,12 @@ fn drive_inventory(max_items: Option<u64>) -> Result<(), CliError> {
     let staged_items = storage.staged_remote_inventory_count(&provider, &account.subject)?;
     let authoritative_snapshot_committed = inventory_complete && max_items.is_none();
     let authoritative_items = if authoritative_snapshot_committed {
-        u64::try_from(storage.commit_remote_inventory_snapshot(&provider, &account.subject)?)
-            .map_err(|_| CliError::NumericOverflow)?
+        u64::try_from(storage.commit_remote_inventory_snapshot(
+            &provider,
+            &account.subject,
+            unix_time_ms()?,
+        )?)
+        .map_err(|_| CliError::NumericOverflow)?
     } else {
         storage.clear_remote_inventory_staging(&provider, &account.subject)?;
         storage.remote_inventory_count(&provider, &account.subject)?
