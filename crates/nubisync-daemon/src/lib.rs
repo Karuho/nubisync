@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use nubisync_core::{
-    ChangeCursor, ContinuationToken, RemoteChange, RemoteItem, RemoteItemKind, SyncRoot,
+    ChangeCursor, ChangePage, ContinuationToken, RemoteChange, RemoteItem, RemoteItemKind, SyncRoot,
 };
 use nubisync_drive::{DriveApiError, DriveFolderRoot, DriveRootMembership, GoogleDriveApi};
 use nubisync_storage::{
@@ -121,6 +121,32 @@ impl std::fmt::Debug for SelectedRootInventoryPage {
     }
 }
 
+pub trait SelectedRootChangeProvider {
+    fn list_changes_page(
+        &self,
+        cursor: &ChangeCursor,
+        continuation: Option<&ContinuationToken>,
+    ) -> Result<ChangePage, SelectedRootExecutorError>;
+}
+
+impl SelectedRootChangeProvider for GoogleDriveApi {
+    fn list_changes_page(
+        &self,
+        cursor: &ChangeCursor,
+        continuation: Option<&ContinuationToken>,
+    ) -> Result<ChangePage, SelectedRootExecutorError> {
+        GoogleDriveApi::list_changes_page(self, cursor, continuation)
+            .map_err(SelectedRootExecutorError::from)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootChangeWindowCollection {
+    pub page_count: u64,
+    pub change_count: u64,
+    pub complete: bool,
+}
+
 pub trait SelectedRootBootstrapProvider: SelectedRootProvider {
     fn current_change_cursor(&self) -> Result<ChangeCursor, SelectedRootExecutorError>;
 
@@ -168,6 +194,62 @@ pub struct SelectedRootBatchExecution {
     pub hydrated_items: usize,
     pub root_revalidations: usize,
     pub completed_initial_catchup: bool,
+}
+
+pub fn collect_selected_root_change_window_page<P: SelectedRootChangeProvider>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootChangeWindowCollection, SelectedRootExecutorError> {
+    if let Some(window) = storage.sync_root_change_window_state(&sync_root.id)? {
+        if window.is_complete() {
+            return Ok(SelectedRootChangeWindowCollection {
+                page_count: window.page_count,
+                change_count: window.change_count,
+                complete: true,
+            });
+        }
+
+        let page = provider.list_changes_page(&window.base_cursor, window.continuation.as_ref())?;
+
+        let state = storage.stage_sync_root_change_window_page(
+            &sync_root.id,
+            &window.base_cursor,
+            window.continuation.as_ref(),
+            &page,
+        )?;
+
+        return Ok(SelectedRootChangeWindowCollection {
+            page_count: state.page_count,
+            change_count: state.change_count,
+            complete: state.is_complete(),
+        });
+    }
+
+    let inventory = storage.sync_root_remote_inventory_state(&sync_root.id)?;
+    if !inventory.snapshot_complete {
+        return Err(SelectedRootExecutorError::ChangeWindowSnapshotMissing);
+    }
+
+    let base_cursor = if inventory.catchup_complete {
+        storage
+            .sync_root_change_cursor(&sync_root.id)?
+            .ok_or(SelectedRootExecutorError::ChangeWindowCursorMissing)?
+    } else {
+        inventory
+            .catchup_from_cursor
+            .ok_or(SelectedRootExecutorError::ChangeWindowCursorMissing)?
+    };
+
+    let page = provider.list_changes_page(&base_cursor, None)?;
+    let state =
+        storage.stage_sync_root_change_window_page(&sync_root.id, &base_cursor, None, &page)?;
+
+    Ok(SelectedRootChangeWindowCollection {
+        page_count: state.page_count,
+        change_count: state.change_count,
+        complete: state.is_complete(),
+    })
 }
 
 pub fn bootstrap_selected_root_snapshot<P: SelectedRootBootstrapProvider>(
@@ -485,6 +567,10 @@ pub enum SelectedRootExecutorError {
     CountOverflow,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
+    #[error("selected-root change window requires an authoritative snapshot")]
+    ChangeWindowSnapshotMissing,
+    #[error("selected-root change window durable cursor is missing")]
+    ChangeWindowCursorMissing,
     #[error("selected-root authoritative snapshot is already complete")]
     BootstrapSnapshotAlreadyComplete,
     #[error("selected-root bootstrap returned invalid item metadata")]
@@ -666,6 +752,158 @@ mod tests {
             .unwrap();
 
         (storage, root)
+    }
+
+    struct FakeChangeProvider {
+        pages: RefCell<VecDeque<Result<ChangePage, SelectedRootExecutorError>>>,
+        calls: Cell<usize>,
+    }
+
+    impl FakeChangeProvider {
+        fn new(pages: Vec<Result<ChangePage, SelectedRootExecutorError>>) -> Self {
+            Self {
+                pages: RefCell::new(VecDeque::from(pages)),
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl SelectedRootChangeProvider for FakeChangeProvider {
+        fn list_changes_page(
+            &self,
+            _cursor: &ChangeCursor,
+            _continuation: Option<&ContinuationToken>,
+        ) -> Result<ChangePage, SelectedRootExecutorError> {
+            self.calls.set(self.calls.get().saturating_add(1));
+            self.pages
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Err(SelectedRootExecutorError::ProviderOperationFailed))
+        }
+    }
+
+    #[test]
+    fn change_window_collection_resumes_one_durable_page_at_a_time() {
+        let (mut storage, root) = storage_with_root(&[], "fence");
+
+        let first = item("first", "canonical-root", RemoteItemKind::File);
+        let provider = FakeChangeProvider::new(vec![
+            Ok(ChangePage {
+                changes: vec![RemoteChange::Upsert(first.clone())],
+                continuation: Some(ContinuationToken::new("page-two").unwrap()),
+                checkpoint: None,
+            }),
+            Ok(ChangePage {
+                changes: vec![RemoteChange::Delete {
+                    remote_id: first.remote_id.clone(),
+                }],
+                continuation: None,
+                checkpoint: Some(ChangeCursor::new("checkpoint").unwrap()),
+            }),
+        ]);
+
+        let first_result =
+            collect_selected_root_change_window_page(&provider, &mut storage, &root).unwrap();
+        assert_eq!(
+            first_result,
+            SelectedRootChangeWindowCollection {
+                page_count: 1,
+                change_count: 1,
+                complete: false,
+            }
+        );
+
+        let durable = storage
+            .sync_root_change_window_state(&root.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.page_count, 1);
+        assert_eq!(durable.continuation.as_ref().unwrap().as_str(), "page-two");
+
+        let second_result =
+            collect_selected_root_change_window_page(&provider, &mut storage, &root).unwrap();
+        assert_eq!(
+            second_result,
+            SelectedRootChangeWindowCollection {
+                page_count: 2,
+                change_count: 2,
+                complete: true,
+            }
+        );
+        assert_eq!(provider.calls.get(), 2);
+
+        let third_result =
+            collect_selected_root_change_window_page(&provider, &mut storage, &root).unwrap();
+        assert_eq!(third_result, second_result);
+        assert_eq!(
+            provider.calls.get(),
+            2,
+            "complete windows must not issue another provider request"
+        );
+
+        assert_eq!(
+            storage.sync_root_change_window_changes(&root.id).unwrap(),
+            vec![
+                RemoteChange::Upsert(first.clone()),
+                RemoteChange::Delete {
+                    remote_id: first.remote_id,
+                },
+            ]
+        );
+        assert!(storage.sync_root_change_cursor(&root.id).unwrap().is_none());
+        assert!(
+            !storage
+                .sync_root_remote_inventory_state(&root.id)
+                .unwrap()
+                .catchup_complete
+        );
+    }
+
+    #[test]
+    fn change_window_provider_failure_preserves_resume_position() {
+        let (mut storage, root) = storage_with_root(&[], "fence");
+
+        let provider = FakeChangeProvider::new(vec![
+            Ok(ChangePage {
+                changes: vec![],
+                continuation: Some(ContinuationToken::new("page-two").unwrap()),
+                checkpoint: None,
+            }),
+            Err(SelectedRootExecutorError::ProviderOperationFailed),
+        ]);
+
+        collect_selected_root_change_window_page(&provider, &mut storage, &root).unwrap();
+
+        let error =
+            collect_selected_root_change_window_page(&provider, &mut storage, &root).unwrap_err();
+        assert!(matches!(
+            error,
+            SelectedRootExecutorError::ProviderOperationFailed
+        ));
+
+        let durable = storage
+            .sync_root_change_window_state(&root.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.page_count, 1);
+        assert_eq!(durable.change_count, 0);
+        assert_eq!(durable.continuation.as_ref().unwrap().as_str(), "page-two");
+        assert!(!durable.is_complete());
+    }
+
+    #[test]
+    fn change_window_collection_requires_snapshot() {
+        let (mut storage, root) = storage_with_uninitialized_root();
+        let provider = FakeChangeProvider::new(Vec::new());
+
+        let error =
+            collect_selected_root_change_window_page(&provider, &mut storage, &root).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SelectedRootExecutorError::ChangeWindowSnapshotMissing
+        ));
+        assert_eq!(provider.calls.get(), 0);
     }
 
     struct FakeBootstrapProvider {

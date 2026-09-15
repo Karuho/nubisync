@@ -679,3 +679,42 @@ Phase 4W still exposes no live bootstrap/catch-up command, downloads no file
 content, performs no Drive write, and mutates no local sync tree. The next phase
 must address durable multi-page change-window collection before a real catch-up
 surface is enabled.
+
+## Phase 4X — Durable resumable selected-root change windows
+
+Selected-root incremental catch-up can now collect a multi-page provider change
+window without keeping the entire provider traversal only in process memory.
+
+SQLite schema v8 adds root-scoped non-authoritative change-window staging:
+
+- `sync_root_change_window_state`
+- `sync_root_change_window_events`
+- `sync_root_change_window_tokens`
+
+A window is anchored to the selected root's current durable cursor:
+
+- before initial catch-up completes: `catchup_from_cursor`
+- after catch-up: `change_cursor`
+
+Each collection call requests at most one provider page. After the provider
+response, page events and the next resume position are committed atomically.
+A crash or provider failure therefore resumes from the last durable page rather
+than restarting an arbitrarily large multi-page window.
+
+Invariants:
+
+- cursor/token contents remain opaque and are never printed
+- intermediate pages require a continuation and no checkpoint
+- the final page requires a checkpoint and no continuation
+- page events retain provider order via a per-root sequence
+- duplicate/repeated pagination tokens fail closed
+- stale base cursors and unexpected continuation positions fail closed
+- a failed page does not erase earlier durable pages
+- completing collection does not advance the root change cursor
+- a completed window causes subsequent collection calls to make no provider
+  request
+
+Phase 4X still does not execute the staged window, clear it, expose live CLI
+catch-up, download contents, write Drive data, or mutate the local sync tree.
+The next phase must consume the durable window safely and combine its deletion
+with the Phase 4S catalog/cursor commit semantics.
