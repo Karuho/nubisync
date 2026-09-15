@@ -281,6 +281,7 @@ fn google_logout() -> Result<(), CliError> {
 }
 
 fn drive_inventory() -> Result<(), CliError> {
+    println!("DRIVE_INVENTORY_STAGE=local_session");
     ensure_keyring_available()?;
 
     let db_path = nubisync_database_path()?;
@@ -300,6 +301,7 @@ fn drive_inventory() -> Result<(), CliError> {
     )?;
     let (client_id, client_secret) = load_google_client_config(&keyring)?;
 
+    println!("DRIVE_INVENTORY_STAGE=refresh_access_token");
     let oauth = GoogleOAuthConfig::new(client_id)?;
     let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
 
@@ -310,6 +312,7 @@ fn drive_inventory() -> Result<(), CliError> {
         )?;
     }
 
+    println!("DRIVE_INVENTORY_STAGE=verify_account");
     let api = GoogleDriveApi::new(tokens.access_token().clone())?;
     let user = api.user_info()?;
     if user.sub != account.subject {
@@ -329,8 +332,11 @@ fn drive_inventory() -> Result<(), CliError> {
             return Err(CliError::DriveInventoryPageLimitExceeded);
         }
 
+        let page_number = pages_fetched + 1;
+        println!("DRIVE_INVENTORY_FETCH_PAGE={page_number}");
         let page = api.list_inventory_page(continuation.as_ref())?;
         pages_fetched += 1;
+        println!("DRIVE_INVENTORY_PAGE_COMPLETE={pages_fetched}");
         supported_items += page.supported_items;
         files += page.file_count;
         folders += page.folder_count;

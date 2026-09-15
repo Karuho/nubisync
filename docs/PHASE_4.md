@@ -30,3 +30,15 @@ sync scope and will require explicit export/import semantics in a later phase.
 
 Phase 4B will persist the validated ordinary-file/folder inventory through a
 crash-safe staging snapshot before any local filesystem reconciliation is enabled.
+
+### Inventory request bounds
+
+The initial Phase 4A runtime probe exposed an observability issue: HTTP requests had no explicit timeout and the CLI emitted no progress until the complete inventory finished.
+
+The Drive API client now uses:
+
+- 10-second connection timeout
+- 60-second total request timeout
+- 100 items per metadata inventory page during the probe
+
+`drive inventory` also emits privacy-safe stage/page counters. It still does not print filenames, Drive IDs, cursor values, page tokens, or OAuth credentials.

@@ -4,6 +4,7 @@ use nubisync_core::{
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use std::time::Duration;
 use thiserror::Error;
 
 const GOOGLE_USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
@@ -30,6 +31,8 @@ impl GoogleDriveApi {
     pub fn new(access_token: OAuthAccessToken) -> Result<Self, DriveApiError> {
         let client = Client::builder()
             .user_agent(concat!("NubiSync/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .build()?;
 
         Ok(Self {
@@ -113,7 +116,7 @@ impl GoogleDriveApi {
                 ("q", "'me' in owners and trashed = false"),
                 ("corpora", "user"),
                 ("spaces", "drive"),
-                ("pageSize", "1000"),
+                ("pageSize", "100"),
                 ("fields", GOOGLE_DRIVE_INVENTORY_FIELDS),
             ]);
 
