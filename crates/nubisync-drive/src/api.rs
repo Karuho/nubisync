@@ -149,6 +149,43 @@ impl GoogleDriveApi {
         response.into_inventory_page()
     }
 
+    /// Lists one metadata-only page of direct children for a Drive folder.
+    ///
+    /// This is intentionally non-recursive. The caller decides whether and how
+    /// to traverse child folders in a later phase.
+    pub fn list_folder_children_page(
+        &self,
+        parent_remote_id: &str,
+        continuation: Option<&ContinuationToken>,
+        page_size: u16,
+    ) -> Result<DriveInventoryPage, DriveApiError> {
+        if !(1..=1000).contains(&page_size) {
+            return Err(DriveApiError::InvalidInventoryPageSize);
+        }
+
+        let query = folder_children_query(parent_remote_id)?;
+        let page_size = page_size.to_string();
+
+        let mut request = self
+            .client
+            .get(GOOGLE_DRIVE_FILES_ENDPOINT)
+            .bearer_auth(self.access_token.as_str())
+            .query(&[
+                ("q", query.as_str()),
+                ("corpora", "user"),
+                ("spaces", "drive"),
+                ("pageSize", page_size.as_str()),
+                ("fields", GOOGLE_DRIVE_INVENTORY_FIELDS),
+            ]);
+
+        if let Some(token) = continuation {
+            request = request.query(&[("pageToken", token.as_str())]);
+        }
+
+        let response: FileListResponse = request.send()?.error_for_status()?.json()?;
+        response.into_inventory_page()
+    }
+
     /// Reads one page of the user's My Drive change stream.
     ///
     /// The caller supplies the durable cursor for the first page and the
@@ -465,6 +502,21 @@ struct GoogleFile {
     trashed: bool,
 }
 
+fn escape_drive_query_literal(value: &str) -> Result<String, DriveApiError> {
+    if value.trim().is_empty() {
+        return Err(DriveApiError::InvalidInventoryParentId);
+    }
+
+    Ok(value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn folder_children_query(parent_remote_id: &str) -> Result<String, DriveApiError> {
+    let parent_remote_id = escape_drive_query_literal(parent_remote_id)?;
+    Ok(format!(
+        "'{parent_remote_id}' in parents and 'me' in owners and trashed = false"
+    ))
+}
+
 fn parse_optional_u64(
     value: Option<&str>,
     field: &'static str,
@@ -493,11 +545,33 @@ pub enum DriveApiError {
     InvalidInventoryPageSize,
     #[error("Google Drive inventory page is invalid: {code}")]
     InvalidInventoryPage { code: &'static str },
+    #[error("Google Drive inventory parent identifier is invalid")]
+    InvalidInventoryParentId,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_children_query_is_scoped_and_escapes_literals() {
+        assert_eq!(
+            folder_children_query("root").unwrap(),
+            "'root' in parents and 'me' in owners and trashed = false"
+        );
+        assert_eq!(
+            folder_children_query("folder'with\\chars").unwrap(),
+            "'folder\\'with\\\\chars' in parents and 'me' in owners and trashed = false"
+        );
+    }
+
+    #[test]
+    fn folder_children_query_rejects_empty_parent() {
+        assert!(matches!(
+            folder_children_query("   "),
+            Err(DriveApiError::InvalidInventoryParentId)
+        ));
+    }
 
     #[test]
     fn optional_numeric_fields_parse_without_guessing() {

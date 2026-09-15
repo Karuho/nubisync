@@ -79,6 +79,11 @@ fn run() -> Result<(), CliError> {
         [drive, inventory] if drive == "drive" && inventory == "inventory" => {
             drive_inventory(Some(20))
         }
+        [drive, folder, probe, parent_id, limit, value]
+            if drive == "drive" && folder == "folder" && probe == "probe" && limit == "--limit" =>
+        {
+            drive_folder_probe(parent_id, parse_folder_probe_limit(value)?)
+        }
         [drive, inventory, full]
             if drive == "drive" && inventory == "inventory" && full == "--full" =>
         {
@@ -116,6 +121,7 @@ USAGE:
   nubisync drive changes
   nubisync drive catalog status
   nubisync drive catalog catchup
+  nubisync drive folder probe <remote-folder-id> --limit <1-1000>
   nubisync drive inventory
   nubisync drive inventory --limit <1-10000>
   nubisync drive inventory --full
@@ -461,6 +467,87 @@ fn drive_catalog_status() -> Result<(), CliError> {
     );
     println!("NETWORK_CHECK=not_performed");
     println!("REMOTE_METADATA_PRINTED=no");
+
+    Ok(())
+}
+
+fn parse_folder_probe_limit(value: &str) -> Result<u16, CliError> {
+    let parsed = value
+        .parse::<u16>()
+        .map_err(|_| CliError::InvalidFolderProbeLimit)?;
+
+    if !(1..=1000).contains(&parsed) {
+        return Err(CliError::InvalidFolderProbeLimit);
+    }
+
+    Ok(parsed)
+}
+
+fn drive_folder_probe(parent_remote_id: &str, max_items: u16) -> Result<(), CliError> {
+    println!("DRIVE_FOLDER_PROBE_STAGE=local_session");
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("DRIVE_FOLDER_PROBE_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("DRIVE_FOLDER_PROBE_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("DRIVE_FOLDER_PROBE_FETCH_PAGE=1");
+    let page = api.list_folder_children_page(parent_remote_id, None, max_items)?;
+
+    let observed_items = page.supported_items + page.unsupported_provider_native;
+
+    println!("DRIVE_FOLDER_PROBE=PASS");
+    println!("MAX_ITEMS={max_items}");
+    println!("OBSERVED_ITEMS={observed_items}");
+    println!("SUPPORTED_ITEMS={}", page.supported_items);
+    println!("FILES={}", page.file_count);
+    println!("FOLDERS={}", page.folder_count);
+    println!(
+        "UNSUPPORTED_PROVIDER_NATIVE={}",
+        page.unsupported_provider_native
+    );
+    println!(
+        "MORE_CHILDREN_AVAILABLE={}",
+        yes_no(page.continuation.is_some())
+    );
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("INVENTORY_PERSISTED=no");
+    println!("PROVIDER_CURSOR_MODIFIED=no");
+    println!("REMOTE_EVENTS_MODIFIED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
 }
@@ -1140,4 +1227,6 @@ enum CliError {
     MissingInventoryBootstrapFence,
     #[error("remote catalog catch-up cursor is missing")]
     MissingCatalogCatchupCursor,
+    #[error("folder probe limit must be an integer between 1 and 1000")]
+    InvalidFolderProbeLimit,
 }

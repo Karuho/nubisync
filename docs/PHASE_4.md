@@ -182,3 +182,29 @@ Without a complete snapshot it exits as `SKIPPED` with
 `NETWORK_CHECK=not_performed`.
 
 Phase 4F still performs no filesystem mutation and no Drive write.
+
+## Phase 4G — Folder-scoped metadata probe
+
+NubiSync can now perform a bounded metadata-only probe of the direct children of
+one Drive folder.
+
+The command is:
+
+`nubisync drive folder probe <remote-folder-id> --limit <1-1000>`
+
+For My Drive's top-level folder, Google Drive accepts the special identifier
+`root`, so routine validation can use:
+
+`nubisync drive folder probe root --limit 10`
+
+The provider query is scoped to:
+
+- the selected parent folder
+- items owned by the current user
+- non-trashed Drive-space items
+
+The probe is intentionally non-recursive and does not persist any inventory,
+change cursor, journal event, filename, path, or Drive ID to CLI output.
+
+This is the foundation for a later recursive inventory rooted at a user-selected
+remote folder instead of requiring an account-wide My Drive scan.
