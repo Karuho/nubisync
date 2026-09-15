@@ -550,3 +550,31 @@ per-root change cursor.
 
 Phase 4S is storage-only. It introduces no Drive request, keyring access, file
 transfer, local sync-tree mutation, or live selected-root catch-up.
+
+## Phase 4T — Complete Drive subtree hydration primitive
+
+The Drive provider can now hydrate a folder that has newly entered a selected
+sync root before the corresponding catalog batch is committed.
+
+`hydrate_folder_subtree`:
+
+- takes the folder metadata already received from the Drive change stream
+- requires a live supported folder
+- includes that folder itself in the hydration result
+- walks every supported descendant breadth-first
+- paginates direct-child requests at the Drive maximum page size
+- verifies every returned child belongs to the folder currently being traversed
+- rejects duplicate remote IDs and repeated pagination tokens
+- ignores but counts unsupported Google-native provider items
+- fails rather than returning a partial successful result when any page fails
+- enforces high safety caps for pages and in-memory supported items
+- returns metadata only; it never reads file contents
+
+The hydration result redacts remote metadata from `Debug` and exposes supported
+items only through an explicit consuming `into_items()` operation.
+
+Phase 4T does not mutate SQLite, does not advance a cursor, does not touch the
+local sync tree, and does not add a live catch-up CLI command. The future
+selected-root executor must complete all required hydrations first, translate
+the result to root-catalog mutations, and only then call the atomic Phase 4S
+storage commit.

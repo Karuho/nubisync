@@ -4,7 +4,11 @@ use nubisync_core::{
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use std::{collections::HashSet, fmt, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    fmt,
+    time::Duration,
+};
 use thiserror::Error;
 
 const GOOGLE_USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
@@ -283,6 +287,78 @@ impl GoogleDriveApi {
         response.into_inventory_page()
     }
 
+    /// Hydrates one supported folder and every supported descendant.
+    ///
+    /// The supplied folder metadata must already come from a provider change
+    /// that the caller has resolved as a descendant of the selected sync root.
+    ///
+    /// This operation is metadata-only. It performs no storage mutation, file
+    /// content read, Drive write, cursor advance, or local filesystem action.
+    pub fn hydrate_folder_subtree(
+        &self,
+        root_item: &RemoteItem,
+    ) -> Result<DriveSubtreeHydration, DriveApiError> {
+        validate_hydration_root(root_item)?;
+
+        let mut items = vec![root_item.clone()];
+        let mut folders = VecDeque::from([root_item.remote_id.clone()]);
+        let mut seen_remote_ids = HashSet::from([root_item.remote_id.clone()]);
+        let mut unsupported_provider_native = 0_u64;
+        let mut page_count = 0_u64;
+
+        while let Some(parent_remote_id) = folders.pop_front() {
+            let mut continuation = None;
+            let mut seen_page_tokens = HashSet::new();
+
+            loop {
+                page_count = page_count
+                    .checked_add(1)
+                    .ok_or(DriveApiError::HydrationSafetyLimitExceeded)?;
+
+                if page_count > 100_000 {
+                    return Err(DriveApiError::HydrationSafetyLimitExceeded);
+                }
+
+                let page =
+                    self.list_folder_children_page(&parent_remote_id, continuation.as_ref(), 1000)?;
+
+                unsupported_provider_native = unsupported_provider_native
+                    .checked_add(page.unsupported_provider_native)
+                    .ok_or(DriveApiError::HydrationSafetyLimitExceeded)?;
+
+                for item in page.items {
+                    validate_hydration_child(&parent_remote_id, &item, &mut seen_remote_ids)?;
+
+                    if item.kind == RemoteItemKind::Folder {
+                        folders.push_back(item.remote_id.clone());
+                    }
+
+                    items.push(item);
+
+                    if items.len() > 1_000_000 {
+                        return Err(DriveApiError::HydrationSafetyLimitExceeded);
+                    }
+                }
+
+                match page.continuation {
+                    Some(next) => {
+                        if !seen_page_tokens.insert(next.as_str().to_owned()) {
+                            return Err(DriveApiError::HydrationPaginationLoop);
+                        }
+                        continuation = Some(next);
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        Ok(DriveSubtreeHydration {
+            items,
+            unsupported_provider_native,
+            page_count,
+        })
+    }
+
     /// Reads one page of the user's My Drive change stream.
     ///
     /// The caller supplies the durable cursor for the first page and the
@@ -418,6 +494,44 @@ struct StorageQuota {
 struct StartPageTokenResponse {
     #[serde(rename = "startPageToken")]
     start_page_token: String,
+}
+
+pub struct DriveSubtreeHydration {
+    items: Vec<RemoteItem>,
+    unsupported_provider_native: u64,
+    page_count: u64,
+}
+
+impl DriveSubtreeHydration {
+    pub fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn unsupported_provider_native(&self) -> u64 {
+        self.unsupported_provider_native
+    }
+
+    pub fn page_count(&self) -> u64 {
+        self.page_count
+    }
+
+    pub fn into_items(self) -> Vec<RemoteItem> {
+        self.items
+    }
+}
+
+impl fmt::Debug for DriveSubtreeHydration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriveSubtreeHydration")
+            .field("item_count", &self.items.len())
+            .field(
+                "unsupported_provider_native",
+                &self.unsupported_provider_native,
+            )
+            .field("page_count", &self.page_count)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -654,6 +768,47 @@ struct GoogleFile {
     trashed: bool,
 }
 
+fn validate_hydration_root(item: &RemoteItem) -> Result<(), DriveApiError> {
+    validate_ancestry_id(&item.remote_id)?;
+
+    if item.kind != RemoteItemKind::Folder {
+        return Err(DriveApiError::HydrationRootNotFolder);
+    }
+
+    if item.trashed {
+        return Err(DriveApiError::HydrationRootTrashed);
+    }
+
+    if item.name.is_empty() {
+        return Err(DriveApiError::HydrationInvalidItem);
+    }
+
+    Ok(())
+}
+
+fn validate_hydration_child(
+    expected_parent_remote_id: &str,
+    item: &RemoteItem,
+    seen_remote_ids: &mut HashSet<String>,
+) -> Result<(), DriveApiError> {
+    validate_ancestry_id(expected_parent_remote_id)?;
+    validate_ancestry_id(&item.remote_id)?;
+
+    if item.name.is_empty() || item.trashed {
+        return Err(DriveApiError::HydrationInvalidItem);
+    }
+
+    if item.parent_remote_id.as_deref() != Some(expected_parent_remote_id) {
+        return Err(DriveApiError::HydrationParentMismatch);
+    }
+
+    if !seen_remote_ids.insert(item.remote_id.clone()) {
+        return Err(DriveApiError::HydrationDuplicateRemoteId);
+    }
+
+    Ok(())
+}
+
 fn ancestry_step(
     expected_remote_id: &str,
     root_remote_id: &str,
@@ -795,6 +950,20 @@ pub enum DriveApiError {
     AncestryCycleDetected,
     #[error("Google Drive ancestry traversal exceeded the safety hop limit")]
     AncestryHopLimitExceeded,
+    #[error("Drive subtree hydration root is not a folder")]
+    HydrationRootNotFolder,
+    #[error("Drive subtree hydration root is trashed")]
+    HydrationRootTrashed,
+    #[error("Drive subtree hydration returned invalid item metadata")]
+    HydrationInvalidItem,
+    #[error("Drive subtree hydration child parent does not match traversal context")]
+    HydrationParentMismatch,
+    #[error("Drive subtree hydration returned a duplicate remote identifier")]
+    HydrationDuplicateRemoteId,
+    #[error("Drive subtree hydration pagination token repeated")]
+    HydrationPaginationLoop,
+    #[error("Drive subtree hydration exceeded a safety limit")]
+    HydrationSafetyLimitExceeded,
 }
 
 #[cfg(test)]
@@ -962,6 +1131,98 @@ mod tests {
             ancestry_step("folder-b", "canonical-root", &not_owned).unwrap(),
             DriveAncestryStep::Outside
         );
+    }
+
+    #[test]
+    fn hydration_root_requires_live_folder_metadata() {
+        let file = RemoteItem {
+            remote_id: "file-root".into(),
+            parent_remote_id: Some("parent".into()),
+            name: "file.txt".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(1),
+            modified_unix_ms: None,
+            trashed: false,
+        };
+        assert!(matches!(
+            validate_hydration_root(&file),
+            Err(DriveApiError::HydrationRootNotFolder)
+        ));
+
+        let trashed = RemoteItem {
+            remote_id: "folder-root".into(),
+            parent_remote_id: Some("parent".into()),
+            name: "Folder".into(),
+            kind: RemoteItemKind::Folder,
+            size_bytes: None,
+            modified_unix_ms: None,
+            trashed: true,
+        };
+        assert!(matches!(
+            validate_hydration_root(&trashed),
+            Err(DriveApiError::HydrationRootTrashed)
+        ));
+    }
+
+    #[test]
+    fn hydration_child_requires_exact_parent_and_unique_id() {
+        let mut seen = HashSet::from(["hydration-root".to_owned()]);
+        let child = RemoteItem {
+            remote_id: "child-one".into(),
+            parent_remote_id: Some("hydration-root".into()),
+            name: "child.txt".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(1),
+            modified_unix_ms: None,
+            trashed: false,
+        };
+
+        validate_hydration_child("hydration-root", &child, &mut seen).unwrap();
+
+        assert!(matches!(
+            validate_hydration_child("hydration-root", &child, &mut seen),
+            Err(DriveApiError::HydrationDuplicateRemoteId)
+        ));
+
+        let wrong_parent = RemoteItem {
+            remote_id: "child-two".into(),
+            parent_remote_id: Some("somewhere-else".into()),
+            name: "other.txt".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(1),
+            modified_unix_ms: None,
+            trashed: false,
+        };
+
+        assert!(matches!(
+            validate_hydration_child("hydration-root", &wrong_parent, &mut seen),
+            Err(DriveApiError::HydrationParentMismatch)
+        ));
+    }
+
+    #[test]
+    fn hydration_result_debug_redacts_remote_metadata() {
+        let hydration = DriveSubtreeHydration {
+            items: vec![RemoteItem {
+                remote_id: "secret-remote-id".into(),
+                parent_remote_id: Some("secret-parent-id".into()),
+                name: "private-name.txt".into(),
+                kind: RemoteItemKind::File,
+                size_bytes: Some(1),
+                modified_unix_ms: None,
+                trashed: false,
+            }],
+            unsupported_provider_native: 2,
+            page_count: 3,
+        };
+
+        let debug = format!("{hydration:?}");
+        assert!(debug.contains("item_count"));
+        assert!(debug.contains("unsupported_provider_native"));
+        assert!(debug.contains("page_count"));
+        assert!(!debug.contains("secret-remote-id"));
+        assert!(!debug.contains("secret-parent-id"));
+        assert!(!debug.contains("private-name.txt"));
     }
 
     #[test]
