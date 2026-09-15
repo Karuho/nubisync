@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
@@ -250,6 +250,7 @@ impl Storage {
                 item_count INTEGER NOT NULL DEFAULT 0 CHECK (item_count >= 0),
                 snapshot_completed_at_unix_ms INTEGER,
                 catchup_from_cursor TEXT,
+                change_cursor TEXT,
                 FOREIGN KEY (sync_root_id)
                     REFERENCES sync_roots(id) ON DELETE CASCADE
             );
@@ -259,6 +260,13 @@ impl Storage {
         if current_version == 4 {
             transaction.execute(
                 "ALTER TABLE remote_inventory_state ADD COLUMN catchup_from_cursor TEXT",
+                [],
+            )?;
+        }
+
+        if current_version == 6 {
+            transaction.execute(
+                "ALTER TABLE sync_root_remote_inventory_state ADD COLUMN change_cursor TEXT",
                 [],
             )?;
         }
@@ -517,14 +525,16 @@ impl Storage {
                 catchup_complete,
                 item_count,
                 snapshot_completed_at_unix_ms,
-                catchup_from_cursor
-             ) VALUES (?1, 1, 0, ?2, ?3, ?4)
+                catchup_from_cursor,
+                change_cursor
+             ) VALUES (?1, 1, 0, ?2, ?3, ?4, NULL)
              ON CONFLICT(sync_root_id) DO UPDATE SET
                 snapshot_complete = 1,
                 catchup_complete = 0,
                 item_count = excluded.item_count,
                 snapshot_completed_at_unix_ms = excluded.snapshot_completed_at_unix_ms,
-                catchup_from_cursor = excluded.catchup_from_cursor",
+                catchup_from_cursor = excluded.catchup_from_cursor,
+                change_cursor = NULL",
             params![
                 sync_root_id,
                 item_count,
@@ -695,6 +705,47 @@ impl Storage {
         transaction.commit()?;
 
         u64::try_from(deleted).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn sync_root_change_cursor(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<Option<ChangeCursor>, StorageError> {
+        let cursor: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT change_cursor
+                 FROM sync_root_remote_inventory_state
+                 WHERE sync_root_id = ?1",
+                params![sync_root_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        cursor
+            .flatten()
+            .map(ChangeCursor::new)
+            .transpose()
+            .map_err(StorageError::from)
+    }
+
+    pub fn sync_root_change_cursor_count(
+        &self,
+        provider: &ProviderId,
+        account_subject: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_remote_inventory_state AS state
+             INNER JOIN sync_roots AS root ON root.id = state.sync_root_id
+             WHERE root.provider = ?1
+               AND root.account_subject = ?2
+               AND state.change_cursor IS NOT NULL",
+            params![provider.as_str(), account_subject],
+            |row| row.get(0),
+        )?;
+
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
     }
 
     pub fn sync_root_catalog_state_count(
@@ -1601,6 +1652,50 @@ mod tests {
     }
 
     #[test]
+    fn schema_v6_migrates_root_change_cursor_column() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE sync_roots (
+                    id TEXT PRIMARY KEY
+                );
+
+                CREATE TABLE sync_root_remote_inventory_state (
+                    sync_root_id TEXT PRIMARY KEY,
+                    snapshot_complete INTEGER NOT NULL DEFAULT 0,
+                    catchup_complete INTEGER NOT NULL DEFAULT 0,
+                    item_count INTEGER NOT NULL DEFAULT 0,
+                    snapshot_completed_at_unix_ms INTEGER,
+                    catchup_from_cursor TEXT,
+                    FOREIGN KEY (sync_root_id)
+                        REFERENCES sync_roots(id) ON DELETE CASCADE
+                );
+
+                PRAGMA user_version = 6;
+                ",
+            )
+            .unwrap();
+
+        let mut storage = Storage { connection };
+        storage.configure().unwrap();
+        storage.migrate().unwrap();
+
+        assert_eq!(storage.schema_version().unwrap(), 7);
+
+        let has_change_cursor: bool = storage
+            .connection
+            .prepare("PRAGMA table_info(sync_root_remote_inventory_state)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .any(|name| name == "change_cursor");
+
+        assert!(has_change_cursor);
+    }
+
+    #[test]
     fn accounts_can_be_loaded_for_persistent_session_discovery() {
         let storage = Storage::open_in_memory().unwrap();
         let provider = ProviderId::new("google-drive").unwrap();
@@ -1691,7 +1786,7 @@ mod tests {
     #[test]
     fn root_scoped_catalogs_isolate_identical_remote_ids() {
         let mut storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 6);
+        assert_eq!(storage.schema_version().unwrap(), 7);
 
         let provider = ProviderId::new("google-drive").unwrap();
         let account = test_account(&provider);
@@ -1800,6 +1895,100 @@ mod tests {
                 .sync_root_catalog_item_count(&provider, &account.subject)
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn root_snapshot_clears_previous_incremental_cursor() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "root-cursor",
+            provider.clone(),
+            account.subject.clone(),
+            "/tmp/root-cursor",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(
+                &root.id,
+                &[test_remote_item(
+                    "file-one",
+                    Some("remote-root"),
+                    "one.txt",
+                    RemoteItemKind::File,
+                )],
+                3,
+            )
+            .unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(
+                &root.id,
+                &ChangeCursor::new("bootstrap-fence-one").unwrap(),
+                4,
+            )
+            .unwrap();
+
+        storage
+            .connection
+            .execute(
+                "UPDATE sync_root_remote_inventory_state
+                 SET change_cursor = ?2
+                 WHERE sync_root_id = ?1",
+                params![root.id, "incremental-checkpoint"],
+            )
+            .unwrap();
+
+        let cursor = storage.sync_root_change_cursor(&root.id).unwrap().unwrap();
+        assert_eq!(cursor.as_str(), "incremental-checkpoint");
+        assert_eq!(format!("{cursor:?}"), "ChangeCursor([redacted])");
+        assert_eq!(
+            storage
+                .sync_root_change_cursor_count(&provider, &account.subject)
+                .unwrap(),
+            1
+        );
+
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(
+                &root.id,
+                &[test_remote_item(
+                    "file-two",
+                    Some("remote-root"),
+                    "two.txt",
+                    RemoteItemKind::File,
+                )],
+                5,
+            )
+            .unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(
+                &root.id,
+                &ChangeCursor::new("bootstrap-fence-two").unwrap(),
+                6,
+            )
+            .unwrap();
+
+        assert!(storage.sync_root_change_cursor(&root.id).unwrap().is_none());
+        assert_eq!(
+            storage
+                .sync_root_change_cursor_count(&provider, &account.subject)
+                .unwrap(),
+            0
         );
     }
 

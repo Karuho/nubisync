@@ -492,3 +492,27 @@ advance, file transfer, or filesystem mutation.
 
 Phase 4Q does not implement subtree hydration itself and does not yet consume a
 real selected-root change batch.
+
+## Phase 4R — Durable incremental cursor per sync root
+
+Selected roots may be bootstrapped at different times, so one account-wide
+provider cursor cannot safely represent every root's incremental position.
+
+Schema v7 adds `change_cursor` to `sync_root_remote_inventory_state`.
+
+Semantics:
+
+- `catchup_from_cursor` remains the pre-snapshot bootstrap fence
+- `change_cursor` is reserved for the durable per-root incremental checkpoint
+  after catch-up
+- committing a new root snapshot always clears `change_cursor`, because a new
+  baseline invalidates any older incremental checkpoint
+- cursor values remain opaque and redacted from `Debug`
+- status reports only the aggregate number of roots with an incremental cursor;
+  it never prints cursor contents
+
+Phase 4R does not yet provide a public operation that advances the root cursor.
+That advance must be introduced together with an atomic root-catalog mutation
+commit so catalog changes and cursor movement cannot diverge.
+
+No Drive request, file transfer, or sync-tree mutation is introduced here.
