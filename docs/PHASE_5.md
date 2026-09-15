@@ -58,3 +58,21 @@ created directories in reverse order. A rollback failure is surfaced explicitly.
 The final postcondition requires every remote directory to exist locally as a
 directory while the Phase 5A safety conditions remain true. Output contains only
 aggregate counts; local names/paths and remote metadata remain private.
+
+## Phase 5C1 — Explicit Drive read-only OAuth upgrade
+
+Phase 5C1 adds the supervised command:
+
+`nubisync auth google upgrade-readonly --approve`
+
+The normal `auth google login` command remains metadata-only. The upgrade requests
+`drive.readonly`, verifies the exact granted scope, verifies that the returned
+Google subject matches the already configured account, and only then replaces
+the refresh token in the OS keyring.
+
+If scope, account identity, or refresh-token issuance is invalid, the existing
+refresh token is left intact. The upgrade performs no SQLite mutation, no local
+filesystem mutation, no Drive write, and no Drive file-content request.
+
+Phase 5C1 only grants the capability required by the later supervised file
+materialization phase; it does not download files itself.

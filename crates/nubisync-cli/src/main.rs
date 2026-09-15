@@ -14,7 +14,9 @@ use nubisync_daemon::{
     execute_completed_selected_root_change_window, materialize_selected_root_directories,
     plan_selected_root_local_materialization,
 };
-use nubisync_drive::{GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig};
+use nubisync_drive::{
+    GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
+};
 use nubisync_storage::Storage;
 use std::{
     collections::{HashSet, VecDeque},
@@ -57,6 +59,14 @@ fn run() -> Result<(), CliError> {
         }
         [auth, google, login] if auth == "auth" && google == "google" && login == "login" => {
             google_login()
+        }
+        [auth, google, upgrade_readonly, approve]
+            if auth == "auth"
+                && google == "google"
+                && upgrade_readonly == "upgrade-readonly"
+                && approve == "--approve" =>
+        {
+            google_upgrade_readonly()
         }
         [auth, google, configure]
             if auth == "auth" && google == "google" && configure == "configure" =>
@@ -180,6 +190,7 @@ USAGE:
   nubisync --version
   nubisync auth keyring check
   nubisync auth google login
+  nubisync auth google upgrade-readonly --approve
   nubisync auth google configure
   nubisync auth google status
   nubisync auth google refresh
@@ -1933,6 +1944,128 @@ fn drive_changes() -> Result<(), CliError> {
     Ok(())
 }
 
+fn oauth_scope_contains(scope: Option<&str>, required_scope: &str) -> bool {
+    scope.is_some_and(|value| {
+        value
+            .split_ascii_whitespace()
+            .any(|candidate| candidate == required_scope)
+    })
+}
+
+fn google_upgrade_readonly() -> Result<(), CliError> {
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let keyring = KeyringSecretStore::default();
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    validate_client_secret_text(&client_secret)?;
+
+    let server = Server::http("127.0.0.1:0").map_err(|_| CliError::LoopbackBindFailed)?;
+    let listen_addr = server
+        .server_addr()
+        .to_ip()
+        .ok_or(CliError::LoopbackBindFailed)?;
+
+    if !listen_addr.ip().is_loopback() {
+        return Err(CliError::LoopbackBindFailed);
+    }
+
+    let authorization =
+        oauth.begin_authorization(listen_addr.port(), GoogleDriveAccess::ReadOnly)?;
+
+    println!("GOOGLE_READONLY_UPGRADE_STAGE=authorize");
+    println!("REQUESTED_DRIVE_ACCESS=read_only");
+    println!("LOOPBACK_PORT={}", listen_addr.port());
+    println!("Opening Google authorization in your default browser...");
+
+    webbrowser::open(authorization.authorization_url().as_str())
+        .map_err(|_| CliError::BrowserOpenFailed)?;
+
+    let request = server
+        .recv_timeout(Duration::from_secs(180))
+        .map_err(|_| CliError::CallbackReceiveFailed)?
+        .ok_or(CliError::CallbackTimeout)?;
+
+    if request.method() != &Method::Get {
+        let _ = request.respond(
+            Response::from_string("NubiSync rejected this callback method.").with_status_code(405),
+        );
+        return Err(CliError::InvalidCallbackMethod);
+    }
+
+    let callback = Url::parse(&format!(
+        "http://127.0.0.1:{}{}",
+        listen_addr.port(),
+        request.url()
+    ))?;
+
+    let code = match authorization.accept_callback(&callback) {
+        Ok(code) => {
+            let _ = request.respond(Response::from_string(
+                "NubiSync received the Google read-only authorization. You can close this tab.",
+            ));
+            code
+        }
+        Err(error) => {
+            let _ = request.respond(
+                Response::from_string(
+                    "NubiSync rejected the OAuth callback. Return to the terminal.",
+                )
+                .with_status_code(400),
+            );
+            return Err(error.into());
+        }
+    };
+
+    println!("GOOGLE_READONLY_UPGRADE_STAGE=exchange_code");
+    let tokens = oauth.exchange_code(&authorization, &code, &client_secret)?;
+
+    if !oauth_scope_contains(tokens.scope(), GOOGLE_DRIVE_READONLY_SCOPE) {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+
+    println!("GOOGLE_READONLY_UPGRADE_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    let refresh_token = tokens
+        .refresh_token()
+        .ok_or(CliError::GoogleReadonlyRefreshTokenMissing)?;
+
+    keyring.put(
+        &refresh_token_key(&account.subject)?,
+        SecretValue::new(refresh_token.as_bytes().to_vec())?,
+    )?;
+
+    println!("GOOGLE_READONLY_UPGRADE=PASS");
+    println!("ACCOUNT_SUBJECT_MATCH=yes");
+    println!("REQUESTED_SCOPE=drive.readonly");
+    println!("GRANTED_SCOPE_VERIFIED=yes");
+    println!("REFRESH_TOKEN_REPLACED=yes");
+    println!("REFRESH_TOKEN_STORAGE=OS_KEYRING");
+    println!("ACCESS_TOKEN_STORAGE=memory_only");
+    println!("DATABASE_MUTATION=no");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("DRIVE_FILE_CONTENT_ACCESSED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+
+    Ok(())
+}
+
 fn google_login() -> Result<(), CliError> {
     ensure_keyring_available()?;
 
@@ -2217,6 +2350,23 @@ mod sync_root_cli_tests {
     }
 
     #[test]
+    fn oauth_scope_matching_is_exact_and_fail_closed() {
+        assert!(oauth_scope_contains(
+            Some("openid email https://www.googleapis.com/auth/drive.readonly profile"),
+            GOOGLE_DRIVE_READONLY_SCOPE,
+        ));
+        assert!(!oauth_scope_contains(
+            Some("openid email https://www.googleapis.com/auth/drive.metadata.readonly profile"),
+            GOOGLE_DRIVE_READONLY_SCOPE,
+        ));
+        assert!(!oauth_scope_contains(
+            Some("https://www.googleapis.com/auth/drive.readonly.extra"),
+            GOOGLE_DRIVE_READONLY_SCOPE,
+        ));
+        assert!(!oauth_scope_contains(None, GOOGLE_DRIVE_READONLY_SCOPE));
+    }
+
+    #[test]
     fn metadata_step_state_machine_is_explicit() {
         assert_eq!(
             classify_sync_root_metadata_step(false, None),
@@ -2346,6 +2496,10 @@ enum CliError {
     InvalidStoredSecret,
     #[error("refreshed Google identity does not match the stored account")]
     GoogleAccountMismatch,
+    #[error("Google did not grant the requested Drive read-only scope")]
+    GoogleReadonlyScopeNotGranted,
+    #[error("Google did not return a new refresh token for the Drive read-only upgrade")]
+    GoogleReadonlyRefreshTokenMissing,
     #[error("failed to bind the OAuth callback to loopback")]
     LoopbackBindFailed,
     #[error("failed to open the system browser")]
