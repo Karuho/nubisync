@@ -9,6 +9,10 @@ use nubisync_auth::{KeyringSecretStore, SecretKey, SecretStore, SecretValue};
 use nubisync_core::{
     ProviderAccount, ProviderId, RemoteChange, RemoteItemKind, SyncMode, SyncRoot,
 };
+use nubisync_daemon::{
+    bootstrap_selected_root_snapshot, collect_selected_root_change_window_page,
+    execute_completed_selected_root_change_window,
+};
 use nubisync_drive::{GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig};
 use nubisync_storage::Storage;
 use std::{
@@ -69,6 +73,14 @@ fn run() -> Result<(), CliError> {
         }
         [sync, roots, status] if sync == "sync" && roots == "roots" && status == "status" => {
             sync_roots_status()
+        }
+        [sync, roots, metadata_step, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && metadata_step == "metadata-step"
+                && approve == "--approve" =>
+        {
+            sync_roots_metadata_step()
         }
         [sync, roots, inventory, limit, value]
             if sync == "sync"
@@ -156,6 +168,7 @@ USAGE:
   nubisync auth google refresh
   nubisync auth google logout
   nubisync sync roots status
+  nubisync sync roots metadata-step --approve
   nubisync sync roots inventory --limit <1-10000>
   nubisync sync roots add --mode receive_only
   nubisync sync roots add --mode receive_only --dry-run
@@ -351,6 +364,174 @@ fn google_logout() -> Result<(), CliError> {
     println!("REFRESH_TOKEN_REMOVED=yes");
     println!("CLIENT_CONFIG_RETAINED=yes");
     println!("LOCAL_METADATA_RETAINED=yes");
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncRootMetadataStep {
+    Bootstrap,
+    CollectChangePage,
+    ExecuteWindow,
+}
+
+fn classify_sync_root_metadata_step(
+    snapshot_complete: bool,
+    window_complete: Option<bool>,
+) -> SyncRootMetadataStep {
+    if !snapshot_complete {
+        return SyncRootMetadataStep::Bootstrap;
+    }
+
+    match window_complete {
+        Some(true) => SyncRootMetadataStep::ExecuteWindow,
+        Some(false) | None => SyncRootMetadataStep::CollectChangePage,
+    }
+}
+
+fn sync_roots_metadata_step() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.is_empty() {
+        println!("SYNC_ROOT_METADATA_STEP=SKIPPED");
+        println!("REASON=no_configured_root");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_METADATA_STEP=SKIPPED");
+        println!("REASON=multiple_roots_require_selector");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootMetadataStepSelectionFailed)?;
+
+    if root.mode != SyncMode::ReceiveOnly {
+        return Err(CliError::SyncRootMetadataStepModeUnsupported);
+    }
+
+    let inventory = storage.sync_root_remote_inventory_state(&root.id)?;
+    let window = storage.sync_root_change_window_state(&root.id)?;
+    let step = classify_sync_root_metadata_step(
+        inventory.snapshot_complete,
+        window.as_ref().map(|state| state.is_complete()),
+    );
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_METADATA_STEP_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("SYNC_ROOT_METADATA_STEP_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    let observed_at_unix_ms = unix_time_ms()?;
+
+    match step {
+        SyncRootMetadataStep::Bootstrap => {
+            println!("SYNC_ROOT_METADATA_STEP_ACTION=bootstrap");
+            let result =
+                bootstrap_selected_root_snapshot(&api, &mut storage, &root, observed_at_unix_ms)?;
+
+            println!("SYNC_ROOT_METADATA_STEP=PASS");
+            println!("ACTION=bootstrap");
+            println!("AUTHORITATIVE_ITEMS={}", result.authoritative_items);
+            println!("FOLDER_PAGES={}", result.folder_pages);
+            println!(
+                "UNSUPPORTED_PROVIDER_NATIVE={}",
+                result.unsupported_provider_native
+            );
+            println!("NEXT_ACTION=collect_change_page");
+        }
+        SyncRootMetadataStep::CollectChangePage => {
+            println!("SYNC_ROOT_METADATA_STEP_ACTION=collect_change_page");
+            let result = collect_selected_root_change_window_page(&api, &mut storage, &root)?;
+
+            println!("SYNC_ROOT_METADATA_STEP=PASS");
+            println!("ACTION=collect_change_page");
+            println!("WINDOW_PAGE_COUNT={}", result.page_count);
+            println!("WINDOW_CHANGE_COUNT={}", result.change_count);
+            println!("WINDOW_COMPLETE={}", yes_no(result.complete));
+            println!(
+                "NEXT_ACTION={}",
+                if result.complete {
+                    "execute_window"
+                } else {
+                    "collect_change_page"
+                }
+            );
+        }
+        SyncRootMetadataStep::ExecuteWindow => {
+            println!("SYNC_ROOT_METADATA_STEP_ACTION=execute_window");
+            let result = execute_completed_selected_root_change_window(
+                &api,
+                &mut storage,
+                &root,
+                observed_at_unix_ms,
+            )?;
+
+            println!("SYNC_ROOT_METADATA_STEP=PASS");
+            println!("ACTION=execute_window");
+            println!("PROVIDER_CHANGES={}", result.provider_changes);
+            println!("CATALOG_MUTATIONS={}", result.storage_mutations);
+            println!("AUTHORITATIVE_ITEMS={}", result.authoritative_items);
+            println!("HYDRATED_ITEMS={}", result.hydrated_items);
+            println!("ROOT_REVALIDATIONS={}", result.root_revalidations);
+            println!(
+                "COMPLETED_INITIAL_CATCHUP={}",
+                yes_no(result.completed_initial_catchup)
+            );
+            println!("NEXT_ACTION=collect_change_page");
+        }
+    }
+
+    println!("NETWORK_CHECK=performed");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
 }
@@ -1876,6 +2057,26 @@ mod sync_root_cli_tests {
     }
 
     #[test]
+    fn metadata_step_state_machine_is_explicit() {
+        assert_eq!(
+            classify_sync_root_metadata_step(false, None),
+            SyncRootMetadataStep::Bootstrap
+        );
+        assert_eq!(
+            classify_sync_root_metadata_step(true, None),
+            SyncRootMetadataStep::CollectChangePage
+        );
+        assert_eq!(
+            classify_sync_root_metadata_step(true, Some(false)),
+            SyncRootMetadataStep::CollectChangePage
+        );
+        assert_eq!(
+            classify_sync_root_metadata_step(true, Some(true)),
+            SyncRootMetadataStep::ExecuteWindow
+        );
+    }
+
+    #[test]
     fn sync_root_mode_is_fail_closed_to_receive_only() {
         assert_eq!(
             parse_sync_root_mode("receive_only").unwrap(),
@@ -2016,6 +2217,8 @@ enum CliError {
     #[error(transparent)]
     Secrets(#[from] nubisync_auth::SecretStoreError),
     #[error(transparent)]
+    Daemon(#[from] nubisync_daemon::SelectedRootExecutorError),
+    #[error(transparent)]
     Storage(#[from] nubisync_storage::StorageError),
     #[error("local filesystem operation failed")]
     Io(#[from] std::io::Error),
@@ -2059,6 +2262,10 @@ enum CliError {
     LocalSyncDirectoryNotEmpty,
     #[error("sync root inventory selection failed")]
     SyncRootInventorySelectionFailed,
+    #[error("sync root metadata-step selection failed")]
+    SyncRootMetadataStepSelectionFailed,
+    #[error("sync root metadata-step currently supports only receive_only roots")]
+    SyncRootMetadataStepModeUnsupported,
     #[error("configured sync root does not have a remote root identifier")]
     SyncRootInventoryRemoteRootMissing,
     #[error("sync root inventory pagination repeated a continuation token")]

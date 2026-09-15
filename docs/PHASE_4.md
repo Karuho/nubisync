@@ -745,3 +745,35 @@ Phase 4Y does not expose live bootstrap/catch-up commands, download file
 content, write Drive data, or mutate the local sync tree. The next integration
 phase can compose bootstrap -> durable page collection -> atomic window
 execution behind a controlled explicit surface.
+
+## Phase 4Z — Explicit supervised metadata step
+
+The CLI now exposes the first controlled selected-root synchronization surface:
+
+`nubisync sync roots metadata-step --approve`
+
+This command is deliberately one state-machine transition per invocation:
+
+- no authoritative snapshot -> bootstrap selected-root metadata
+- snapshot present and no complete window -> collect at most one change page
+- complete durable window -> execute it atomically
+
+Safety properties:
+
+- the exact `--approve` argument is required
+- zero configured roots skip before keyring/network access
+- multiple configured roots skip until an explicit selector exists
+- only `receive_only` roots are accepted
+- root paths, remote IDs, filenames, and provider cursors are not printed
+- no file content is requested
+- no local sync-tree mutation occurs
+- no Drive write permission/action exists
+- a collected page is durable before the next page can be requested
+- a completed window is applied through the Phase 4Y atomic commit/cleanup path
+
+The command is intentionally not a background loop. The owner reruns it to
+advance another supervised metadata step.
+
+Initial validation should use the existing zero-root state first; that invocation
+must return `SKIPPED`, `REASON=no_configured_root`, and
+`NETWORK_CHECK=not_performed`.

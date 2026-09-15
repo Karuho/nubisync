@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 nubisync-auth = { path = "../nubisync-auth" }
 nubisync-core = { path = "../nubisync-core" }
+nubisync-daemon = { path = "../nubisync-daemon" }
 nubisync-drive = { path = "../nubisync-drive" }
 nubisync-storage = { path = "../nubisync-storage" }
 rpassword.workspace = true

@@ -1203,6 +1203,7 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "nubisync-auth",
  "nubisync-core",
+ "nubisync-daemon",
  "nubisync-drive",
  "nubisync-storage",
  "rpassword",
