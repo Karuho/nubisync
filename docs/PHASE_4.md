@@ -642,3 +642,40 @@ executor's provider contract, while unit tests use an offline fake provider.
 
 Phase 4V does not expose a live daemon loop or CLI catch-up command yet. It does
 not download file contents and does not mutate the local sync tree.
+
+## Phase 4W — Authoritative selected-root bootstrap orchestration
+
+The daemon layer can now build the first authoritative catalog snapshot for one
+configured selected root without exposing a live CLI command.
+
+Bootstrap order is deliberately fenced:
+
+1. reject roots that already have an authoritative snapshot
+2. resolve the configured remote root to its canonical provider identity
+3. capture the provider change cursor before inventory begins
+4. clear only non-authoritative root staging
+5. traverse every supported descendant breadth-first using metadata-only pages
+6. validate exact parent relationships, duplicate IDs, pagination tokens, and
+   safety limits while staging pages incrementally in SQLite
+7. revalidate the configured root after traversal
+8. atomically promote staging to the authoritative root catalog together with
+   the pre-inventory catch-up fence
+
+The selected root container itself is not inserted into the catalog; only its
+supported descendants are authoritative catalog items.
+
+Any provider, validation, pagination, or storage failure before promotion leaves
+the previous authoritative catalog unchanged and performs best-effort staging
+cleanup. Retrying bootstrap starts by clearing staging again.
+
+A successful bootstrap ends with:
+
+- `snapshot_complete = true`
+- `catchup_complete = false`
+- `catchup_from_cursor = pre-inventory fence`
+- `change_cursor = NULL`
+
+Phase 4W still exposes no live bootstrap/catch-up command, downloads no file
+content, performs no Drive write, and mutates no local sync tree. The next phase
+must address durable multi-page change-window collection before a real catch-up
+surface is enabled.

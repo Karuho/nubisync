@@ -2,7 +2,9 @@
 
 #![forbid(unsafe_code)]
 
-use nubisync_core::{ChangeCursor, RemoteChange, RemoteItem, RemoteItemKind, SyncRoot};
+use nubisync_core::{
+    ChangeCursor, ContinuationToken, RemoteChange, RemoteItem, RemoteItemKind, SyncRoot,
+};
 use nubisync_drive::{DriveApiError, DriveFolderRoot, DriveRootMembership, GoogleDriveApi};
 use nubisync_storage::{
     Storage, StorageError, SyncRootCatalogBatchCommit, SyncRootCatalogMutation,
@@ -11,6 +13,7 @@ use nubisync_sync::{
     RootCatalogMutationPlan, RootCatalogProjection, RootCatalogProjectionError,
     RootCatalogResolution, RootChangeMembership,
 };
+use std::collections::{HashSet, VecDeque};
 use thiserror::Error;
 
 pub trait SelectedRootProvider {
@@ -75,6 +78,88 @@ impl SelectedRootProvider for GoogleDriveApi {
     }
 }
 
+#[derive(Clone)]
+pub struct SelectedRootInventoryPage {
+    items: Vec<RemoteItem>,
+    continuation: Option<ContinuationToken>,
+    unsupported_provider_native: u64,
+}
+
+impl SelectedRootInventoryPage {
+    pub fn new(
+        items: Vec<RemoteItem>,
+        continuation: Option<ContinuationToken>,
+        unsupported_provider_native: u64,
+    ) -> Self {
+        Self {
+            items,
+            continuation,
+            unsupported_provider_native,
+        }
+    }
+
+    fn into_parts(self) -> (Vec<RemoteItem>, Option<ContinuationToken>, u64) {
+        (
+            self.items,
+            self.continuation,
+            self.unsupported_provider_native,
+        )
+    }
+}
+
+impl std::fmt::Debug for SelectedRootInventoryPage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SelectedRootInventoryPage")
+            .field("item_count", &self.items.len())
+            .field("has_continuation", &self.continuation.is_some())
+            .field(
+                "unsupported_provider_native",
+                &self.unsupported_provider_native,
+            )
+            .finish()
+    }
+}
+
+pub trait SelectedRootBootstrapProvider: SelectedRootProvider {
+    fn current_change_cursor(&self) -> Result<ChangeCursor, SelectedRootExecutorError>;
+
+    fn list_children_page(
+        &self,
+        parent_remote_id: &str,
+        continuation: Option<&ContinuationToken>,
+    ) -> Result<SelectedRootInventoryPage, SelectedRootExecutorError>;
+}
+
+impl SelectedRootBootstrapProvider for GoogleDriveApi {
+    fn current_change_cursor(&self) -> Result<ChangeCursor, SelectedRootExecutorError> {
+        GoogleDriveApi::current_change_cursor(self).map_err(SelectedRootExecutorError::from)
+    }
+
+    fn list_children_page(
+        &self,
+        parent_remote_id: &str,
+        continuation: Option<&ContinuationToken>,
+    ) -> Result<SelectedRootInventoryPage, SelectedRootExecutorError> {
+        let page =
+            GoogleDriveApi::list_folder_children_page(self, parent_remote_id, continuation, 1000)
+                .map_err(SelectedRootExecutorError::from)?;
+
+        Ok(SelectedRootInventoryPage::new(
+            page.items,
+            page.continuation,
+            page.unsupported_provider_native,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootBootstrap {
+    pub authoritative_items: u64,
+    pub folder_pages: u64,
+    pub unsupported_provider_native: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectedRootBatchExecution {
     pub provider_changes: usize,
@@ -83,6 +168,178 @@ pub struct SelectedRootBatchExecution {
     pub hydrated_items: usize,
     pub root_revalidations: usize,
     pub completed_initial_catchup: bool,
+}
+
+pub fn bootstrap_selected_root_snapshot<P: SelectedRootBootstrapProvider>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    observed_at_unix_ms: i64,
+) -> Result<SelectedRootBootstrap, SelectedRootExecutorError> {
+    let state = storage.sync_root_remote_inventory_state(&sync_root.id)?;
+    if state.snapshot_complete {
+        return Err(SelectedRootExecutorError::BootstrapSnapshotAlreadyComplete);
+    }
+
+    let configured_remote_root_id = sync_root
+        .remote_root_id
+        .as_deref()
+        .ok_or(SelectedRootExecutorError::MissingRemoteRoot)?;
+
+    let root_identity = provider.resolve_root(configured_remote_root_id)?;
+    let canonical_root_id = provider.canonical_root_id(&root_identity).to_owned();
+
+    if canonical_root_id.trim().is_empty() {
+        return Err(SelectedRootExecutorError::InvalidCanonicalRoot);
+    }
+
+    // The fence must be captured before the full subtree inventory begins.
+    let fence = provider.current_change_cursor()?;
+
+    storage.begin_sync_root_remote_inventory_staging(&sync_root.id)?;
+
+    let result = (|| {
+        let traversal = stage_selected_root_inventory(
+            provider,
+            storage,
+            &sync_root.id,
+            &canonical_root_id,
+            observed_at_unix_ms,
+        )?;
+
+        // Revalidate the configured root before promoting staging. Any root
+        // transition after the fence is still caught by the later change feed,
+        // but an unavailable or identity-shifted root must not be promoted.
+        let revalidated = provider.resolve_root(configured_remote_root_id)?;
+        if provider.canonical_root_id(&revalidated) != canonical_root_id {
+            return Err(SelectedRootExecutorError::RootIdentityChanged);
+        }
+
+        let staged_items = storage.staged_sync_root_remote_inventory_count(&sync_root.id)?;
+
+        if staged_items != traversal.supported_items {
+            return Err(SelectedRootExecutorError::BootstrapItemCountMismatch);
+        }
+
+        storage.commit_sync_root_remote_inventory_snapshot(
+            &sync_root.id,
+            &fence,
+            observed_at_unix_ms,
+        )?;
+
+        Ok(SelectedRootBootstrap {
+            authoritative_items: traversal.supported_items,
+            folder_pages: traversal.folder_pages,
+            unsupported_provider_native: traversal.unsupported_provider_native,
+        })
+    })();
+
+    if result.is_err() {
+        // Staging is non-authoritative. Best-effort cleanup keeps retries tidy;
+        // a future retry also clears staging before writing.
+        let _ = storage.clear_sync_root_remote_inventory_staging(&sync_root.id);
+    }
+
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BootstrapTraversal {
+    supported_items: u64,
+    folder_pages: u64,
+    unsupported_provider_native: u64,
+}
+
+fn stage_selected_root_inventory<P: SelectedRootBootstrapProvider>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root_id: &str,
+    canonical_root_id: &str,
+    observed_at_unix_ms: i64,
+) -> Result<BootstrapTraversal, SelectedRootExecutorError> {
+    let mut folders = VecDeque::from([canonical_root_id.to_owned()]);
+    let mut seen_remote_ids = HashSet::from([canonical_root_id.to_owned()]);
+    let mut supported_items = 0_u64;
+    let mut folder_pages = 0_u64;
+    let mut unsupported_provider_native = 0_u64;
+
+    while let Some(parent_remote_id) = folders.pop_front() {
+        let mut continuation = None;
+        let mut seen_page_tokens = HashSet::new();
+
+        loop {
+            folder_pages = folder_pages
+                .checked_add(1)
+                .ok_or(SelectedRootExecutorError::BootstrapSafetyLimitExceeded)?;
+            if folder_pages > 100_000 {
+                return Err(SelectedRootExecutorError::BootstrapSafetyLimitExceeded);
+            }
+
+            let page = provider.list_children_page(&parent_remote_id, continuation.as_ref())?;
+            let (items, next_continuation, unsupported) = page.into_parts();
+
+            unsupported_provider_native = unsupported_provider_native
+                .checked_add(unsupported)
+                .ok_or(SelectedRootExecutorError::BootstrapSafetyLimitExceeded)?;
+
+            for item in &items {
+                validate_bootstrap_item(&parent_remote_id, item, &mut seen_remote_ids)?;
+
+                supported_items = supported_items
+                    .checked_add(1)
+                    .ok_or(SelectedRootExecutorError::BootstrapSafetyLimitExceeded)?;
+                if supported_items > 1_000_000 {
+                    return Err(SelectedRootExecutorError::BootstrapSafetyLimitExceeded);
+                }
+
+                if item.kind == RemoteItemKind::Folder {
+                    folders.push_back(item.remote_id.clone());
+                }
+            }
+
+            storage.stage_sync_root_remote_inventory_items(
+                sync_root_id,
+                &items,
+                observed_at_unix_ms,
+            )?;
+
+            match next_continuation {
+                Some(next) => {
+                    if !seen_page_tokens.insert(next.as_str().to_owned()) {
+                        return Err(SelectedRootExecutorError::BootstrapPaginationLoop);
+                    }
+                    continuation = Some(next);
+                }
+                None => break,
+            }
+        }
+    }
+
+    Ok(BootstrapTraversal {
+        supported_items,
+        folder_pages,
+        unsupported_provider_native,
+    })
+}
+
+fn validate_bootstrap_item(
+    expected_parent_remote_id: &str,
+    item: &RemoteItem,
+    seen_remote_ids: &mut HashSet<String>,
+) -> Result<(), SelectedRootExecutorError> {
+    if item.remote_id.trim().is_empty() || item.name.is_empty() || item.trashed {
+        return Err(SelectedRootExecutorError::BootstrapInvalidItem);
+    }
+
+    if item.parent_remote_id.as_deref() != Some(expected_parent_remote_id) {
+        return Err(SelectedRootExecutorError::BootstrapParentMismatch);
+    }
+
+    if !seen_remote_ids.insert(item.remote_id.clone()) {
+        return Err(SelectedRootExecutorError::BootstrapDuplicateRemoteId);
+    }
+
+    Ok(())
 }
 
 pub fn execute_selected_root_change_batch<P: SelectedRootProvider>(
@@ -228,6 +485,20 @@ pub enum SelectedRootExecutorError {
     CountOverflow,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
+    #[error("selected-root authoritative snapshot is already complete")]
+    BootstrapSnapshotAlreadyComplete,
+    #[error("selected-root bootstrap returned invalid item metadata")]
+    BootstrapInvalidItem,
+    #[error("selected-root bootstrap child parent does not match traversal context")]
+    BootstrapParentMismatch,
+    #[error("selected-root bootstrap returned a duplicate remote identifier")]
+    BootstrapDuplicateRemoteId,
+    #[error("selected-root bootstrap pagination token repeated")]
+    BootstrapPaginationLoop,
+    #[error("selected-root bootstrap exceeded a safety limit")]
+    BootstrapSafetyLimitExceeded,
+    #[error("selected-root bootstrap authoritative item count mismatched traversal")]
+    BootstrapItemCountMismatch,
     #[error("Drive provider operation failed")]
     Drive(Box<DriveApiError>),
     #[error("selected-root storage operation failed")]
@@ -258,7 +529,10 @@ impl From<RootCatalogProjectionError> for SelectedRootExecutorError {
 mod tests {
     use super::*;
     use nubisync_core::{ProviderAccount, ProviderId, SyncMode};
-    use std::{cell::Cell, collections::HashMap};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::{HashMap, VecDeque},
+    };
 
     struct FakeProvider {
         canonical_root_id: String,
@@ -336,6 +610,28 @@ mod tests {
         }
     }
 
+    fn storage_with_uninitialized_root() -> (Storage, SyncRoot) {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = ProviderAccount::new(provider.clone(), "subject", None, None).unwrap();
+
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "root-one",
+            provider,
+            account.subject,
+            "/tmp/root-one",
+            Some("configured-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+
+        storage.insert_sync_root(&root).unwrap();
+        (storage, root)
+    }
+
     fn storage_with_root(baseline: &[RemoteItem], fence: &str) -> (Storage, SyncRoot) {
         let mut storage = Storage::open_in_memory().unwrap();
         let provider = ProviderId::new("google-drive").unwrap();
@@ -370,6 +666,254 @@ mod tests {
             .unwrap();
 
         (storage, root)
+    }
+
+    struct FakeBootstrapProvider {
+        canonical_root_id: String,
+        cursor: ChangeCursor,
+        pages: RefCell<VecDeque<Result<SelectedRootInventoryPage, SelectedRootExecutorError>>>,
+        events: RefCell<Vec<&'static str>>,
+        root_resolutions: Cell<usize>,
+    }
+
+    impl FakeBootstrapProvider {
+        fn new(
+            canonical_root_id: &str,
+            cursor: &str,
+            pages: Vec<Result<SelectedRootInventoryPage, SelectedRootExecutorError>>,
+        ) -> Self {
+            Self {
+                canonical_root_id: canonical_root_id.into(),
+                cursor: ChangeCursor::new(cursor).unwrap(),
+                pages: RefCell::new(VecDeque::from(pages)),
+                events: RefCell::new(Vec::new()),
+                root_resolutions: Cell::new(0),
+            }
+        }
+    }
+
+    impl SelectedRootProvider for FakeBootstrapProvider {
+        type RootIdentity = String;
+
+        fn resolve_root(
+            &self,
+            _remote_root_id: &str,
+        ) -> Result<Self::RootIdentity, SelectedRootExecutorError> {
+            self.events.borrow_mut().push("resolve_root");
+            self.root_resolutions
+                .set(self.root_resolutions.get().saturating_add(1));
+            Ok(self.canonical_root_id.clone())
+        }
+
+        fn canonical_root_id<'a>(&self, root: &'a Self::RootIdentity) -> &'a str {
+            root
+        }
+
+        fn resolve_membership(
+            &self,
+            _item: &RemoteItem,
+            _root: &Self::RootIdentity,
+        ) -> Result<RootChangeMembership, SelectedRootExecutorError> {
+            Err(SelectedRootExecutorError::ProviderOperationFailed)
+        }
+
+        fn hydrate_folder(
+            &self,
+            _item: &RemoteItem,
+        ) -> Result<Vec<RemoteItem>, SelectedRootExecutorError> {
+            Err(SelectedRootExecutorError::ProviderOperationFailed)
+        }
+    }
+
+    impl SelectedRootBootstrapProvider for FakeBootstrapProvider {
+        fn current_change_cursor(&self) -> Result<ChangeCursor, SelectedRootExecutorError> {
+            self.events.borrow_mut().push("cursor");
+            Ok(self.cursor.clone())
+        }
+
+        fn list_children_page(
+            &self,
+            _parent_remote_id: &str,
+            _continuation: Option<&ContinuationToken>,
+        ) -> Result<SelectedRootInventoryPage, SelectedRootExecutorError> {
+            self.events.borrow_mut().push("list");
+            self.pages
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| Ok(SelectedRootInventoryPage::new(Vec::new(), None, 0)))
+        }
+    }
+
+    #[test]
+    fn bootstrap_captures_fence_before_inventory_and_promotes_snapshot() {
+        let (mut storage, root) = storage_with_uninitialized_root();
+
+        let folder = item("folder", "canonical-root", RemoteItemKind::Folder);
+        let direct_file = item("direct-file", "canonical-root", RemoteItemKind::File);
+        let nested_file = item("nested-file", "folder", RemoteItemKind::File);
+
+        let provider = FakeBootstrapProvider::new(
+            "canonical-root",
+            "bootstrap-fence",
+            vec![
+                Ok(SelectedRootInventoryPage::new(
+                    vec![folder.clone(), direct_file.clone()],
+                    None,
+                    1,
+                )),
+                Ok(SelectedRootInventoryPage::new(
+                    vec![nested_file.clone()],
+                    None,
+                    0,
+                )),
+            ],
+        );
+
+        let result = bootstrap_selected_root_snapshot(&provider, &mut storage, &root, 10).unwrap();
+
+        assert_eq!(
+            result,
+            SelectedRootBootstrap {
+                authoritative_items: 3,
+                folder_pages: 2,
+                unsupported_provider_native: 1,
+            }
+        );
+
+        assert_eq!(
+            provider.events.borrow().as_slice(),
+            ["resolve_root", "cursor", "list", "list", "resolve_root"]
+        );
+
+        let state = storage.sync_root_remote_inventory_state(&root.id).unwrap();
+        assert!(state.snapshot_complete);
+        assert!(!state.catchup_complete);
+        assert_eq!(state.item_count, 3);
+        assert_eq!(
+            state.catchup_from_cursor.unwrap().as_str(),
+            "bootstrap-fence"
+        );
+        assert!(storage.sync_root_change_cursor(&root.id).unwrap().is_none());
+        assert_eq!(
+            storage.list_sync_root_remote_items(&root.id).unwrap(),
+            vec![direct_file, folder, nested_file]
+        );
+        assert_eq!(
+            storage
+                .staged_sync_root_remote_inventory_count(&root.id)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn bootstrap_failure_clears_non_authoritative_staging() {
+        let (mut storage, root) = storage_with_uninitialized_root();
+
+        let folder = item("folder", "canonical-root", RemoteItemKind::Folder);
+        let provider = FakeBootstrapProvider::new(
+            "canonical-root",
+            "bootstrap-fence",
+            vec![
+                Ok(SelectedRootInventoryPage::new(vec![folder], None, 0)),
+                Err(SelectedRootExecutorError::ProviderOperationFailed),
+            ],
+        );
+
+        let error =
+            bootstrap_selected_root_snapshot(&provider, &mut storage, &root, 10).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SelectedRootExecutorError::ProviderOperationFailed
+        ));
+        assert_eq!(
+            storage
+                .staged_sync_root_remote_inventory_count(&root.id)
+                .unwrap(),
+            0
+        );
+
+        let state = storage.sync_root_remote_inventory_state(&root.id).unwrap();
+        assert!(!state.snapshot_complete);
+        assert!(!state.catchup_complete);
+        assert_eq!(state.item_count, 0);
+        assert!(state.catchup_from_cursor.is_none());
+        assert!(
+            storage
+                .list_sync_root_remote_items(&root.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_duplicate_remote_ids_and_clears_staging() {
+        let (mut storage, root) = storage_with_uninitialized_root();
+
+        let folder = item("folder", "canonical-root", RemoteItemKind::Folder);
+        let duplicate = item("folder", "canonical-root", RemoteItemKind::File);
+
+        let provider = FakeBootstrapProvider::new(
+            "canonical-root",
+            "bootstrap-fence",
+            vec![Ok(SelectedRootInventoryPage::new(
+                vec![folder, duplicate],
+                None,
+                0,
+            ))],
+        );
+
+        let error =
+            bootstrap_selected_root_snapshot(&provider, &mut storage, &root, 10).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SelectedRootExecutorError::BootstrapDuplicateRemoteId
+        ));
+        assert_eq!(
+            storage
+                .staged_sync_root_remote_inventory_count(&root.id)
+                .unwrap(),
+            0
+        );
+        assert!(
+            !storage
+                .sync_root_remote_inventory_state(&root.id)
+                .unwrap()
+                .snapshot_complete
+        );
+    }
+
+    #[test]
+    fn bootstrap_refuses_to_replace_existing_authoritative_snapshot() {
+        let baseline = item("baseline", "canonical-root", RemoteItemKind::File);
+        let (mut storage, root) =
+            storage_with_root(std::slice::from_ref(&baseline), "existing-fence");
+
+        let provider = FakeBootstrapProvider::new("canonical-root", "new-fence", Vec::new());
+
+        let error =
+            bootstrap_selected_root_snapshot(&provider, &mut storage, &root, 10).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SelectedRootExecutorError::BootstrapSnapshotAlreadyComplete
+        ));
+        assert!(provider.events.borrow().is_empty());
+        assert_eq!(
+            storage.list_sync_root_remote_items(&root.id).unwrap(),
+            vec![baseline]
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_inventory_state(&root.id)
+                .unwrap()
+                .catchup_from_cursor
+                .unwrap()
+                .as_str(),
+            "existing-fence"
+        );
     }
 
     #[test]
