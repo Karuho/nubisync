@@ -155,3 +155,30 @@ that was never present in the supported baseline is idempotent and harmless.
 
 This prevents a later bootstrap catch-up from introducing provider-native objects
 that the authoritative inventory intentionally excluded.
+
+## Phase 4F — Transactional catalog catch-up
+
+After a complete inventory snapshot exists, `drive catalog catchup` consumes the
+Drive change stream beginning at the bootstrap fence captured before that
+inventory.
+
+Catch-up changes are applied directly to the authoritative `remote_items`
+catalog. Deletes and trashed items remove entries; ordinary file/folder upserts
+replace their metadata idempotently.
+
+The following transition is committed in one SQLite transaction:
+
+- apply the complete catch-up change batch to `remote_items`
+- recompute the authoritative item count
+- set `catchup_complete=yes`
+- advance the normal provider cursor to the catch-up checkpoint
+- supersede older pending `remote_events` already represented by the
+  snapshot-plus-catch-up baseline
+
+If any catalog mutation fails, none of those transitions commit.
+
+The command checks local catalog state before authentication or network access.
+Without a complete snapshot it exits as `SKIPPED` with
+`NETWORK_CHECK=not_performed`.
+
+Phase 4F still performs no filesystem mutation and no Drive write.

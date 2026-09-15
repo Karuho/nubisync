@@ -28,6 +28,13 @@ impl RemoteInventoryState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogCatchupCommit {
+    pub changes_applied: usize,
+    pub authoritative_items: u64,
+    pub remote_events_superseded: u64,
+}
+
 pub struct Storage {
     connection: Connection,
 }
@@ -568,6 +575,118 @@ impl Storage {
         }
     }
 
+    pub fn commit_remote_catalog_catchup(
+        &mut self,
+        provider: &ProviderId,
+        account_subject: &str,
+        from_cursor: &ChangeCursor,
+        changes: &[RemoteChange],
+        checkpoint: &ChangeCursor,
+        observed_at_unix_ms: i64,
+    ) -> Result<CatalogCatchupCommit, StorageError> {
+        let transaction = self.connection.transaction()?;
+
+        let state: Option<(i64, i64, Option<String>)> = transaction
+            .query_row(
+                "SELECT snapshot_complete, catchup_complete, catchup_from_cursor
+                 FROM remote_inventory_state
+                 WHERE provider = ?1 AND account_subject = ?2",
+                params![provider.as_str(), account_subject],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((snapshot_complete, catchup_complete, stored_from_cursor)) = state else {
+            return Err(StorageError::RemoteCatalogSnapshotMissing);
+        };
+
+        if snapshot_complete == 0 {
+            return Err(StorageError::RemoteCatalogSnapshotMissing);
+        }
+
+        if catchup_complete != 0 {
+            return Err(StorageError::RemoteCatalogCatchupAlreadyComplete);
+        }
+
+        let stored_from_cursor =
+            stored_from_cursor.ok_or(StorageError::RemoteCatalogCatchupCursorMissing)?;
+
+        if stored_from_cursor != from_cursor.as_str() {
+            return Err(StorageError::RemoteCatalogCatchupCursorMismatch);
+        }
+
+        for change in changes {
+            apply_remote_change_to_inventory(
+                &transaction,
+                provider,
+                account_subject,
+                change,
+                observed_at_unix_ms,
+            )?;
+        }
+
+        let item_count_i64: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM remote_items
+             WHERE provider = ?1 AND account_subject = ?2",
+            params![provider.as_str(), account_subject],
+            |row| row.get(0),
+        )?;
+
+        let authoritative_items =
+            u64::try_from(item_count_i64).map_err(|_| StorageError::NumericOverflow)?;
+
+        transaction.execute(
+            "UPDATE remote_inventory_state
+             SET catchup_complete = 1,
+                 item_count = ?3
+             WHERE provider = ?1
+               AND account_subject = ?2
+               AND snapshot_complete = 1
+               AND catchup_complete = 0
+               AND catchup_from_cursor = ?4",
+            params![
+                provider.as_str(),
+                account_subject,
+                item_count_i64,
+                from_cursor.as_str()
+            ],
+        )?;
+
+        transaction.execute(
+            "INSERT INTO provider_cursors (
+                provider, account_subject, cursor, updated_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(provider, account_subject) DO UPDATE SET
+                cursor = excluded.cursor,
+                updated_at_unix_ms = excluded.updated_at_unix_ms",
+            params![
+                provider.as_str(),
+                account_subject,
+                checkpoint.as_str(),
+                observed_at_unix_ms
+            ],
+        )?;
+
+        let superseded = transaction.execute(
+            "UPDATE remote_events
+             SET status = 'superseded'
+             WHERE provider = ?1
+               AND account_subject = ?2
+               AND status = 'pending'",
+            params![provider.as_str(), account_subject],
+        )?;
+
+        transaction.commit()?;
+
+        Ok(CatalogCatchupCommit {
+            changes_applied: changes.len(),
+            authoritative_items,
+            remote_events_superseded: u64::try_from(superseded)
+                .map_err(|_| StorageError::NumericOverflow)?,
+        })
+    }
+
     pub fn remote_inventory_count(
         &self,
         provider: &ProviderId,
@@ -595,6 +714,80 @@ impl Storage {
 
         u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
     }
+}
+
+fn apply_remote_change_to_inventory(
+    transaction: &Transaction<'_>,
+    provider: &ProviderId,
+    account_subject: &str,
+    change: &RemoteChange,
+    observed_at_unix_ms: i64,
+) -> Result<(), StorageError> {
+    match change {
+        RemoteChange::Delete { remote_id } => {
+            transaction.execute(
+                "DELETE FROM remote_items
+                 WHERE provider = ?1
+                   AND account_subject = ?2
+                   AND remote_id = ?3",
+                params![provider.as_str(), account_subject, remote_id],
+            )?;
+        }
+        RemoteChange::Upsert(item) if item.trashed => {
+            transaction.execute(
+                "DELETE FROM remote_items
+                 WHERE provider = ?1
+                   AND account_subject = ?2
+                   AND remote_id = ?3",
+                params![provider.as_str(), account_subject, item.remote_id],
+            )?;
+        }
+        RemoteChange::Upsert(item) => {
+            let item_kind = match item.kind {
+                RemoteItemKind::File => "file",
+                RemoteItemKind::Folder => "folder",
+            };
+
+            let size_bytes = item
+                .size_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| StorageError::NumericOverflow)?;
+
+            transaction.execute(
+                "INSERT INTO remote_items (
+                    provider,
+                    account_subject,
+                    remote_id,
+                    parent_remote_id,
+                    name,
+                    item_kind,
+                    size_bytes,
+                    trashed,
+                    observed_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)
+                 ON CONFLICT(provider, account_subject, remote_id) DO UPDATE SET
+                    parent_remote_id = excluded.parent_remote_id,
+                    name = excluded.name,
+                    item_kind = excluded.item_kind,
+                    size_bytes = excluded.size_bytes,
+                    trashed = 0,
+                    observed_at_unix_ms = excluded.observed_at_unix_ms",
+                params![
+                    provider.as_str(),
+                    account_subject,
+                    item.remote_id,
+                    item.parent_remote_id,
+                    item.name,
+                    item_kind,
+                    size_bytes,
+                    observed_at_unix_ms
+                ],
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 fn insert_inventory_item(
@@ -759,6 +952,14 @@ pub enum StorageError {
     InvalidInternalTable,
     #[error("SQLite schema version {found} is newer than supported version {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
+    #[error("remote catalog does not have a complete authoritative snapshot")]
+    RemoteCatalogSnapshotMissing,
+    #[error("remote catalog catch-up is already complete")]
+    RemoteCatalogCatchupAlreadyComplete,
+    #[error("remote catalog catch-up cursor is missing")]
+    RemoteCatalogCatchupCursorMissing,
+    #[error("remote catalog catch-up cursor does not match the stored bootstrap fence")]
+    RemoteCatalogCatchupCursorMismatch,
 }
 
 #[cfg(test)]
@@ -976,6 +1177,197 @@ mod tests {
             "ChangeCursor([redacted])"
         );
         assert!(!state.ready_for_reconciliation());
+    }
+
+    #[test]
+    fn catalog_catchup_requires_complete_snapshot() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let result = storage.commit_remote_catalog_catchup(
+            &provider,
+            &account.subject,
+            &ChangeCursor::new("fence").unwrap(),
+            &[],
+            &ChangeCursor::new("checkpoint").unwrap(),
+            2,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StorageError::RemoteCatalogSnapshotMissing)
+        ));
+    }
+
+    #[test]
+    fn catalog_catchup_applies_changes_advances_cursor_and_supersedes_journal() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let first = match test_upsert("file-1", Some(10)) {
+            RemoteChange::Upsert(item) => item,
+            _ => unreachable!(),
+        };
+        let second = match test_upsert("file-2", Some(20)) {
+            RemoteChange::Upsert(item) => item,
+            _ => unreachable!(),
+        };
+        let fence = ChangeCursor::new("bootstrap-fence").unwrap();
+
+        storage
+            .begin_remote_inventory_staging(&provider, &account.subject)
+            .unwrap();
+        storage
+            .stage_remote_inventory_items(&provider, &account.subject, &[first, second], 2)
+            .unwrap();
+        storage
+            .commit_remote_inventory_snapshot(&provider, &account.subject, &fence, 3)
+            .unwrap();
+
+        storage
+            .commit_remote_changes_and_cursor(
+                &provider,
+                &account.subject,
+                &[test_upsert("journal-old", Some(1))],
+                &ChangeCursor::new("old-poll-cursor").unwrap(),
+                4,
+            )
+            .unwrap();
+
+        let replacement = RemoteChange::Upsert(RemoteItem {
+            remote_id: "file-3".into(),
+            parent_remote_id: Some("root".into()),
+            name: "replacement.txt".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(30),
+            modified_unix_ms: None,
+            trashed: false,
+        });
+
+        let checkpoint = ChangeCursor::new("catchup-checkpoint").unwrap();
+        let result = storage
+            .commit_remote_catalog_catchup(
+                &provider,
+                &account.subject,
+                &fence,
+                &[
+                    RemoteChange::Delete {
+                        remote_id: "file-1".into(),
+                    },
+                    replacement,
+                ],
+                &checkpoint,
+                5,
+            )
+            .unwrap();
+
+        assert_eq!(result.changes_applied, 2);
+        assert_eq!(result.authoritative_items, 2);
+        assert_eq!(result.remote_events_superseded, 1);
+
+        let state = storage
+            .remote_inventory_state(&provider, &account.subject)
+            .unwrap();
+        assert!(state.snapshot_complete);
+        assert!(state.catchup_complete);
+        assert_eq!(state.item_count, 2);
+        assert!(state.ready_for_reconciliation());
+
+        assert_eq!(
+            storage
+                .load_cursor(&provider, &account.subject)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            checkpoint.as_str()
+        );
+        assert_eq!(
+            storage
+                .pending_remote_event_count(&provider, &account.subject)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn catalog_catchup_rolls_back_on_invalid_numeric_item() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let initial = match test_upsert("file-1", Some(10)) {
+            RemoteChange::Upsert(item) => item,
+            _ => unreachable!(),
+        };
+        let fence = ChangeCursor::new("bootstrap-fence").unwrap();
+
+        storage
+            .begin_remote_inventory_staging(&provider, &account.subject)
+            .unwrap();
+        storage
+            .stage_remote_inventory_items(&provider, &account.subject, &[initial], 2)
+            .unwrap();
+        storage
+            .commit_remote_inventory_snapshot(&provider, &account.subject, &fence, 3)
+            .unwrap();
+
+        let old_cursor = ChangeCursor::new("old-poll-cursor").unwrap();
+        storage
+            .commit_remote_changes_and_cursor(
+                &provider,
+                &account.subject,
+                &[test_upsert("journal-old", Some(1))],
+                &old_cursor,
+                4,
+            )
+            .unwrap();
+
+        let valid = test_upsert("file-2", Some(20));
+        let overflow = test_upsert("file-overflow", Some(u64::MAX));
+
+        let result = storage.commit_remote_catalog_catchup(
+            &provider,
+            &account.subject,
+            &fence,
+            &[valid, overflow],
+            &ChangeCursor::new("new-checkpoint").unwrap(),
+            5,
+        );
+
+        assert!(matches!(result, Err(StorageError::NumericOverflow)));
+
+        let state = storage
+            .remote_inventory_state(&provider, &account.subject)
+            .unwrap();
+        assert!(state.snapshot_complete);
+        assert!(!state.catchup_complete);
+        assert_eq!(state.item_count, 1);
+
+        assert_eq!(
+            storage
+                .remote_inventory_count(&provider, &account.subject)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .load_cursor(&provider, &account.subject)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            old_cursor.as_str()
+        );
+        assert_eq!(
+            storage
+                .pending_remote_event_count(&provider, &account.subject)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

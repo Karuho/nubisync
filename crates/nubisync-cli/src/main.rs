@@ -71,6 +71,11 @@ fn run() -> Result<(), CliError> {
         {
             drive_catalog_status()
         }
+        [drive, catalog, catchup]
+            if drive == "drive" && catalog == "catalog" && catchup == "catchup" =>
+        {
+            drive_catalog_catchup()
+        }
         [drive, inventory] if drive == "drive" && inventory == "inventory" => {
             drive_inventory(Some(20))
         }
@@ -110,6 +115,7 @@ USAGE:
   nubisync auth google logout
   nubisync drive changes
   nubisync drive catalog status
+  nubisync drive catalog catchup
   nubisync drive inventory
   nubisync drive inventory --limit <1-10000>
   nubisync drive inventory --full
@@ -296,6 +302,124 @@ fn google_logout() -> Result<(), CliError> {
     println!("REFRESH_TOKEN_REMOVED=yes");
     println!("CLIENT_CONFIG_RETAINED=yes");
     println!("LOCAL_METADATA_RETAINED=yes");
+
+    Ok(())
+}
+
+fn drive_catalog_catchup() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let state = storage.remote_inventory_state(&provider, &account.subject)?;
+
+    if !state.snapshot_complete {
+        println!("DRIVE_CATALOG_CATCHUP=SKIPPED");
+        println!("REASON=snapshot_missing");
+        println!("NETWORK_CHECK=not_performed");
+        println!("REMOTE_EVENTS_MODIFIED=no");
+        println!("PROVIDER_CURSOR_MODIFIED=no");
+        return Ok(());
+    }
+
+    if state.catchup_complete {
+        println!("DRIVE_CATALOG_CATCHUP=SKIPPED");
+        println!("REASON=already_complete");
+        println!("NETWORK_CHECK=not_performed");
+        println!("REMOTE_EVENTS_MODIFIED=no");
+        println!("PROVIDER_CURSOR_MODIFIED=no");
+        return Ok(());
+    }
+
+    let from_cursor = state
+        .catchup_from_cursor
+        .ok_or(CliError::MissingCatalogCatchupCursor)?;
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    let mut continuation = None;
+    let mut seen_continuations = HashSet::new();
+    let mut pages_fetched = 0_u64;
+    let mut collected_changes = Vec::new();
+
+    let checkpoint = loop {
+        if pages_fetched >= 10_000 {
+            return Err(CliError::DriveChangePageLimitExceeded);
+        }
+
+        let page = api.list_changes_page(&from_cursor, continuation.as_ref())?;
+        pages_fetched += 1;
+        collected_changes.extend(page.changes);
+
+        match (page.continuation, page.checkpoint) {
+            (Some(next), None) => {
+                if !seen_continuations.insert(next.as_str().to_owned()) {
+                    return Err(CliError::DriveChangePaginationLoop);
+                }
+                continuation = Some(next);
+            }
+            (None, Some(checkpoint)) => break checkpoint,
+            _ => return Err(CliError::DriveChangeStreamMissingCheckpoint),
+        }
+    };
+
+    let result = storage.commit_remote_catalog_catchup(
+        &provider,
+        &account.subject,
+        &from_cursor,
+        &collected_changes,
+        &checkpoint,
+        unix_time_ms()?,
+    )?;
+
+    let final_state = storage.remote_inventory_state(&provider, &account.subject)?;
+    let staging_items = storage.staged_remote_inventory_count(&provider, &account.subject)?;
+    let state_consistent = final_state.item_count == result.authoritative_items;
+    let ready = final_state.ready_for_reconciliation() && state_consistent && staging_items == 0;
+
+    println!("DRIVE_CATALOG_CATCHUP=PASS");
+    println!("PAGES_FETCHED={pages_fetched}");
+    println!("CHANGES_TOTAL={}", collected_changes.len());
+    println!("CATALOG_CHANGES_APPLIED={}", result.changes_applied);
+    println!("AUTHORITATIVE_ITEMS={}", result.authoritative_items);
+    println!(
+        "REMOTE_EVENTS_SUPERSEDED={}",
+        result.remote_events_superseded
+    );
+    println!("CATCHUP_COMPLETE={}", yes_no(final_state.catchup_complete));
+    println!("STATE_CONSISTENT={}", yes_no(state_consistent));
+    println!("READY_FOR_RECONCILIATION={}", yes_no(ready));
+    println!("PROVIDER_CURSOR_ADVANCED=yes");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+    println!("REMOTE_METADATA_PRINTED=no");
 
     Ok(())
 }
@@ -1014,4 +1138,6 @@ enum CliError {
     Url(#[from] url::ParseError),
     #[error("full inventory completed without its bootstrap change fence")]
     MissingInventoryBootstrapFence,
+    #[error("remote catalog catch-up cursor is missing")]
+    MissingCatalogCatchupCursor,
 }
