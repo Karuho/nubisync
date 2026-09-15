@@ -132,3 +132,26 @@ The normal provider polling cursor is not modified by snapshot promotion.
 
 The bootstrap cursor is local synchronization metadata. It is never printed or
 sent as telemetry. `drive catalog status` reports only whether it exists.
+
+## Phase 4E — Inventory/change classification parity
+
+The Drive inventory and incremental change stream now apply the same support
+boundary for Google-native objects.
+
+Supported:
+
+- ordinary files
+- folders
+
+Ignored on upsert:
+
+- Google Docs/Sheets/Slides and other `application/vnd.google-apps.*` native
+  objects
+- Drive shortcuts
+
+Removed change records are still represented as provider-neutral deletes because
+Drive can omit the metadata needed to classify a removed object. Deleting an ID
+that was never present in the supported baseline is idempotent and harmless.
+
+This prevents a later bootstrap catch-up from introducing provider-native objects
+that the authoritative inventory intentionally excluded.

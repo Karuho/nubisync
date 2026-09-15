@@ -363,11 +363,13 @@ impl ChangeListResponse {
             }
         }
 
-        let changes = self
-            .changes
-            .into_iter()
-            .map(GoogleChange::into_remote_change)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut changes = Vec::new();
+
+        for change in self.changes {
+            if let Some(change) = change.into_remote_change()? {
+                changes.push(change);
+            }
+        }
 
         Ok(ChangePage {
             changes,
@@ -389,7 +391,7 @@ struct GoogleChange {
 }
 
 impl GoogleChange {
-    fn into_remote_change(self) -> Result<RemoteChange, DriveApiError> {
+    fn into_remote_change(self) -> Result<Option<RemoteChange>, DriveApiError> {
         if self.change_type != "file" {
             return Err(DriveApiError::InvalidChangePage {
                 code: "non_file_change",
@@ -403,9 +405,9 @@ impl GoogleChange {
         }
 
         if self.removed {
-            return Ok(RemoteChange::Delete {
+            return Ok(Some(RemoteChange::Delete {
                 remote_id: self.file_id,
-            });
+            }));
         }
 
         let file = self.file.ok_or(DriveApiError::InvalidChangePage {
@@ -424,6 +426,12 @@ impl GoogleChange {
             });
         }
 
+        if file.mime_type != GOOGLE_DRIVE_FOLDER_MIME_TYPE
+            && file.mime_type.starts_with("application/vnd.google-apps.")
+        {
+            return Ok(None);
+        }
+
         let size_bytes = parse_optional_u64(file.size.as_deref(), "file.size")?;
         let parent_remote_id = file.parents.into_iter().next();
         let kind = if file.mime_type == GOOGLE_DRIVE_FOLDER_MIME_TYPE {
@@ -432,7 +440,7 @@ impl GoogleChange {
             RemoteItemKind::File
         };
 
-        Ok(RemoteChange::Upsert(RemoteItem {
+        Ok(Some(RemoteChange::Upsert(RemoteItem {
             remote_id: file.id,
             parent_remote_id,
             name: file.name,
@@ -440,7 +448,7 @@ impl GoogleChange {
             size_bytes,
             modified_unix_ms: None,
             trashed: file.trashed,
-        }))
+        })))
     }
 }
 
@@ -589,6 +597,19 @@ mod tests {
                     removed: true,
                     file: None,
                 },
+                GoogleChange {
+                    change_type: "file".into(),
+                    file_id: "native-1".into(),
+                    removed: false,
+                    file: Some(GoogleFile {
+                        id: "native-1".into(),
+                        name: "Native Doc".into(),
+                        mime_type: "application/vnd.google-apps.document".into(),
+                        parents: vec!["root".into()],
+                        size: None,
+                        trashed: false,
+                    }),
+                },
             ],
         };
 
@@ -611,6 +632,47 @@ mod tests {
             &page.changes[1],
             RemoteChange::Delete { remote_id } if remote_id == "removed-1"
         ));
+    }
+
+    #[test]
+    fn change_page_ignores_google_native_and_shortcut_upserts() {
+        let response = ChangeListResponse {
+            next_page_token: None,
+            new_start_page_token: Some("checkpoint-native".into()),
+            changes: vec![
+                GoogleChange {
+                    change_type: "file".into(),
+                    file_id: "native-doc".into(),
+                    removed: false,
+                    file: Some(GoogleFile {
+                        id: "native-doc".into(),
+                        name: "Document".into(),
+                        mime_type: "application/vnd.google-apps.document".into(),
+                        parents: vec!["root".into()],
+                        size: None,
+                        trashed: false,
+                    }),
+                },
+                GoogleChange {
+                    change_type: "file".into(),
+                    file_id: "shortcut-1".into(),
+                    removed: false,
+                    file: Some(GoogleFile {
+                        id: "shortcut-1".into(),
+                        name: "Shortcut".into(),
+                        mime_type: "application/vnd.google-apps.shortcut".into(),
+                        parents: vec!["root".into()],
+                        size: None,
+                        trashed: false,
+                    }),
+                },
+            ],
+        };
+
+        let page = response.into_change_page().unwrap();
+
+        assert!(page.changes.is_empty());
+        assert_eq!(page.checkpoint.unwrap().as_str(), "checkpoint-native");
     }
 
     #[test]
