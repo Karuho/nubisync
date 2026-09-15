@@ -73,7 +73,16 @@ fn run() -> Result<(), CliError> {
         [sync, roots, add, mode_flag, mode_value]
             if sync == "sync" && roots == "roots" && add == "add" && mode_flag == "--mode" =>
         {
-            sync_roots_add(parse_sync_root_mode(mode_value)?)
+            sync_roots_add(parse_sync_root_mode(mode_value)?, false)
+        }
+        [sync, roots, add, mode_flag, mode_value, dry_run]
+            if sync == "sync"
+                && roots == "roots"
+                && add == "add"
+                && mode_flag == "--mode"
+                && dry_run == "--dry-run" =>
+        {
+            sync_roots_add(parse_sync_root_mode(mode_value)?, true)
         }
         [drive, changes] if drive == "drive" && changes == "changes" => drive_changes(),
         [drive, catalog, status]
@@ -140,6 +149,7 @@ USAGE:
   nubisync auth google logout
   nubisync sync roots status
   nubisync sync roots add --mode receive_only
+  nubisync sync roots add --mode receive_only --dry-run
   nubisync drive changes
   nubisync drive catalog status
   nubisync drive catalog catchup
@@ -369,13 +379,31 @@ fn validate_local_sync_directory(value: &str) -> Result<String, CliError> {
 
     let canonical = fs::canonicalize(path).map_err(|_| CliError::LocalSyncDirectoryUnavailable)?;
 
+    if canonical.parent().is_none() {
+        return Err(CliError::LocalSyncDirectoryFilesystemRootUnsupported);
+    }
+
+    if let Some(home) = env::var_os("HOME")
+        && let Ok(home) = fs::canonicalize(home)
+        && canonical == home
+    {
+        return Err(CliError::LocalSyncDirectoryHomeUnsupported);
+    }
+
+    let mut entries =
+        fs::read_dir(&canonical).map_err(|_| CliError::LocalSyncDirectoryUnavailable)?;
+
+    if entries.next().transpose()?.is_some() {
+        return Err(CliError::LocalSyncDirectoryNotEmpty);
+    }
+
     canonical
         .into_os_string()
         .into_string()
         .map_err(|_| CliError::LocalSyncDirectoryNonUtf8)
 }
 
-fn sync_roots_add(mode: SyncMode) -> Result<(), CliError> {
+fn sync_roots_add(mode: SyncMode, dry_run: bool) -> Result<(), CliError> {
     let local_path_input = prompt_line("Local sync directory (absolute, existing): ")?;
     let remote_root_id = prompt_line("Google Drive folder ID (or root): ")?;
 
@@ -447,6 +475,26 @@ fn sync_roots_add(mode: SyncMode) -> Result<(), CliError> {
         created_at_unix_ms,
     )?;
 
+    if dry_run {
+        let configured_roots = storage.sync_root_count(&provider, &account.subject)?;
+
+        println!("SYNC_ROOT_ADD=DRY_RUN_PASS");
+        println!("MODE={}", mode.as_str());
+        println!("LOCAL_DIRECTORY_VERIFIED=yes");
+        println!("LOCAL_DIRECTORY_EMPTY=yes");
+        println!("REMOTE_ROOT_VERIFIED=yes");
+        println!("SYNC_ROOT_PERSISTED=no");
+        println!("CONFIGURED_ROOTS={configured_roots}");
+        println!("ROOT_PATH_PRINTED=no");
+        println!("REMOTE_ROOT_ID_PRINTED=no");
+        println!("INVENTORY_PERSISTED=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+
+        return Ok(());
+    }
+
     storage.insert_sync_root(&root)?;
 
     let configured_roots = storage.sync_root_count(&provider, &account.subject)?;
@@ -454,6 +502,7 @@ fn sync_roots_add(mode: SyncMode) -> Result<(), CliError> {
     println!("SYNC_ROOT_ADD=PASS");
     println!("MODE={}", mode.as_str());
     println!("LOCAL_DIRECTORY_VERIFIED=yes");
+    println!("LOCAL_DIRECTORY_EMPTY=yes");
     println!("REMOTE_ROOT_VERIFIED=yes");
     println!("SYNC_ROOT_PERSISTED=yes");
     println!("CONFIGURED_ROOTS={configured_roots}");
@@ -1597,6 +1646,26 @@ mod sync_root_cli_tests {
         ));
     }
 
+    #[test]
+    fn local_sync_directory_rejects_filesystem_root_and_non_empty_directory() {
+        assert!(matches!(
+            validate_local_sync_directory("/"),
+            Err(CliError::LocalSyncDirectoryFilesystemRootUnsupported)
+        ));
+
+        let path = temp_test_dir("non-empty");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("existing.txt"), b"existing").unwrap();
+
+        assert!(matches!(
+            validate_local_sync_directory(path.to_str().unwrap()),
+            Err(CliError::LocalSyncDirectoryNotEmpty)
+        ));
+
+        fs::remove_file(path.join("existing.txt")).unwrap();
+        fs::remove_dir(&path).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_sync_directory_rejects_symlink_root() {
@@ -1721,4 +1790,10 @@ enum CliError {
     LocalSyncDirectoryAlreadyRegistered,
     #[error("remote Drive sync root is already registered")]
     RemoteSyncRootAlreadyRegistered,
+    #[error("filesystem root cannot be used as a sync root")]
+    LocalSyncDirectoryFilesystemRootUnsupported,
+    #[error("the user's home directory cannot be used directly as a sync root")]
+    LocalSyncDirectoryHomeUnsupported,
+    #[error("local sync directory must be empty for initial receive-only registration")]
+    LocalSyncDirectoryNotEmpty,
 }

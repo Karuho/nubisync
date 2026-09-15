@@ -321,3 +321,28 @@ until transfer/write semantics exist.
 Registration writes only NubiSync configuration metadata to SQLite. It does not
 scan the tree, download content, mutate the selected local directory, or perform
 a Drive write.
+
+## Phase 4L — Registration dry-run and empty-root safety
+
+Sync-root registration now supports a full validation dry-run:
+
+`nubisync sync roots add --mode receive_only --dry-run`
+
+The command uses the same interactive local-path and remote-ID prompts as real
+registration and performs the same local and Drive validation, but it never
+inserts a `sync_roots` row.
+
+For the current receive-only alpha path, the selected local directory must also
+be empty. This avoids mixing a newly established remote baseline with
+pre-existing local content before conflict and transfer semantics are ready.
+
+The following local roots are rejected:
+
+- the filesystem root
+- the user's home directory itself
+- a symlink used as the selected root
+- a non-directory
+- a non-empty directory
+
+The dry-run performs no local filesystem mutation, no inventory persistence, and
+no Drive write.
