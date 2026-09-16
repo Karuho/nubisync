@@ -1829,6 +1829,22 @@ impl Storage {
         Ok(deleted == 1)
     }
 
+    pub fn delete_sync_root_stale_directory_materialization_receipt(
+        &mut self,
+        sync_root_id: &str,
+        remote_id: &str,
+    ) -> Result<bool, StorageError> {
+        let deleted = self.connection.execute(
+            "DELETE FROM sync_root_directory_materialization_receipts
+             WHERE sync_root_id = ?1
+               AND remote_id = ?2
+               AND receipt_state = 'stale'",
+            params![sync_root_id, remote_id],
+        )?;
+
+        Ok(deleted == 1)
+    }
+
     pub fn record_sync_root_directory_materializations(
         &mut self,
         sync_root_id: &str,
@@ -5357,6 +5373,90 @@ mod phase5c10_directory_receipt_tests {
         assert_eq!(
             storage
                 .sync_root_stale_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase5c12_directory_receipt_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn stale_directory_receipt_cleanup_never_deletes_current_receipt() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5c12-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5c12-root",
+            provider,
+            account.subject,
+            "/tmp/phase5c12-root",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_directory_materialization_receipts (
+                    sync_root_id,
+                    remote_id,
+                    relative_path,
+                    materialized_at_unix_ms,
+                    receipt_state
+                 ) VALUES (?1, 'gone', 'gone', 3, 'stale')",
+                params![root.id],
+            )
+            .unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_directory_materialization_receipts (
+                    sync_root_id,
+                    remote_id,
+                    relative_path,
+                    materialized_at_unix_ms,
+                    receipt_state
+                 ) VALUES (?1, 'live', 'live', 4, 'current')",
+                params![root.id],
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .delete_sync_root_stale_directory_materialization_receipt(&root.id, "gone",)
+                .unwrap()
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+
+        assert!(
+            !storage
+                .delete_sync_root_stale_directory_materialization_receipt(&root.id, "live",)
+                .unwrap()
+        );
+        assert_eq!(
+            storage
+                .sync_root_directory_materialization_receipt_count(&root.id)
                 .unwrap(),
             1
         );

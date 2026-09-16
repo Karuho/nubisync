@@ -12,12 +12,12 @@ use nubisync_core::{
 use nubisync_daemon::{
     SUPERVISED_FILE_DOWNLOAD_MAX_BYTES, adopt_selected_root_existing_directory,
     bootstrap_selected_root_snapshot, collect_selected_root_change_window_page,
-    delete_selected_root_existing_file, execute_completed_selected_root_change_window,
-    materialize_selected_root_directories, materialize_selected_root_missing_file,
-    plan_selected_root_local_materialization, plan_selected_root_remote_deletion,
-    plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
-    replace_selected_root_existing_file, verify_selected_root_existing_file,
-    verify_selected_root_local_receipts,
+    delete_selected_root_existing_directory, delete_selected_root_existing_file,
+    execute_completed_selected_root_change_window, materialize_selected_root_directories,
+    materialize_selected_root_missing_file, plan_selected_root_local_materialization,
+    plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
+    plan_selected_root_remote_replacement, replace_selected_root_existing_file,
+    verify_selected_root_existing_file, verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -170,6 +170,14 @@ fn run() -> Result<(), CliError> {
         {
             sync_roots_directory_deletion_plan()
         }
+        [sync, roots, delete_directory, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && delete_directory == "delete-directory"
+                && approve == "--approve" =>
+        {
+            sync_roots_delete_directory()
+        }
         [sync, roots, deletion_plan, approve]
             if sync == "sync"
                 && roots == "roots"
@@ -283,6 +291,7 @@ USAGE:
   nubisync sync roots replacement-plan --approve
   nubisync sync roots replace-file --approve
   nubisync sync roots directory-deletion-plan --approve
+  nubisync sync roots delete-directory --approve
   nubisync sync roots deletion-plan --approve
   nubisync sync roots delete-file --approve
   nubisync sync roots inventory --limit <1-10000>
@@ -1351,6 +1360,80 @@ fn sync_roots_directory_deletion_plan() -> Result<(), CliError> {
     println!("FILESYSTEM_READ=metadata_only");
     println!("FILESYSTEM_MUTATION=no");
     println!("FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_delete_directory() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_DIRECTORY_DELETION=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    let readiness = plan_selected_root_remote_directory_deletion(&storage, root)?;
+    if !readiness.ready() {
+        return Err(CliError::SyncRootDirectoryDeletionNotReady);
+    }
+
+    let result = delete_selected_root_existing_directory(&mut storage, root)?;
+    let current_directory_receipts =
+        storage.sync_root_directory_materialization_receipt_count(&root.id)?;
+    let stale_directory_receipts =
+        storage.sync_root_stale_directory_materialization_receipt_count(&root.id)?;
+
+    println!("SYNC_ROOT_DIRECTORY_DELETION=PASS");
+    println!("MODE=receive_only");
+    println!("DIRECTORIES_DELETED={}", result.directories_deleted);
+    println!(
+        "EMPTY_DIRECTORY_VERIFIED={}",
+        yes_no(result.empty_directory_verified)
+    );
+    println!("RECEIPT_DELETED={}", yes_no(result.receipt_deleted));
+    println!("QUARANTINE_RENAME={}", yes_no(result.quarantine_rename));
+    println!("CURRENT_DIRECTORY_RECEIPTS={current_directory_receipts}");
+    println!("STALE_DIRECTORY_RECEIPTS={stale_directory_receipts}");
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!("FILESYSTEM_MUTATION=yes");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("FILES_CREATED=0");
+    println!("FILES_DELETED=0");
+    println!("DIRECTORIES_CREATED=0");
+    println!("DIRECTORIES_REMOVED=1");
     println!("ROOT_PATH_PRINTED=no");
     println!("LOCAL_NAMES_PRINTED=no");
     println!("REMOTE_ROOT_ID_PRINTED=no");
@@ -3377,6 +3460,8 @@ enum CliError {
     SyncRootReplacementNotReady,
     #[error("selected receive-only file is not ready for safe deletion")]
     SyncRootDeletionNotReady,
+    #[error("selected receive-only directory is not ready for safe deletion")]
+    SyncRootDirectoryDeletionNotReady,
     #[error("sync root metadata-step currently supports only receive_only roots")]
     SyncRootMetadataStepModeUnsupported,
     #[error("configured sync root does not have a remote root identifier")]

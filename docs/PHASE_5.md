@@ -346,3 +346,31 @@ A later phase must separately implement and owner-validate supervised directory
 deletion.
 
 Phase 5C11 performs no Drive writes.
+
+## Phase 5C12 — Supervised safe local directory deletion
+
+Phase 5C12 adds `nubisync sync roots delete-directory --approve`.
+
+The command requires the Phase 5C11 read-only directory deletion plan to be
+ready. It performs no provider request.
+
+Immediately before mutation NubiSync revalidates that the stale directory receipt
+still resolves to an ordinary, non-symlink, empty directory. It captures Linux
+device/inode identity, atomically renames the exact directory into an
+unpredictable same-parent quarantine path, verifies that the quarantined directory
+is the same inode and is still empty, then removes only that quarantined directory.
+
+The parent directory is fsynced around the destructive step. If removal cannot
+complete, NubiSync attempts to rename the quarantined directory back to its
+original path. The stale directory receipt is deleted from SQLite only after the
+filesystem deletion succeeds. If database cleanup fails after deletion, the stale
+receipt remains so later operations fail closed.
+
+The final postcondition requires an empty authoritative selected-root catalog, an
+empty local selected-root tree, and zero file/directory materialization receipts.
+
+This remains an owner-supervised prototype boundary. Ordinary pathname APIs still
+leave a narrow TOCTOU window; descriptor-relative/openat2/dirfd hardening is
+required before unattended/adversarial destructive operation.
+
+Phase 5C12 performs no Drive writes.
