@@ -74,6 +74,28 @@ impl SelectedRootLocalReceiptVerification {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootRemoteReplacementPlan {
+    pub stale_receipts_total: usize,
+    pub replacement_candidates: usize,
+    pub safe_to_replace: usize,
+    pub local_conflicts: usize,
+    pub files_missing: usize,
+    pub type_conflicts: usize,
+    pub bytes_hashed: u64,
+}
+
+impl SelectedRootRemoteReplacementPlan {
+    pub fn ready(self) -> bool {
+        self.stale_receipts_total == 1
+            && self.replacement_candidates == 1
+            && self.safe_to_replace == 1
+            && self.local_conflicts == 0
+            && self.files_missing == 0
+            && self.type_conflicts == 0
+    }
+}
+
 pub trait SelectedRootContentProvider {
     fn download_file_content(
         &self,
@@ -475,6 +497,105 @@ fn rollback_created_file(path: &Path) -> Result<(), SelectedRootExecutorError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(SelectedRootExecutorError::LocalFileRollbackFailed),
     }
+}
+
+pub fn plan_selected_root_remote_replacement(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootRemoteReplacementPlan, SelectedRootExecutorError> {
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let materialization = plan_receive_only_materialization(&remote_items, &local_entries)?;
+
+    if !materialization.ready_for_directory_phase()
+        || materialization.missing_directories != 0
+        || materialization.missing_files != 0
+        || materialization.matching_directories != materialization.remote_directories
+        || materialization.remote_files != 1
+        || materialization.existing_files_unverified != 1
+    {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanPhaseBlocked);
+    }
+
+    if storage.sync_root_materialization_receipt_count(&sync_root.id)? != 0 {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanCurrentReceiptPresent);
+    }
+
+    let stale_count = storage.sync_root_stale_materialization_receipt_count(&sync_root.id)?;
+    let stale_receipts =
+        storage.list_sync_root_stale_file_materialization_receipts(&sync_root.id)?;
+
+    if stale_count != 1 || stale_receipts.len() != 1 {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanStaleReceiptCountMismatch);
+    }
+
+    let current_targets = plan_receive_only_existing_file_targets(&remote_items, &local_entries)?;
+
+    if current_targets.len() != 1 {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanTargetMismatch);
+    }
+
+    let receipt = stale_receipts
+        .first()
+        .ok_or(SelectedRootExecutorError::RemoteReplacementPlanStaleReceiptCountMismatch)?;
+    let target = current_targets
+        .first()
+        .ok_or(SelectedRootExecutorError::RemoteReplacementPlanTargetMismatch)?;
+
+    if target.remote_id() != receipt.remote_id.as_str()
+        || target.relative_path() != receipt.relative_path.as_str()
+    {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanTargetMismatch);
+    }
+
+    let current_remote_size = target
+        .size_bytes()
+        .ok_or(SelectedRootExecutorError::LocalFileSizeUnknown)?;
+
+    if current_remote_size > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+        return Err(SelectedRootExecutorError::LocalFileTooLarge);
+    }
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let mut result = SelectedRootRemoteReplacementPlan {
+        stale_receipts_total: 1,
+        replacement_candidates: 1,
+        safe_to_replace: 0,
+        local_conflicts: 0,
+        files_missing: 0,
+        type_conflicts: 0,
+        bytes_hashed: 0,
+    };
+
+    match inspect_receipt_target(&root_path, receipt)? {
+        ReceiptTargetInspection::Missing => {
+            result.files_missing = 1;
+        }
+        ReceiptTargetInspection::Conflict => {
+            result.type_conflicts = 1;
+        }
+        ReceiptTargetInspection::File(target_path, observed_size) => {
+            if observed_size != receipt.size_bytes {
+                result.local_conflicts = 1;
+                return Ok(result);
+            }
+
+            if receipt.size_bytes > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+                return Err(SelectedRootExecutorError::LocalFileTooLarge);
+            }
+
+            let (bytes, sha256_hex) =
+                hash_local_file(&target_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES)?;
+            result.bytes_hashed = bytes;
+
+            if bytes == receipt.size_bytes && sha256_hex == receipt.sha256_hex {
+                result.safe_to_replace = 1;
+            } else {
+                result.local_conflicts = 1;
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 pub fn verify_selected_root_local_receipts(
@@ -1696,6 +1817,14 @@ pub enum SelectedRootExecutorError {
     LocalReceiptVerificationCountMismatch,
     #[error("local materialization receipt path is invalid or escaped the root")]
     LocalReceiptPathInvalid,
+    #[error("remote replacement planning is blocked by the current receive-only state")]
+    RemoteReplacementPlanPhaseBlocked,
+    #[error("remote replacement planning requires no current receipt")]
+    RemoteReplacementPlanCurrentReceiptPresent,
+    #[error("remote replacement planning requires exactly one stale receipt")]
+    RemoteReplacementPlanStaleReceiptCountMismatch,
+    #[error("remote replacement planning target does not match the stale baseline")]
+    RemoteReplacementPlanTargetMismatch,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
     #[error("selected-root change window requires an authoritative snapshot")]

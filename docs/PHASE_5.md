@@ -174,3 +174,26 @@ A new successful materialization of the same remote ID replaces the previous
 baseline and returns the receipt to `current`.
 
 Phase 5C5 still does not overwrite or delete an existing local file.
+
+## Phase 5C6 — Safe remote replacement readiness plan
+
+Phase 5C6 adds `nubisync sync roots replacement-plan --approve`.
+
+This is a read-only decision phase. It performs no OAuth refresh, provider
+request, SQLite mutation or filesystem mutation.
+
+The plan requires exactly one stale materialization receipt, no current receipt,
+one current ordinary remote file at the same remote ID and relative path, and a
+clean receive-only topology.
+
+NubiSync hashes the existing local file and compares it with the stale receipt,
+which represents the last locally verified provider version. If the local file
+still matches that baseline, the candidate is classified `SAFE_TO_REPLACE=1`.
+If local bytes changed independently, it reports `LOCAL_CONFLICTS=1`.
+
+The current remote blob is not downloaded in this phase. `READY_TO_REPLACE=yes`
+only means a later supervised replacement operation may download the newer
+provider version without having detected an independent local modification.
+
+Renames, moves, missing local files and filesystem type conflicts fail closed or
+produce a non-ready plan. This phase never overwrites or deletes anything.
