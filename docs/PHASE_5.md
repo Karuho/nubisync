@@ -124,3 +124,27 @@ The command does not modify the filesystem and performs no Drive write.
 `reconcile-plan` remains metadata-only and therefore still reports existing
 files as unverified by that planner while separately exposing the durable
 materialization receipt count.
+
+## Phase 5C4 — Offline local verification against durable receipts
+
+Phase 5C4 adds:
+
+`nubisync sync roots verify-local --approve`
+
+The command performs no OAuth refresh and no provider request. It reads the
+durable materialization receipts from SQLite and compares local regular files
+against the recorded size and SHA-256 values.
+
+Receipt paths are treated as untrusted durable data at the filesystem boundary.
+Each path is walked component by component below the canonical configured root.
+Missing components are reported as missing; symlinks and non-file type changes
+are reported as type conflicts; root escapes are rejected.
+
+The command is read-only with respect to both SQLite and the filesystem. It
+prints only aggregate counters and never prints local paths, names, remote IDs,
+or SHA-256 values.
+
+A matching receipt means the local file still matches the content NubiSync
+previously verified/materialized. It does not independently prove that the
+provider has not changed since the receipt was recorded; provider-side catalog
+changes invalidate receipts when they are durably applied.

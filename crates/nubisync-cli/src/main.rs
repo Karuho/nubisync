@@ -14,6 +14,7 @@ use nubisync_daemon::{
     collect_selected_root_change_window_page, execute_completed_selected_root_change_window,
     materialize_selected_root_directories, materialize_selected_root_missing_file,
     plan_selected_root_local_materialization, verify_selected_root_existing_file,
+    verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -126,6 +127,14 @@ fn run() -> Result<(), CliError> {
         {
             sync_roots_verify_file()
         }
+        [sync, roots, verify_local, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && verify_local == "verify-local"
+                && approve == "--approve" =>
+        {
+            sync_roots_verify_local()
+        }
         [sync, roots, inventory, limit, value]
             if sync == "sync"
                 && roots == "roots"
@@ -218,6 +227,7 @@ USAGE:
   nubisync sync roots materialize-directories --approve
   nubisync sync roots materialize-file --approve
   nubisync sync roots verify-file --approve
+  nubisync sync roots verify-local --approve
   nubisync sync roots inventory --limit <1-10000>
   nubisync sync roots add --mode receive_only
   nubisync sync roots add --mode receive_only --dry-run
@@ -912,6 +922,71 @@ fn sync_roots_verify_file() -> Result<(), CliError> {
     println!("HASH_VALUE_PRINTED=no");
     println!("TOKEN_VALUES_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=no");
+    Ok(())
+}
+
+fn sync_roots_verify_local() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_LOCAL_RECEIPT_VERIFICATION=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("LOCAL_FILE_CONTENT_ACCESSED=no");
+        println!("REMOTE_FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    let result = verify_selected_root_local_receipts(&storage, root)?;
+
+    println!("SYNC_ROOT_LOCAL_RECEIPT_VERIFICATION=PASS");
+    println!("MODE=receive_only");
+    println!("RECEIPTS_TOTAL={}", result.receipts_total);
+    println!("FILES_MATCHING_RECEIPT={}", result.files_matching_receipt);
+    println!(
+        "FILES_MODIFIED_SINCE_RECEIPT={}",
+        result.files_modified_since_receipt
+    );
+    println!("FILES_MISSING={}", result.files_missing);
+    println!("TYPE_CONFLICTS={}", result.type_conflicts);
+    println!("BYTES_HASHED={}", result.bytes_hashed);
+    println!("ALL_RECEIPTS_MATCH={}", yes_no(result.all_receipts_match()));
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=no");
+    println!("FILESYSTEM_READ=file_content");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("LOCAL_FILE_CONTENT_ACCESSED=yes");
+    println!("REMOTE_FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
     Ok(())
 }
 

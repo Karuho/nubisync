@@ -8,6 +8,7 @@ use nubisync_core::{
 use nubisync_drive::{DriveApiError, DriveFolderRoot, DriveRootMembership, GoogleDriveApi};
 use nubisync_storage::{
     Storage, StorageError, SyncRootCatalogBatchCommit, SyncRootCatalogMutation,
+    SyncRootFileMaterializationReceipt,
 };
 use nubisync_sync::{
     LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyDirectoryTarget, ReceiveOnlyFileTarget,
@@ -21,7 +22,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fs,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 use thiserror::Error;
@@ -51,6 +52,26 @@ pub struct SelectedRootFileVerification {
     pub bytes_verified: u64,
     pub hash_match: bool,
     pub receipt_recorded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootLocalReceiptVerification {
+    pub receipts_total: usize,
+    pub files_matching_receipt: usize,
+    pub files_modified_since_receipt: usize,
+    pub files_missing: usize,
+    pub type_conflicts: usize,
+    pub bytes_hashed: u64,
+}
+
+impl SelectedRootLocalReceiptVerification {
+    pub fn all_receipts_match(self) -> bool {
+        self.receipts_total > 0
+            && self.files_matching_receipt == self.receipts_total
+            && self.files_modified_since_receipt == 0
+            && self.files_missing == 0
+            && self.type_conflicts == 0
+    }
 }
 
 pub trait SelectedRootContentProvider {
@@ -454,6 +475,160 @@ fn rollback_created_file(path: &Path) -> Result<(), SelectedRootExecutorError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(SelectedRootExecutorError::LocalFileRollbackFailed),
     }
+}
+
+pub fn verify_selected_root_local_receipts(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootLocalReceiptVerification, SelectedRootExecutorError> {
+    if sync_root.mode != nubisync_core::SyncMode::ReceiveOnly {
+        return Err(SelectedRootExecutorError::LocalPlanModeUnsupported);
+    }
+
+    let receipt_count = storage.sync_root_materialization_receipt_count(&sync_root.id)?;
+    if receipt_count > 100_000 {
+        return Err(SelectedRootExecutorError::LocalReceiptVerificationSafetyLimitExceeded);
+    }
+
+    let receipts = storage.list_sync_root_file_materialization_receipts(&sync_root.id)?;
+    let receipt_len =
+        u64::try_from(receipts.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+
+    if receipt_len != receipt_count {
+        return Err(SelectedRootExecutorError::LocalReceiptVerificationCountMismatch);
+    }
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let mut result = SelectedRootLocalReceiptVerification {
+        receipts_total: receipts.len(),
+        files_matching_receipt: 0,
+        files_modified_since_receipt: 0,
+        files_missing: 0,
+        type_conflicts: 0,
+        bytes_hashed: 0,
+    };
+
+    for receipt in &receipts {
+        match inspect_receipt_target(&root_path, receipt)? {
+            ReceiptTargetInspection::Missing => {
+                result.files_missing = result
+                    .files_missing
+                    .checked_add(1)
+                    .ok_or(SelectedRootExecutorError::CountOverflow)?;
+            }
+            ReceiptTargetInspection::Conflict => {
+                result.type_conflicts = result
+                    .type_conflicts
+                    .checked_add(1)
+                    .ok_or(SelectedRootExecutorError::CountOverflow)?;
+            }
+            ReceiptTargetInspection::File(target_path, observed_size) => {
+                if observed_size != receipt.size_bytes {
+                    result.files_modified_since_receipt = result
+                        .files_modified_since_receipt
+                        .checked_add(1)
+                        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+                    continue;
+                }
+
+                if receipt.size_bytes > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+                    return Err(SelectedRootExecutorError::LocalFileTooLarge);
+                }
+
+                let (bytes, sha256_hex) =
+                    hash_local_file(&target_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES)?;
+
+                result.bytes_hashed = result
+                    .bytes_hashed
+                    .checked_add(bytes)
+                    .ok_or(SelectedRootExecutorError::CountOverflow)?;
+
+                if bytes == receipt.size_bytes && sha256_hex == receipt.sha256_hex {
+                    result.files_matching_receipt = result
+                        .files_matching_receipt
+                        .checked_add(1)
+                        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+                } else {
+                    result.files_modified_since_receipt = result
+                        .files_modified_since_receipt
+                        .checked_add(1)
+                        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+enum ReceiptTargetInspection {
+    Missing,
+    Conflict,
+    File(PathBuf, u64),
+}
+
+fn inspect_receipt_target(
+    root_path: &Path,
+    receipt: &SyncRootFileMaterializationReceipt,
+) -> Result<ReceiptTargetInspection, SelectedRootExecutorError> {
+    let relative = Path::new(&receipt.relative_path);
+
+    if relative.is_absolute() {
+        return Err(SelectedRootExecutorError::LocalReceiptPathInvalid);
+    }
+
+    let mut current = root_path.to_path_buf();
+    let mut components = relative.components().peekable();
+
+    if components.peek().is_none() {
+        return Err(SelectedRootExecutorError::LocalReceiptPathInvalid);
+    }
+
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(SelectedRootExecutorError::LocalReceiptPathInvalid);
+        };
+
+        current.push(name);
+        if !current.starts_with(root_path) {
+            return Err(SelectedRootExecutorError::LocalReceiptPathInvalid);
+        }
+
+        let is_last = components.peek().is_none();
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ReceiptTargetInspection::Missing);
+            }
+            Err(_) => {
+                return Err(SelectedRootExecutorError::LocalFilesystemInspectionFailed);
+            }
+        };
+
+        if metadata.file_type().is_symlink() {
+            return Ok(ReceiptTargetInspection::Conflict);
+        }
+
+        if is_last {
+            return if metadata.is_file() {
+                Ok(ReceiptTargetInspection::File(current, metadata.len()))
+            } else {
+                Ok(ReceiptTargetInspection::Conflict)
+            };
+        }
+
+        if !metadata.is_dir() {
+            return Ok(ReceiptTargetInspection::Conflict);
+        }
+
+        let canonical = fs::canonicalize(&current)
+            .map_err(|_| SelectedRootExecutorError::LocalFilesystemInspectionFailed)?;
+        if !canonical.starts_with(root_path) {
+            return Err(SelectedRootExecutorError::LocalReceiptPathInvalid);
+        }
+    }
+
+    Err(SelectedRootExecutorError::LocalReceiptPathInvalid)
 }
 
 pub fn verify_selected_root_existing_file<P: SelectedRootContentProvider>(
@@ -1515,6 +1690,12 @@ pub enum SelectedRootExecutorError {
     LocalFileHashMismatch,
     #[error("system clock is before the Unix epoch")]
     ClockBeforeUnixEpoch,
+    #[error("local receipt verification exceeded its safety limit")]
+    LocalReceiptVerificationSafetyLimitExceeded,
+    #[error("local receipt verification durable count did not match loaded receipts")]
+    LocalReceiptVerificationCountMismatch,
+    #[error("local materialization receipt path is invalid or escaped the root")]
+    LocalReceiptPathInvalid,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
     #[error("selected-root change window requires an authoritative snapshot")]
@@ -1737,6 +1918,44 @@ mod tests {
         assert!(root.join("second").is_file());
 
         std::fs::remove_file(root.join("second")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_target_inspection_detects_file_missing_and_type_conflict() {
+        let root = local_plan_temp_dir("receipt-target-inspection");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/file.txt"), b"hello").unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+
+        let receipt = nubisync_storage::SyncRootFileMaterializationReceipt {
+            remote_id: "remote".into(),
+            relative_path: "docs/file.txt".into(),
+            size_bytes: 5,
+            sha256_hex: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
+            materialized_at_unix_ms: 1,
+        };
+
+        match inspect_receipt_target(&root, &receipt).unwrap() {
+            ReceiptTargetInspection::File(_, size) => assert_eq!(size, 5),
+            _ => panic!("expected file"),
+        }
+
+        std::fs::remove_file(root.join("docs/file.txt")).unwrap();
+        assert!(matches!(
+            inspect_receipt_target(&root, &receipt).unwrap(),
+            ReceiptTargetInspection::Missing
+        ));
+
+        std::fs::create_dir(root.join("docs/file.txt")).unwrap();
+        assert!(matches!(
+            inspect_receipt_target(&root, &receipt).unwrap(),
+            ReceiptTargetInspection::Conflict
+        ));
+
+        std::fs::remove_dir(root.join("docs/file.txt")).unwrap();
+        std::fs::remove_dir(root.join("docs")).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
 

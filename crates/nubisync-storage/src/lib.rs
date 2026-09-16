@@ -1584,6 +1584,50 @@ impl Storage {
         Ok(())
     }
 
+    pub fn list_sync_root_file_materialization_receipts(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<Vec<SyncRootFileMaterializationReceipt>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                remote_id,
+                relative_path,
+                size_bytes,
+                sha256_hex,
+                materialized_at_unix_ms
+             FROM sync_root_file_materialization_receipts
+             WHERE sync_root_id = ?1
+             ORDER BY remote_id",
+        )?;
+
+        let rows = statement.query_map(params![sync_root_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+
+        let mut receipts = Vec::new();
+        for row in rows {
+            let (remote_id, relative_path, size_bytes, sha256_hex, materialized_at_unix_ms) = row?;
+
+            validate_materialization_receipt_values(&remote_id, &relative_path, &sha256_hex)?;
+
+            receipts.push(SyncRootFileMaterializationReceipt {
+                remote_id,
+                relative_path,
+                size_bytes: u64::try_from(size_bytes).map_err(|_| StorageError::NumericOverflow)?,
+                sha256_hex,
+                materialized_at_unix_ms,
+            });
+        }
+
+        Ok(receipts)
+    }
+
     pub fn sync_root_materialization_receipt_count(
         &self,
         sync_root_id: &str,
