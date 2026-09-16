@@ -640,6 +640,30 @@ pub fn plan_receive_only_missing_file_targets(
 
 type RemoteExpectedPath = (String, RemoteItemKind, String, Option<u64>);
 
+pub fn plan_receive_only_existing_file_targets(
+    remote_items: &[RemoteItem],
+    local_entries: &[LocalTreeEntry],
+) -> Result<Vec<ReceiveOnlyFileTarget>, ReceiveOnlyMaterializationPlanError> {
+    let _ = plan_receive_only_materialization(remote_items, local_entries)?;
+    let local_files = local_entries
+        .iter()
+        .filter(|entry| entry.kind == LocalTreeEntryKind::File)
+        .map(LocalTreeEntry::relative_path)
+        .collect::<HashSet<_>>();
+
+    Ok(build_remote_expected_paths(remote_items)?
+        .into_iter()
+        .filter_map(|(relative_path, kind, remote_id, size_bytes)| {
+            (kind == RemoteItemKind::File && local_files.contains(relative_path.as_str()))
+                .then_some(ReceiveOnlyFileTarget {
+                    remote_id,
+                    relative_path,
+                    size_bytes,
+                })
+        })
+        .collect())
+}
+
 fn build_remote_expected_paths(
     remote_items: &[RemoteItem],
 ) -> Result<Vec<RemoteExpectedPath>, ReceiveOnlyMaterializationPlanError> {

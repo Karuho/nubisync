@@ -17,3 +17,4 @@ nubisync-drive = { path = "../nubisync-drive" }
 nubisync-storage = { path = "../nubisync-storage" }
 nubisync-sync = { path = "../nubisync-sync" }
 thiserror.workspace = true
+sha2.workspace = true

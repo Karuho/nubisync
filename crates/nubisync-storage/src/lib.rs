@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
@@ -65,6 +65,28 @@ pub struct SyncRootChangeWindowState {
 impl SyncRootChangeWindowState {
     pub fn is_complete(&self) -> bool {
         self.continuation.is_none() && self.checkpoint.is_some()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SyncRootFileMaterializationReceipt {
+    pub remote_id: String,
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub sha256_hex: String,
+    pub materialized_at_unix_ms: i64,
+}
+
+impl std::fmt::Debug for SyncRootFileMaterializationReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SyncRootFileMaterializationReceipt")
+            .field("remote_id", &"[redacted]")
+            .field("relative_path", &"[redacted]")
+            .field("size_bytes", &self.size_bytes)
+            .field("sha256_hex", &"[redacted]")
+            .field("materialized_at_unix_ms", &self.materialized_at_unix_ms)
+            .finish()
     }
 }
 
@@ -325,6 +347,21 @@ impl Storage {
                 PRIMARY KEY (sync_root_id, token),
                 FOREIGN KEY (sync_root_id)
                     REFERENCES sync_roots(id) ON DELETE CASCADE
+            );
+
+
+            CREATE TABLE IF NOT EXISTS sync_root_file_materialization_receipts (
+                sync_root_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+                sha256_hex TEXT NOT NULL CHECK (length(sha256_hex) = 64),
+                materialized_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (sync_root_id, remote_id),
+                UNIQUE (sync_root_id, relative_path),
+                FOREIGN KEY (sync_root_id, remote_id)
+                    REFERENCES sync_root_remote_items(sync_root_id, remote_id)
+                    ON DELETE CASCADE
             );
             ",
         )?;
@@ -1491,6 +1528,74 @@ impl Storage {
         })
     }
 
+    pub fn record_sync_root_file_materialization(
+        &mut self,
+        sync_root_id: &str,
+        remote_id: &str,
+        relative_path: &str,
+        size_bytes: u64,
+        sha256_hex: &str,
+        materialized_at_unix_ms: i64,
+    ) -> Result<(), StorageError> {
+        validate_materialization_receipt_values(remote_id, relative_path, sha256_hex)?;
+
+        let size_bytes_i64 =
+            i64::try_from(size_bytes).map_err(|_| StorageError::NumericOverflow)?;
+        let transaction = self.connection.transaction()?;
+
+        let remote: Option<(String, Option<i64>, i64)> = transaction
+            .query_row(
+                "SELECT item_kind, size_bytes, trashed
+                 FROM sync_root_remote_items
+                 WHERE sync_root_id = ?1 AND remote_id = ?2",
+                params![sync_root_id, remote_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((item_kind, durable_size, trashed)) = remote else {
+            return Err(StorageError::MaterializationReceiptRemoteItemMissing);
+        };
+
+        if item_kind != "file" || trashed != 0 || durable_size != Some(size_bytes_i64) {
+            return Err(StorageError::MaterializationReceiptRemoteItemMismatch);
+        }
+
+        transaction.execute(
+            "INSERT INTO sync_root_file_materialization_receipts (
+                sync_root_id, remote_id, relative_path, size_bytes, sha256_hex, materialized_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(sync_root_id, remote_id) DO UPDATE SET
+                relative_path = excluded.relative_path,
+                size_bytes = excluded.size_bytes,
+                sha256_hex = excluded.sha256_hex,
+                materialized_at_unix_ms = excluded.materialized_at_unix_ms",
+            params![
+                sync_root_id,
+                remote_id,
+                relative_path,
+                size_bytes_i64,
+                sha256_hex,
+                materialized_at_unix_ms
+            ],
+        )?;
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn sync_root_materialization_receipt_count(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM sync_root_file_materialization_receipts WHERE sync_root_id = ?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
     pub fn sync_root_change_cursor(
         &self,
         sync_root_id: &str,
@@ -1993,12 +2098,59 @@ impl Storage {
     }
 }
 
+fn validate_materialization_receipt_values(
+    remote_id: &str,
+    relative_path: &str,
+    sha256_hex: &str,
+) -> Result<(), StorageError> {
+    if remote_id.trim().is_empty()
+        || relative_path.is_empty()
+        || relative_path.starts_with('/')
+        || relative_path.ends_with('/')
+        || relative_path.contains('\0')
+        || relative_path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        || sha256_hex.len() != 64
+        || !sha256_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StorageError::InvalidMaterializationReceipt);
+    }
+    Ok(())
+}
+
+fn invalidate_sync_root_materialization_subtree(
+    transaction: &Transaction<'_>,
+    sync_root_id: &str,
+    remote_id: &str,
+) -> Result<(), StorageError> {
+    transaction.execute(
+        "WITH RECURSIVE subtree(remote_id) AS (
+            SELECT ?2
+            UNION
+            SELECT child.remote_id
+            FROM sync_root_remote_items AS child
+            INNER JOIN subtree AS parent ON child.parent_remote_id = parent.remote_id
+            WHERE child.sync_root_id = ?1
+         )
+         DELETE FROM sync_root_file_materialization_receipts
+         WHERE sync_root_id = ?1
+           AND remote_id IN (SELECT remote_id FROM subtree)",
+        params![sync_root_id, remote_id],
+    )?;
+    Ok(())
+}
+
 fn upsert_sync_root_catalog_item(
     transaction: &Transaction<'_>,
     sync_root_id: &str,
     item: &RemoteItem,
     observed_at_unix_ms: i64,
 ) -> Result<(), StorageError> {
+    invalidate_sync_root_materialization_subtree(transaction, sync_root_id, &item.remote_id)?;
+
     let item_kind = match item.kind {
         RemoteItemKind::File => "file",
         RemoteItemKind::Folder => "folder",
@@ -2047,6 +2199,8 @@ fn delete_sync_root_subtree_in_transaction(
     sync_root_id: &str,
     remote_id: &str,
 ) -> Result<usize, StorageError> {
+    invalidate_sync_root_materialization_subtree(transaction, sync_root_id, remote_id)?;
+
     let deleted = transaction.execute(
         "WITH RECURSIVE subtree(remote_id) AS (
             SELECT ?2
@@ -2364,6 +2518,12 @@ fn insert_remote_upsert(
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("materialization receipt contains invalid values")]
+    InvalidMaterializationReceipt,
+    #[error("materialization receipt remote item is missing")]
+    MaterializationReceiptRemoteItemMissing,
+    #[error("materialization receipt does not match durable remote file metadata")]
+    MaterializationReceiptRemoteItemMismatch,
     #[error("SQLite operation failed")]
     Sqlite(#[from] rusqlite::Error),
     #[error("stored NubiSync domain value is invalid")]
@@ -2523,7 +2683,7 @@ mod tests {
         storage.configure().unwrap();
         storage.migrate().unwrap();
 
-        assert_eq!(storage.schema_version().unwrap(), 8);
+        assert_eq!(storage.schema_version().unwrap(), 9);
 
         let has_change_cursor: bool = storage
             .connection
@@ -2628,7 +2788,7 @@ mod tests {
     #[test]
     fn root_scoped_catalogs_isolate_identical_remote_ids() {
         let mut storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 8);
+        assert_eq!(storage.schema_version().unwrap(), 9);
 
         let provider = ProviderId::new("google-drive").unwrap();
         let account = test_account(&provider);

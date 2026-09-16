@@ -103,3 +103,24 @@ not local names/paths, remote IDs/metadata, or OAuth token values.
 
 Descriptor-relative/openat-style filesystem race hardening remains required
 before unattended/background materialization.
+
+## Phase 5C3 — Durable file materialization receipts
+
+Phase 5C3 introduces SQLite schema v9 and durable SHA-256 materialization
+receipts. A receipt binds a selected-root remote file to its expected relative
+path, durable byte size, SHA-256 digest, and materialization timestamp.
+
+Future `materialize-file` runs hash bytes while streaming and persist the
+receipt only after no-overwrite promotion and postconditions succeed. Selected-
+root catalog upserts/deletes invalidate affected receipts transactionally; the
+invalidation is subtree-aware so folder moves/renames also invalidate descendant
+file receipts.
+
+For the file downloaded in Phase 5C2, `sync roots verify-file --approve` hashes
+the existing local file and streams the current remote blob into a SHA-256 sink.
+It requires exact byte count and digest equality before recording the receipt.
+The command does not modify the filesystem and performs no Drive write.
+
+`reconcile-plan` remains metadata-only and therefore still reports existing
+files as unverified by that planner while separately exposing the durable
+materialization receipt count.

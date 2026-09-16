@@ -13,13 +13,14 @@ use nubisync_sync::{
     LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyDirectoryTarget, ReceiveOnlyFileTarget,
     ReceiveOnlyMaterializationPlan, ReceiveOnlyMaterializationPlanError, RootCatalogMutationPlan,
     RootCatalogProjection, RootCatalogProjectionError, RootCatalogResolution, RootChangeMembership,
-    plan_receive_only_directory_targets, plan_receive_only_materialization,
-    plan_receive_only_missing_file_targets,
+    plan_receive_only_directory_targets, plan_receive_only_existing_file_targets,
+    plan_receive_only_materialization, plan_receive_only_missing_file_targets,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashSet, VecDeque},
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -42,6 +43,14 @@ pub struct SelectedRootFileMaterialization {
     pub bytes_downloaded: u64,
     pub max_file_bytes: u64,
     pub size_match_verified: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootFileVerification {
+    pub files_verified: usize,
+    pub bytes_verified: u64,
+    pub hash_match: bool,
+    pub receipt_recorded: bool,
 }
 
 pub trait SelectedRootContentProvider {
@@ -126,7 +135,7 @@ pub fn materialize_selected_root_directories(
 
 pub fn materialize_selected_root_missing_file<P: SelectedRootContentProvider>(
     provider: &P,
-    storage: &Storage,
+    storage: &mut Storage,
     sync_root: &SyncRoot,
 ) -> Result<SelectedRootFileMaterialization, SelectedRootExecutorError> {
     let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
@@ -173,6 +182,15 @@ pub fn materialize_selected_root_missing_file<P: SelectedRootContentProvider>(
         {
             return Err(SelectedRootExecutorError::LocalFilePostconditionFailed);
         }
+        storage.record_sync_root_file_materialization(
+            &sync_root.id,
+            target.remote_id(),
+            target.relative_path(),
+            expected_size,
+            &outcome.sha256_hex,
+            current_unix_time_ms()?,
+        )?;
+
         Ok(SelectedRootFileMaterialization {
             files_downloaded: 1,
             bytes_downloaded: outcome.bytes_downloaded,
@@ -193,6 +211,7 @@ pub fn materialize_selected_root_missing_file<P: SelectedRootContentProvider>(
 struct FileApplyOutcome {
     target_path: PathBuf,
     bytes_downloaded: u64,
+    sha256_hex: String,
 }
 
 fn apply_selected_root_file_target<P: SelectedRootContentProvider>(
@@ -233,14 +252,28 @@ fn apply_selected_root_file_target<P: SelectedRootContentProvider>(
     }
 
     let (temp_path, mut temp_file) = create_download_temp(parent)?;
-    let bytes = match provider.download_file_content(target.remote_id(), max_bytes, &mut temp_file)
-    {
-        Ok(bytes) => bytes,
-        Err(error) => {
+    let (bytes, sha256_hex) = {
+        let mut hashing_writer = HashingWriter::new(&mut temp_file);
+        let provider_bytes = match provider.download_file_content(
+            target.remote_id(),
+            max_bytes,
+            &mut hashing_writer,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                drop(temp_file);
+                cleanup_temp_file(&temp_path)?;
+                return Err(error);
+            }
+        };
+        let hashed_bytes = hashing_writer.bytes_written();
+        let sha256_hex = hashing_writer.finish_hex();
+        if provider_bytes != hashed_bytes {
             drop(temp_file);
             cleanup_temp_file(&temp_path)?;
-            return Err(error);
+            return Err(SelectedRootExecutorError::LocalFileProviderByteCountMismatch);
         }
+        (provider_bytes, sha256_hex)
     };
     if bytes != expected_size {
         drop(temp_file);
@@ -286,7 +319,100 @@ fn apply_selected_root_file_target<P: SelectedRootContentProvider>(
     Ok(FileApplyOutcome {
         target_path,
         bytes_downloaded: bytes,
+        sha256_hex,
     })
+}
+
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+    bytes_written: u64,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes_written: 0,
+        }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    fn finish_hex(self) -> String {
+        digest_to_hex(self.hasher.finalize().as_slice())
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(written as u64)
+            .ok_or_else(|| std::io::Error::other("NubiSync hash byte counter overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn digest_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn hash_local_file(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(u64, String), SelectedRootExecutorError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| SelectedRootExecutorError::LocalFileVerifyFailed)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(SelectedRootExecutorError::LocalFileVerifyFailed);
+    }
+
+    let mut file =
+        fs::File::open(path).map_err(|_| SelectedRootExecutorError::LocalFileVerifyFailed)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| SelectedRootExecutorError::LocalFileVerifyFailed)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or(SelectedRootExecutorError::CountOverflow)?;
+        if total > max_bytes {
+            return Err(SelectedRootExecutorError::LocalFileTooLarge);
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok((total, digest_to_hex(hasher.finalize().as_slice())))
+}
+
+fn current_unix_time_ms() -> Result<i64, SelectedRootExecutorError> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| SelectedRootExecutorError::ClockBeforeUnixEpoch)?;
+    i64::try_from(duration.as_millis()).map_err(|_| SelectedRootExecutorError::CountOverflow)
 }
 
 fn create_download_temp(parent: &Path) -> Result<(PathBuf, fs::File), SelectedRootExecutorError> {
@@ -328,6 +454,94 @@ fn rollback_created_file(path: &Path) -> Result<(), SelectedRootExecutorError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(SelectedRootExecutorError::LocalFileRollbackFailed),
     }
+}
+
+pub fn verify_selected_root_existing_file<P: SelectedRootContentProvider>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootFileVerification, SelectedRootExecutorError> {
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let plan = plan_receive_only_materialization(&remote_items, &local_entries)?;
+
+    if !plan.ready_for_directory_phase()
+        || plan.missing_directories != 0
+        || plan.missing_files != 0
+        || plan.matching_directories != plan.remote_directories
+        || plan.existing_files_unverified != 1
+        || plan.remote_files != 1
+    {
+        return Err(SelectedRootExecutorError::LocalFileVerificationPhaseBlocked);
+    }
+
+    let targets = plan_receive_only_existing_file_targets(&remote_items, &local_entries)?;
+    if targets.len() != 1 {
+        return Err(SelectedRootExecutorError::LocalFileTargetCountMismatch);
+    }
+    let target = targets
+        .first()
+        .ok_or(SelectedRootExecutorError::LocalFileTargetCountMismatch)?;
+    let expected_size = target
+        .size_bytes()
+        .ok_or(SelectedRootExecutorError::LocalFileSizeUnknown)?;
+    if expected_size > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+        return Err(SelectedRootExecutorError::LocalFileTooLarge);
+    }
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let target_path = root_path.join(target.relative_path());
+    if !target_path.starts_with(&root_path) {
+        return Err(SelectedRootExecutorError::LocalFileTargetEscapedRoot);
+    }
+
+    let parent = target_path
+        .parent()
+        .ok_or(SelectedRootExecutorError::LocalFileParentInvalid)?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|_| SelectedRootExecutorError::LocalFileParentInvalid)?;
+    if !canonical_parent.starts_with(&root_path) {
+        return Err(SelectedRootExecutorError::LocalFileParentInvalid);
+    }
+
+    let (local_bytes, local_sha256) =
+        hash_local_file(&target_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES)?;
+    if local_bytes != expected_size {
+        return Err(SelectedRootExecutorError::LocalFileDownloadSizeMismatch);
+    }
+
+    let mut remote_sink = HashingWriter::new(std::io::sink());
+    let provider_bytes = provider.download_file_content(
+        target.remote_id(),
+        SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
+        &mut remote_sink,
+    )?;
+    let hashed_bytes = remote_sink.bytes_written();
+    let remote_sha256 = remote_sink.finish_hex();
+    if provider_bytes != hashed_bytes {
+        return Err(SelectedRootExecutorError::LocalFileProviderByteCountMismatch);
+    }
+    if provider_bytes != expected_size {
+        return Err(SelectedRootExecutorError::LocalFileDownloadSizeMismatch);
+    }
+    if local_sha256 != remote_sha256 {
+        return Err(SelectedRootExecutorError::LocalFileHashMismatch);
+    }
+
+    storage.record_sync_root_file_materialization(
+        &sync_root.id,
+        target.remote_id(),
+        target.relative_path(),
+        expected_size,
+        &local_sha256,
+        current_unix_time_ms()?,
+    )?;
+
+    Ok(SelectedRootFileVerification {
+        files_verified: 1,
+        bytes_verified: expected_size,
+        hash_match: true,
+        receipt_recorded: true,
+    })
 }
 
 fn selected_root_materialization_inputs(
@@ -1291,6 +1505,16 @@ pub enum SelectedRootExecutorError {
     LocalFilePostconditionFailed,
     #[error("local file materialization rollback failed")]
     LocalFileRollbackFailed,
+    #[error("provider byte count disagreed with the bytes hashed locally")]
+    LocalFileProviderByteCountMismatch,
+    #[error("local file verification is blocked by the current receive-only state")]
+    LocalFileVerificationPhaseBlocked,
+    #[error("local file verification failed")]
+    LocalFileVerifyFailed,
+    #[error("local file SHA-256 does not match current remote content")]
+    LocalFileHashMismatch,
+    #[error("system clock is before the Unix epoch")]
+    ClockBeforeUnixEpoch,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
     #[error("selected-root change window requires an authoritative snapshot")]

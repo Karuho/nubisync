@@ -13,7 +13,7 @@ use nubisync_daemon::{
     SUPERVISED_FILE_DOWNLOAD_MAX_BYTES, bootstrap_selected_root_snapshot,
     collect_selected_root_change_window_page, execute_completed_selected_root_change_window,
     materialize_selected_root_directories, materialize_selected_root_missing_file,
-    plan_selected_root_local_materialization,
+    plan_selected_root_local_materialization, verify_selected_root_existing_file,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -118,6 +118,14 @@ fn run() -> Result<(), CliError> {
         {
             sync_roots_materialize_file()
         }
+        [sync, roots, verify_file, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && verify_file == "verify-file"
+                && approve == "--approve" =>
+        {
+            sync_roots_verify_file()
+        }
         [sync, roots, inventory, limit, value]
             if sync == "sync"
                 && roots == "roots"
@@ -209,6 +217,7 @@ USAGE:
   nubisync sync roots reconcile-plan --approve
   nubisync sync roots materialize-directories --approve
   nubisync sync roots materialize-file --approve
+  nubisync sync roots verify-file --approve
   nubisync sync roots inventory --limit <1-10000>
   nubisync sync roots add --mode receive_only
   nubisync sync roots add --mode receive_only --dry-run
@@ -616,6 +625,7 @@ fn sync_roots_reconcile_plan() -> Result<(), CliError> {
         .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
 
     let plan = plan_selected_root_local_materialization(&storage, &root)?;
+    let receipt_count = storage.sync_root_materialization_receipt_count(&root.id)?;
 
     println!("SYNC_ROOT_RECONCILE_PLAN=PASS");
     println!("MODE=receive_only");
@@ -632,6 +642,7 @@ fn sync_roots_reconcile_plan() -> Result<(), CliError> {
     );
     println!("LOCAL_ONLY_ENTRIES={}", plan.local_only_entries);
     println!("TYPE_CONFLICTS={}", plan.type_conflicts);
+    println!("DURABLE_MATERIALIZATION_RECEIPTS={receipt_count}");
     println!(
         "READY_FOR_DIRECTORY_PHASE={}",
         yes_no(plan.ready_for_directory_phase())
@@ -723,7 +734,7 @@ fn sync_roots_materialize_file() -> Result<(), CliError> {
         return Err(CliError::NoLocalGoogleAccount);
     }
 
-    let storage = Storage::open(&db_path)?;
+    let mut storage = Storage::open(&db_path)?;
     let provider = ProviderId::new("google-drive")?;
     let account = single_google_account(storage.list_accounts(&provider)?)?;
     let roots = storage.list_sync_roots(&provider, &account.subject)?;
@@ -781,7 +792,7 @@ fn sync_roots_materialize_file() -> Result<(), CliError> {
     }
 
     println!("SYNC_ROOT_FILE_MATERIALIZATION_STAGE=download_one_file");
-    let result = materialize_selected_root_missing_file(&api, &storage, root)?;
+    let result = materialize_selected_root_missing_file(&api, &mut storage, root)?;
 
     println!("SYNC_ROOT_FILE_MATERIALIZATION=PASS");
     println!("MODE=receive_only");
@@ -790,7 +801,7 @@ fn sync_roots_materialize_file() -> Result<(), CliError> {
     println!("MAX_FILE_BYTES={}", result.max_file_bytes);
     println!("SIZE_MATCH_VERIFIED={}", yes_no(result.size_match_verified));
     println!("NETWORK_CHECK=performed");
-    println!("DATABASE_MUTATION=no");
+    println!("DATABASE_MUTATION=yes");
     println!("FILESYSTEM_MUTATION=yes");
     println!("FILE_CONTENT_ACCESSED=yes");
     println!("FILES_CREATED=1");
@@ -807,6 +818,100 @@ fn sync_roots_materialize_file() -> Result<(), CliError> {
     println!("TOKEN_VALUES_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=no");
     println!("CONFIGURED_MAX_FILE_BYTES={SUPERVISED_FILE_DOWNLOAD_MAX_BYTES}");
+    Ok(())
+}
+
+fn sync_roots_verify_file() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_FILE_VERIFICATION=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("LOCAL_FILE_CONTENT_ACCESSED=no");
+        println!("REMOTE_FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_FILE_VERIFICATION_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("SYNC_ROOT_FILE_VERIFICATION_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_FILE_VERIFICATION_STAGE=compare_sha256");
+    let result = verify_selected_root_existing_file(&api, &mut storage, root)?;
+    let receipt_count = storage.sync_root_materialization_receipt_count(&root.id)?;
+
+    println!("SYNC_ROOT_FILE_VERIFICATION=PASS");
+    println!("MODE=receive_only");
+    println!("FILES_VERIFIED={}", result.files_verified);
+    println!("BYTES_VERIFIED={}", result.bytes_verified);
+    println!("HASH_ALGORITHM=sha256");
+    println!("HASH_MATCH={}", yes_no(result.hash_match));
+    println!("RECEIPT_RECORDED={}", yes_no(result.receipt_recorded));
+    println!("DURABLE_MATERIALIZATION_RECEIPTS={receipt_count}");
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("LOCAL_FILE_CONTENT_ACCESSED=yes");
+    println!("REMOTE_FILE_CONTENT_ACCESSED=yes");
+    println!("FILES_OVERWRITTEN=0");
+    println!("FILES_DELETED=0");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
     Ok(())
 }
 
