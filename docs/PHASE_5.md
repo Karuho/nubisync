@@ -314,3 +314,35 @@ This adoption path is not a general background ownership inference mechanism.
 Future unattended operation must never adopt arbitrary pre-existing directories.
 
 Phase 5C10 performs no Drive writes.
+
+## Phase 5C11 — Read-only remote directory absence/removal plan
+
+Phase 5C11 adds `nubisync sync roots directory-deletion-plan --approve`.
+
+The planner is intentionally read-only. It performs no provider request, no
+database mutation and no filesystem mutation.
+
+For this first supervised directory-removal slice it accepts only the exact
+single-directory state established by Phase 5C10 after that remote folder has
+left the authoritative selected root:
+
+- zero authoritative remote items
+- exactly one local-only directory
+- zero file receipts, current or stale
+- zero current directory receipts
+- exactly one stale directory receipt
+- stale remote identity absent from the authoritative catalog
+- stale receipt path resolving to one ordinary non-symlink directory
+- the directory must be empty
+- no missing remote items or type conflicts
+
+The planner distinguishes an already-missing directory, a type/symlink conflict,
+and a non-empty directory from a safe deletion candidate. It prints only
+aggregate counters and booleans and never prints the root path, local names,
+remote IDs or metadata.
+
+Phase 5C11 does not add `rmdir` or any other destructive filesystem operation.
+A later phase must separately implement and owner-validate supervised directory
+deletion.
+
+Phase 5C11 performs no Drive writes.
