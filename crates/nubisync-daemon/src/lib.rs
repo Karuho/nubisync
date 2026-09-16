@@ -19,7 +19,8 @@ use nubisync_sync::{
     ReceiveOnlyOwnershipReceipt, ReceiveOnlyReceiptState, RootCatalogMutationPlan,
     RootCatalogProjection, RootCatalogProjectionError, RootCatalogResolution, RootChangeMembership,
     plan_receive_only_directory_targets, plan_receive_only_existing_file_targets,
-    plan_receive_only_materialization, plan_receive_only_missing_file_targets,
+    plan_receive_only_materialization, plan_receive_only_missing_directory_targets,
+    plan_receive_only_missing_file_targets,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,6 +36,8 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectedRootDirectoryMaterialization {
     pub remote_directories: usize,
+    pub planned_directory_actions: usize,
+    pub batch_action_limit: usize,
     pub created_directories: usize,
     pub existing_directories: usize,
     pub pending_files: usize,
@@ -308,15 +311,28 @@ pub fn materialize_selected_root_directories(
     storage: &mut Storage,
     sync_root: &SyncRoot,
 ) -> Result<SelectedRootDirectoryMaterialization, SelectedRootExecutorError> {
-    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
-    let preflight = plan_receive_only_materialization(&remote_items, &local_entries)?;
-
-    if !preflight.ready_for_directory_phase() {
+    let convergence = plan_selected_root_receive_only_convergence(storage, sync_root)?;
+    if convergence.blocked() {
         return Err(SelectedRootExecutorError::LocalDirectoryPhaseBlocked);
     }
 
-    let targets = plan_receive_only_directory_targets(&remote_items)?;
-    if targets.len() != preflight.remote_directories {
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let preflight = plan_receive_only_materialization(&remote_items, &local_entries)?;
+
+    if !preflight.ready_for_directory_phase()
+        || convergence.remote_items != preflight.remote_items
+        || convergence.local_entries != preflight.local_entries
+        || convergence.create_directories != preflight.missing_directories
+        || convergence.materialize_missing_files != preflight.missing_files
+    {
+        return Err(SelectedRootExecutorError::LocalDirectoryPhaseBlocked);
+    }
+
+    let targets = plan_receive_only_missing_directory_targets(&remote_items, &local_entries)?;
+    if targets.len() != preflight.missing_directories
+        || targets.len() != convergence.create_directories
+        || targets.len() > SELECTED_ROOT_CONVERGENCE_MAX_ACTIONS
+    {
         return Err(SelectedRootExecutorError::LocalDirectoryTargetCountMismatch);
     }
 
@@ -324,13 +340,23 @@ pub fn materialize_selected_root_directories(
     let outcome = apply_selected_root_directory_targets(&root_path, &targets)?;
 
     let post_result = (|| {
+        if outcome.existing_directories != 0
+            || outcome.created_paths.len() != targets.len()
+            || outcome.created_targets.len() != targets.len()
+        {
+            return Err(SelectedRootExecutorError::LocalDirectoryPostconditionFailed);
+        }
+
         let post_entries = scan_selected_root_local_tree(sync_root)?;
         let post_plan = plan_receive_only_materialization(&remote_items, &post_entries)?;
 
         if !post_plan.ready_for_directory_phase()
             || post_plan.missing_directories != 0
             || post_plan.matching_directories != post_plan.remote_directories
-            || outcome.created_paths.len() + outcome.existing_directories
+            || preflight
+                .matching_directories
+                .checked_add(outcome.created_paths.len())
+                .ok_or(SelectedRootExecutorError::CountOverflow)?
                 != post_plan.remote_directories
         {
             return Err(SelectedRootExecutorError::LocalDirectoryPostconditionFailed);
@@ -358,8 +384,10 @@ pub fn materialize_selected_root_directories(
 
         Ok(SelectedRootDirectoryMaterialization {
             remote_directories: post_plan.remote_directories,
+            planned_directory_actions: targets.len(),
+            batch_action_limit: SELECTED_ROOT_CONVERGENCE_MAX_ACTIONS,
             created_directories: outcome.created_paths.len(),
-            existing_directories: outcome.existing_directories,
+            existing_directories: preflight.matching_directories,
             pending_files: post_plan.remote_files,
         })
     })();

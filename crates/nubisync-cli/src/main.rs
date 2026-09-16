@@ -881,6 +881,11 @@ fn sync_roots_materialize_directories() -> Result<(), CliError> {
     println!("SYNC_ROOT_DIRECTORY_MATERIALIZATION=PASS");
     println!("MODE=receive_only");
     println!("REMOTE_DIRECTORIES={}", result.remote_directories);
+    println!("BATCH_ACTION_LIMIT={}", result.batch_action_limit);
+    println!(
+        "DIRECTORY_ACTIONS_PLANNED={}",
+        result.planned_directory_actions
+    );
     println!("DIRECTORIES_CREATED={}", result.created_directories);
     println!(
         "DIRECTORIES_ALREADY_PRESENT={}",
@@ -889,6 +894,8 @@ fn sync_roots_materialize_directories() -> Result<(), CliError> {
     println!("PENDING_FILES={}", result.pending_files);
     println!("CURRENT_DIRECTORY_RECEIPTS={current_directory_receipts}");
     println!("STALE_DIRECTORY_RECEIPTS={stale_directory_receipts}");
+    println!("BATCH_MODE=bounded_supervised");
+    println!("FILE_BATCH_EXECUTION_AVAILABLE=no");
     println!("NETWORK_CHECK=not_performed");
     println!(
         "DATABASE_MUTATION={}",

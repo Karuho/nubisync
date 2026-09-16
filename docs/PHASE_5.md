@@ -411,3 +411,36 @@ remote IDs, hashes, cursors or tokens.
 Phase 5D1 performs no provider request, keyring access, SQLite mutation,
 filesystem mutation, file-content read or Drive write. Batch execution is
 explicitly unavailable in this phase.
+
+## Phase 5D2 — Supervised bounded batch directory creation
+
+Phase 5D2 hardens the existing supervised
+`nubisync sync roots materialize-directories --approve` command into the first
+bounded multi-item executor.
+
+The executor is bound to the Phase 5D1 convergence plan immediately before local
+mutation. It accepts only `CreateDirectory` work and uses the same hard 10,000
+action ceiling. Missing-directory targets are planned explicitly and remain in
+deterministic parent-before-child order.
+
+Only directories that were missing in the preflight snapshot are mutation
+targets. A target that appears concurrently is not adopted: the batch fails
+closed and rolls back only directories created by that invocation.
+
+After local creation, the executor requires all authoritative remote directories
+to exist locally, records durable directory ownership receipts only for
+directories created by the current invocation, and preserves matching pre-existing
+directories as unowned.
+
+Rollback is best-effort and removes only directories created by the current batch,
+in reverse order. File content is not downloaded, created, read, replaced or
+deleted in Phase 5D2.
+
+The command performs no provider request, no OAuth/keyring operation and no Drive
+write. It does mutate the local filesystem and SQLite ownership receipts when
+directories are successfully created. Output remains aggregate-only and explicitly
+reports the batch bound, planned directory actions, created directories and
+directory receipt counts.
+
+Descriptor-relative/openat2 hardening is still required before unattended or
+adversarial filesystem mutation.

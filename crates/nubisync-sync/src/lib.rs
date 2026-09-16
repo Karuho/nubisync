@@ -631,6 +631,28 @@ pub fn plan_receive_only_directory_targets(
         .collect())
 }
 
+pub fn plan_receive_only_missing_directory_targets(
+    remote_items: &[RemoteItem],
+    local_entries: &[LocalTreeEntry],
+) -> Result<Vec<ReceiveOnlyDirectoryTarget>, ReceiveOnlyMaterializationPlanError> {
+    let _ = plan_receive_only_materialization(remote_items, local_entries)?;
+    let local_paths = local_entries
+        .iter()
+        .map(LocalTreeEntry::relative_path)
+        .collect::<HashSet<_>>();
+
+    Ok(build_remote_expected_paths(remote_items)?
+        .into_iter()
+        .filter_map(|(relative_path, kind, remote_id, _)| {
+            (kind == RemoteItemKind::Folder && !local_paths.contains(relative_path.as_str()))
+                .then_some(ReceiveOnlyDirectoryTarget {
+                    remote_id,
+                    relative_path,
+                })
+        })
+        .collect())
+}
+
 pub fn plan_receive_only_missing_file_targets(
     remote_items: &[RemoteItem],
     local_entries: &[LocalTreeEntry],
@@ -1418,5 +1440,44 @@ mod tests {
             ),
             ReconcileAction::IgnoreLocalChange
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5d2_tests {
+    use super::*;
+
+    fn directory_item(remote_id: &str, parent_remote_id: &str, name: &str) -> RemoteItem {
+        RemoteItem {
+            remote_id: remote_id.into(),
+            parent_remote_id: Some(parent_remote_id.into()),
+            name: name.into(),
+            kind: RemoteItemKind::Folder,
+            size_bytes: None,
+            modified_unix_ms: None,
+            trashed: false,
+        }
+    }
+
+    #[test]
+    fn missing_directory_targets_are_parent_before_child_and_exclude_existing() {
+        let remote_items = vec![
+            directory_item("parent", "selected", "parent"),
+            directory_item("child", "parent", "child"),
+        ];
+
+        let empty_targets =
+            plan_receive_only_missing_directory_targets(&remote_items, &[]).unwrap();
+        assert_eq!(empty_targets.len(), 2);
+        assert_eq!(empty_targets[0].remote_id(), "parent");
+        assert_eq!(empty_targets[1].remote_id(), "child");
+
+        let local_entries =
+            vec![LocalTreeEntry::new("parent", LocalTreeEntryKind::Directory).unwrap()];
+        let partial_targets =
+            plan_receive_only_missing_directory_targets(&remote_items, &local_entries).unwrap();
+
+        assert_eq!(partial_targets.len(), 1);
+        assert_eq!(partial_targets[0].remote_id(), "child");
     }
 }
