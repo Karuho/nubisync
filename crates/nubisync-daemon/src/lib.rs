@@ -13,8 +13,10 @@ use nubisync_storage::{
     SyncRootDirectoryMaterializationReceipt, SyncRootFileMaterializationReceipt,
 };
 use nubisync_sync::{
-    LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyDirectoryTarget, ReceiveOnlyFileTarget,
-    ReceiveOnlyMaterializationPlan, ReceiveOnlyMaterializationPlanError, RootCatalogMutationPlan,
+    LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyConvergencePlan,
+    ReceiveOnlyConvergencePlanError, ReceiveOnlyDirectoryTarget, ReceiveOnlyFileTarget,
+    ReceiveOnlyMaterializationPlan, ReceiveOnlyMaterializationPlanError,
+    ReceiveOnlyOwnershipReceipt, ReceiveOnlyReceiptState, RootCatalogMutationPlan,
     RootCatalogProjection, RootCatalogProjectionError, RootCatalogResolution, RootChangeMembership,
     plan_receive_only_directory_targets, plan_receive_only_existing_file_targets,
     plan_receive_only_materialization, plan_receive_only_missing_file_targets,
@@ -45,6 +47,7 @@ pub struct SelectedRootDirectoryAdoption {
     pub stale_directory_receipts: u64,
 }
 
+pub const SELECTED_ROOT_CONVERGENCE_MAX_ACTIONS: usize = 10_000;
 pub const SUPERVISED_FILE_DOWNLOAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
 static DOWNLOAD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -247,6 +250,58 @@ pub fn plan_selected_root_local_materialization(
 
     plan_receive_only_materialization(&remote_items, &local_entries)
         .map_err(SelectedRootExecutorError::from)
+}
+
+pub fn plan_selected_root_receive_only_convergence(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<ReceiveOnlyConvergencePlan, SelectedRootExecutorError> {
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let mut receipts = Vec::new();
+
+    for receipt in storage.list_sync_root_file_materialization_receipts(&sync_root.id)? {
+        receipts.push(ReceiveOnlyOwnershipReceipt::new(
+            receipt.remote_id,
+            receipt.relative_path,
+            LocalTreeEntryKind::File,
+            ReceiveOnlyReceiptState::Current,
+        )?);
+    }
+
+    for receipt in storage.list_sync_root_stale_file_materialization_receipts(&sync_root.id)? {
+        receipts.push(ReceiveOnlyOwnershipReceipt::new(
+            receipt.remote_id,
+            receipt.relative_path,
+            LocalTreeEntryKind::File,
+            ReceiveOnlyReceiptState::Stale,
+        )?);
+    }
+
+    for receipt in storage.list_sync_root_directory_materialization_receipts(&sync_root.id)? {
+        receipts.push(ReceiveOnlyOwnershipReceipt::new(
+            receipt.remote_id,
+            receipt.relative_path,
+            LocalTreeEntryKind::Directory,
+            ReceiveOnlyReceiptState::Current,
+        )?);
+    }
+
+    for receipt in storage.list_sync_root_stale_directory_materialization_receipts(&sync_root.id)? {
+        receipts.push(ReceiveOnlyOwnershipReceipt::new(
+            receipt.remote_id,
+            receipt.relative_path,
+            LocalTreeEntryKind::Directory,
+            ReceiveOnlyReceiptState::Stale,
+        )?);
+    }
+
+    nubisync_sync::plan_receive_only_convergence(
+        &remote_items,
+        &local_entries,
+        &receipts,
+        SELECTED_ROOT_CONVERGENCE_MAX_ACTIONS,
+    )
+    .map_err(SelectedRootExecutorError::from)
 }
 
 pub fn materialize_selected_root_directories(
@@ -3044,6 +3099,8 @@ pub enum SelectedRootExecutorError {
     Projection(RootCatalogProjectionError),
     #[error("receive-only local materialization planning failed: {0:?}")]
     MaterializationPlan(ReceiveOnlyMaterializationPlanError),
+    #[error("receive-only convergence planning failed: {0:?}")]
+    ConvergencePlan(ReceiveOnlyConvergencePlanError),
 }
 
 impl From<DriveApiError> for SelectedRootExecutorError {
@@ -3055,6 +3112,12 @@ impl From<DriveApiError> for SelectedRootExecutorError {
 impl From<StorageError> for SelectedRootExecutorError {
     fn from(error: StorageError) -> Self {
         Self::Storage(Box::new(error))
+    }
+}
+
+impl From<ReceiveOnlyConvergencePlanError> for SelectedRootExecutorError {
+    fn from(error: ReceiveOnlyConvergencePlanError) -> Self {
+        Self::ConvergencePlan(error)
     }
 }
 

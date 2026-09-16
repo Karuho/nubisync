@@ -2,6 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+mod convergence;
+
+pub use convergence::{
+    ReceiveOnlyConvergenceAction, ReceiveOnlyConvergenceActionKind, ReceiveOnlyConvergencePlan,
+    ReceiveOnlyConvergencePlanError, ReceiveOnlyOwnershipReceipt, ReceiveOnlyReceiptState,
+    plan_receive_only_convergence,
+};
 pub use nubisync_core::SyncMode;
 use nubisync_core::{RemoteChange, RemoteItem, RemoteItemKind};
 use std::collections::{HashMap, HashSet, VecDeque};

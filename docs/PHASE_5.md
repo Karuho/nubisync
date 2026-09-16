@@ -374,3 +374,40 @@ leave a narrow TOCTOU window; descriptor-relative/openat2/dirfd hardening is
 required before unattended/adversarial destructive operation.
 
 Phase 5C12 performs no Drive writes.
+
+## Phase 5D1 — Bounded multi-item receive-only convergence plan
+
+Phase 5D1 adds `nubisync sync roots convergence-plan --approve`.
+
+This phase moves receive-only planning beyond the exact-one file/directory
+prototype while remaining strictly read-only. The planner consumes the
+authoritative selected-root catalog, the complete local metadata tree, and
+durable current/stale file and directory ownership receipts.
+
+The provider-neutral planner lives in `nubisync-sync`. It produces a deterministic
+bounded action sequence with a hard limit of 10,000 actions. The first slice can
+classify:
+
+- create missing directory
+- materialize missing file
+- verify an existing unowned file
+- revalidate a stale file before replacement
+- revalidate a stale local-only file before deletion
+- delete a stale-owned empty local-only directory
+- blocked/conflicting state
+
+File replacement/deletion classifications are not authorization to mutate bytes:
+the existing SHA-256 stale-baseline verification remains mandatory in later
+execution phases. Matching directories without ownership receipts are counted
+separately and are never silently adopted.
+
+Ordering is deterministic: parent directory creation precedes descendant file
+work, stale-file deletion checks precede destructive directory removal, and owned
+directory removals are deepest-first.
+
+The CLI prints aggregate counters only. It does not print local names/paths,
+remote IDs, hashes, cursors or tokens.
+
+Phase 5D1 performs no provider request, keyring access, SQLite mutation,
+filesystem mutation, file-content read or Drive write. Batch execution is
+explicitly unavailable in this phase.

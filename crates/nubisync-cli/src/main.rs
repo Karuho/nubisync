@@ -15,9 +15,10 @@ use nubisync_daemon::{
     delete_selected_root_existing_directory, delete_selected_root_existing_file,
     execute_completed_selected_root_change_window, materialize_selected_root_directories,
     materialize_selected_root_missing_file, plan_selected_root_local_materialization,
-    plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
-    plan_selected_root_remote_replacement, replace_selected_root_existing_file,
-    verify_selected_root_existing_file, verify_selected_root_local_receipts,
+    plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
+    plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
+    replace_selected_root_existing_file, verify_selected_root_existing_file,
+    verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -97,6 +98,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_metadata_step()
+        }
+        [sync, roots, convergence_plan, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && convergence_plan == "convergence-plan"
+                && approve == "--approve" =>
+        {
+            sync_roots_convergence_plan()
         }
         [sync, roots, reconcile_plan, approve]
             if sync == "sync"
@@ -282,6 +291,7 @@ USAGE:
   nubisync auth google logout
   nubisync sync roots status
   nubisync sync roots metadata-step --approve
+  nubisync sync roots convergence-plan --approve
   nubisync sync roots reconcile-plan --approve
   nubisync sync roots materialize-directories --approve
   nubisync sync roots adopt-directory --approve
@@ -656,6 +666,93 @@ fn sync_roots_metadata_step() -> Result<(), CliError> {
     println!("REMOTE_METADATA_PRINTED=no");
     println!("FILE_CONTENT_ACCESSED=no");
     println!("FILESYSTEM_MUTATION=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_convergence_plan() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_CONVERGENCE_PLAN=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    let plan = plan_selected_root_receive_only_convergence(&storage, root)?;
+
+    println!("SYNC_ROOT_CONVERGENCE_PLAN=PASS");
+    println!("MODE=receive_only");
+    println!("MAX_ACTIONS=10000");
+    println!("REMOTE_ITEMS={}", plan.remote_items);
+    println!("LOCAL_ENTRIES={}", plan.local_entries);
+    println!("OWNERSHIP_RECEIPTS={}", plan.receipt_count);
+    println!("ACTIONS_TOTAL={}", plan.action_count());
+    println!("CREATE_DIRECTORIES={}", plan.create_directories);
+    println!(
+        "MATERIALIZE_MISSING_FILES={}",
+        plan.materialize_missing_files
+    );
+    println!("VERIFY_EXISTING_FILES={}", plan.verify_existing_files);
+    println!(
+        "REVALIDATE_STALE_FILE_REPLACEMENTS={}",
+        plan.revalidate_stale_file_replacements
+    );
+    println!(
+        "REVALIDATE_STALE_FILE_DELETIONS={}",
+        plan.revalidate_stale_file_deletions
+    );
+    println!(
+        "DELETE_OWNED_EMPTY_DIRECTORIES={}",
+        plan.delete_owned_empty_directories
+    );
+    println!("BLOCKED_ACTIONS={}", plan.blocked_actions);
+    println!("CURRENT_OWNED_FILES={}", plan.current_owned_files);
+    println!(
+        "CURRENT_OWNED_DIRECTORIES={}",
+        plan.current_owned_directories
+    );
+    println!(
+        "UNOWNED_MATCHING_DIRECTORIES={}",
+        plan.unowned_matching_directories
+    );
+    println!("BATCH_EXECUTION_AVAILABLE=no");
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=no");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
