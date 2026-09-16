@@ -636,6 +636,7 @@ fn sync_roots_reconcile_plan() -> Result<(), CliError> {
 
     let plan = plan_selected_root_local_materialization(&storage, &root)?;
     let receipt_count = storage.sync_root_materialization_receipt_count(&root.id)?;
+    let stale_receipt_count = storage.sync_root_stale_materialization_receipt_count(&root.id)?;
 
     println!("SYNC_ROOT_RECONCILE_PLAN=PASS");
     println!("MODE=receive_only");
@@ -653,6 +654,7 @@ fn sync_roots_reconcile_plan() -> Result<(), CliError> {
     println!("LOCAL_ONLY_ENTRIES={}", plan.local_only_entries);
     println!("TYPE_CONFLICTS={}", plan.type_conflicts);
     println!("DURABLE_MATERIALIZATION_RECEIPTS={receipt_count}");
+    println!("STALE_MATERIALIZATION_RECEIPTS={stale_receipt_count}");
     println!(
         "READY_FOR_DIRECTORY_PHASE={}",
         yes_no(plan.ready_for_directory_phase())

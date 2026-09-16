@@ -148,3 +148,29 @@ A matching receipt means the local file still matches the content NubiSync
 previously verified/materialized. It does not independently prove that the
 provider has not changed since the receipt was recorded; provider-side catalog
 changes invalidate receipts when they are durably applied.
+
+## Phase 5C5 — Preserve stale materialization baselines
+
+Phase 5C5 advances SQLite to schema v10 and changes receipt invalidation from
+destructive deletion to a durable `current` -> `stale` transition.
+
+A current receipt means the selected-root remote item has not been durably
+mutated since that local content was verified/materialized. When an authoritative
+selected-root upsert/delete affects the item or an ancestor subtree, the receipt
+is marked stale in the same catalog transaction before the remote catalog is
+updated.
+
+Stale receipts deliberately keep the last verified local SHA-256, byte size and
+relative path even if the current remote item changes or disappears. They no
+longer have a foreign key to the current remote catalog, but remain bound to the
+sync root. This preserves the baseline required to decide later whether the local
+file was independently modified before applying a newer remote version.
+
+Only current receipts participate in the existing `verify-local` command.
+`reconcile-plan` now reports both current and stale receipt counts while
+remaining metadata-only.
+
+A new successful materialization of the same remote ID replaces the previous
+baseline and returns the receipt to `current`.
+
+Phase 5C5 still does not overwrite or delete an existing local file.
