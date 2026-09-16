@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::{
     collections::{HashSet, VecDeque},
     fmt,
+    io::{Read, Write},
     time::Duration,
 };
 use thiserror::Error;
@@ -357,6 +358,32 @@ impl GoogleDriveApi {
             unsupported_provider_native,
             page_count,
         })
+    }
+
+    /// Streams one ordinary Drive blob into a caller-owned writer.
+    pub fn download_blob_to_writer(
+        &self,
+        remote_id: &str,
+        max_bytes: u64,
+        writer: &mut dyn Write,
+    ) -> Result<u64, DriveApiError> {
+        validate_drive_file_id(remote_id)?;
+        if max_bytes == 0 {
+            return Err(DriveApiError::InvalidDownloadLimit);
+        }
+
+        let mut response = self
+            .client
+            .get(format!("{GOOGLE_DRIVE_FILES_ENDPOINT}/{remote_id}"))
+            .bearer_auth(self.access_token.as_str())
+            .query(&[("alt", "media")])
+            .send()?
+            .error_for_status()?;
+
+        if response.content_length().is_some_and(|n| n > max_bytes) {
+            return Err(DriveApiError::DownloadSafetyLimitExceeded);
+        }
+        copy_bounded_download(&mut response, writer, max_bytes)
     }
 
     /// Reads one page of the user's My Drive change stream.
@@ -900,6 +927,35 @@ fn folder_children_query(parent_remote_id: &str) -> Result<String, DriveApiError
     ))
 }
 
+fn copy_bounded_download(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    max_bytes: u64,
+) -> Result<u64, DriveApiError> {
+    if max_bytes == 0 {
+        return Err(DriveApiError::InvalidDownloadLimit);
+    }
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let remaining = max_bytes.saturating_sub(total);
+        let probe = remaining.saturating_add(1).min(buffer.len() as u64) as usize;
+        let read = reader.read(&mut buffer[..probe])?;
+        if read == 0 {
+            return Ok(total);
+        }
+        let read = u64::try_from(read).map_err(|_| DriveApiError::DownloadSafetyLimitExceeded)?;
+        let next = total
+            .checked_add(read)
+            .ok_or(DriveApiError::DownloadSafetyLimitExceeded)?;
+        if next > max_bytes {
+            return Err(DriveApiError::DownloadSafetyLimitExceeded);
+        }
+        writer.write_all(&buffer[..read as usize])?;
+        total = next;
+    }
+}
+
 fn parse_optional_u64(
     value: Option<&str>,
     field: &'static str,
@@ -932,6 +988,12 @@ pub enum DriveApiError {
     InvalidInventoryParentId,
     #[error("Google Drive remote root identifier is invalid")]
     InvalidRemoteRootId,
+    #[error("Google Drive file download byte limit must be non-zero")]
+    InvalidDownloadLimit,
+    #[error("Google Drive file download exceeded the supervised byte limit")]
+    DownloadSafetyLimitExceeded,
+    #[error("Google Drive file download stream I/O failed")]
+    ContentIo(#[from] std::io::Error),
     #[error("Google Drive remote root is not a folder")]
     RemoteRootNotFolder,
     #[error("Google Drive remote root is trashed")]
@@ -969,6 +1031,24 @@ pub enum DriveApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_download_copy_enforces_limit() {
+        let mut input = &b"hello"[..];
+        let mut output = Vec::new();
+        assert_eq!(
+            copy_bounded_download(&mut input, &mut output, 10).unwrap(),
+            5
+        );
+        assert_eq!(output, b"hello");
+        let mut input = &b"hello"[..];
+        let mut output = Vec::new();
+        assert!(matches!(
+            copy_bounded_download(&mut input, &mut output, 4),
+            Err(DriveApiError::DownloadSafetyLimitExceeded)
+        ));
+        assert!(output.is_empty());
+    }
 
     #[test]
     fn remote_root_id_accepts_root_alias_and_drive_id_shape() {

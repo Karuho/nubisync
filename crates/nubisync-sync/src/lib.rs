@@ -502,6 +502,36 @@ impl std::fmt::Debug for ReceiveOnlyDirectoryTarget {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReceiveOnlyFileTarget {
+    remote_id: String,
+    relative_path: String,
+    size_bytes: Option<u64>,
+}
+
+impl ReceiveOnlyFileTarget {
+    pub fn remote_id(&self) -> &str {
+        &self.remote_id
+    }
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+    pub fn size_bytes(&self) -> Option<u64> {
+        self.size_bytes
+    }
+}
+
+impl std::fmt::Debug for ReceiveOnlyFileTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReceiveOnlyFileTarget")
+            .field("remote_id", &"[redacted]")
+            .field("relative_path", &"[redacted]")
+            .field("size_bytes", &self.size_bytes)
+            .finish()
+    }
+}
+
 pub fn plan_receive_only_materialization(
     remote_items: &[RemoteItem],
     local_entries: &[LocalTreeEntry],
@@ -522,11 +552,11 @@ pub fn plan_receive_only_materialization(
 
     let remote_directories = expected_paths
         .iter()
-        .filter(|(_, kind)| *kind == RemoteItemKind::Folder)
+        .filter(|(_, kind, _, _)| *kind == RemoteItemKind::Folder)
         .count();
     let remote_files = expected_paths
         .iter()
-        .filter(|(_, kind)| *kind == RemoteItemKind::File)
+        .filter(|(_, kind, _, _)| *kind == RemoteItemKind::File)
         .count();
 
     let mut missing_directories = 0_usize;
@@ -535,7 +565,7 @@ pub fn plan_receive_only_materialization(
     let mut existing_files_unverified = 0_usize;
     let mut type_conflicts = 0_usize;
 
-    for (relative_path, remote_kind) in &expected_paths {
+    for (relative_path, remote_kind, _, _) in &expected_paths {
         match (remote_kind, local_by_path.get(relative_path.as_str())) {
             (RemoteItemKind::Folder, None) => missing_directories += 1,
             (RemoteItemKind::File, None) => missing_files += 1,
@@ -552,7 +582,7 @@ pub fn plan_receive_only_materialization(
 
     let expected_path_names = expected_paths
         .iter()
-        .map(|(path, _)| path.as_str())
+        .map(|(path, _, _, _)| path.as_str())
         .collect::<HashSet<_>>();
 
     let local_only_entries = local_by_path
@@ -579,15 +609,40 @@ pub fn plan_receive_only_directory_targets(
 ) -> Result<Vec<ReceiveOnlyDirectoryTarget>, ReceiveOnlyMaterializationPlanError> {
     Ok(build_remote_expected_paths(remote_items)?
         .into_iter()
-        .filter_map(|(relative_path, kind)| {
+        .filter_map(|(relative_path, kind, _, _)| {
             (kind == RemoteItemKind::Folder).then_some(ReceiveOnlyDirectoryTarget { relative_path })
         })
         .collect())
 }
 
+pub fn plan_receive_only_missing_file_targets(
+    remote_items: &[RemoteItem],
+    local_entries: &[LocalTreeEntry],
+) -> Result<Vec<ReceiveOnlyFileTarget>, ReceiveOnlyMaterializationPlanError> {
+    let _ = plan_receive_only_materialization(remote_items, local_entries)?;
+    let local_paths = local_entries
+        .iter()
+        .map(|e| e.relative_path())
+        .collect::<HashSet<_>>();
+
+    Ok(build_remote_expected_paths(remote_items)?
+        .into_iter()
+        .filter_map(|(relative_path, kind, remote_id, size_bytes)| {
+            (kind == RemoteItemKind::File && !local_paths.contains(relative_path.as_str()))
+                .then_some(ReceiveOnlyFileTarget {
+                    remote_id,
+                    relative_path,
+                    size_bytes,
+                })
+        })
+        .collect())
+}
+
+type RemoteExpectedPath = (String, RemoteItemKind, String, Option<u64>);
+
 fn build_remote_expected_paths(
     remote_items: &[RemoteItem],
-) -> Result<Vec<(String, RemoteItemKind)>, ReceiveOnlyMaterializationPlanError> {
+) -> Result<Vec<RemoteExpectedPath>, ReceiveOnlyMaterializationPlanError> {
     if remote_items.is_empty() {
         return Ok(Vec::new());
     }
@@ -678,7 +733,12 @@ fn build_remote_expected_paths(
             return Err(ReceiveOnlyMaterializationPlanError::RemotePathCollision);
         }
 
-        expected_paths.push((relative_path.clone(), item.kind));
+        expected_paths.push((
+            relative_path.clone(),
+            item.kind,
+            item.remote_id.clone(),
+            item.size_bytes,
+        ));
 
         if item.kind == RemoteItemKind::Folder
             && let Some(children) = children_by_parent.get(item.remote_id.as_str())
@@ -899,6 +959,22 @@ mod tests {
         assert!(debug.contains("[redacted]"));
         assert!(!debug.contains("docs"));
         assert!(!debug.contains("nested"));
+    }
+
+    #[test]
+    fn missing_file_target_preserves_size_and_redacts_identity() {
+        let folder =
+            materialization_item("folder", "selected-root", "docs", RemoteItemKind::Folder);
+        let mut file =
+            materialization_item("secret-id", "folder", "private.txt", RemoteItemKind::File);
+        file.size_bytes = Some(13);
+        let local = vec![LocalTreeEntry::new("docs", LocalTreeEntryKind::Directory).unwrap()];
+        let targets = plan_receive_only_missing_file_targets(&[folder, file], &local).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].size_bytes(), Some(13));
+        let debug = format!("{targets:?}");
+        assert!(!debug.contains("private.txt"));
+        assert!(!debug.contains("secret-id"));
     }
 
     #[test]

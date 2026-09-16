@@ -10,15 +10,18 @@ use nubisync_storage::{
     Storage, StorageError, SyncRootCatalogBatchCommit, SyncRootCatalogMutation,
 };
 use nubisync_sync::{
-    LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyDirectoryTarget, ReceiveOnlyMaterializationPlan,
-    ReceiveOnlyMaterializationPlanError, RootCatalogMutationPlan, RootCatalogProjection,
-    RootCatalogProjectionError, RootCatalogResolution, RootChangeMembership,
+    LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyDirectoryTarget, ReceiveOnlyFileTarget,
+    ReceiveOnlyMaterializationPlan, ReceiveOnlyMaterializationPlanError, RootCatalogMutationPlan,
+    RootCatalogProjection, RootCatalogProjectionError, RootCatalogResolution, RootChangeMembership,
     plan_receive_only_directory_targets, plan_receive_only_materialization,
+    plan_receive_only_missing_file_targets,
 };
 use std::{
     collections::{HashSet, VecDeque},
     fs,
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use thiserror::Error;
 
@@ -28,6 +31,38 @@ pub struct SelectedRootDirectoryMaterialization {
     pub created_directories: usize,
     pub existing_directories: usize,
     pub pending_files: usize,
+}
+
+pub const SUPERVISED_FILE_DOWNLOAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
+static DOWNLOAD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootFileMaterialization {
+    pub files_downloaded: usize,
+    pub bytes_downloaded: u64,
+    pub max_file_bytes: u64,
+    pub size_match_verified: bool,
+}
+
+pub trait SelectedRootContentProvider {
+    fn download_file_content(
+        &self,
+        remote_id: &str,
+        max_bytes: u64,
+        writer: &mut dyn Write,
+    ) -> Result<u64, SelectedRootExecutorError>;
+}
+
+impl SelectedRootContentProvider for GoogleDriveApi {
+    fn download_file_content(
+        &self,
+        remote_id: &str,
+        max_bytes: u64,
+        writer: &mut dyn Write,
+    ) -> Result<u64, SelectedRootExecutorError> {
+        GoogleDriveApi::download_blob_to_writer(self, remote_id, max_bytes, writer)
+            .map_err(SelectedRootExecutorError::from)
+    }
 }
 
 pub fn plan_selected_root_local_materialization(
@@ -86,6 +121,212 @@ pub fn materialize_selected_root_directories(
             rollback_created_directories(&outcome.created_paths)?;
             Err(error)
         }
+    }
+}
+
+pub fn materialize_selected_root_missing_file<P: SelectedRootContentProvider>(
+    provider: &P,
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootFileMaterialization, SelectedRootExecutorError> {
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let preflight = plan_receive_only_materialization(&remote_items, &local_entries)?;
+    if !preflight.ready_for_directory_phase()
+        || preflight.missing_directories != 0
+        || preflight.matching_directories != preflight.remote_directories
+        || preflight.existing_files_unverified != 0
+        || preflight.missing_files != 1
+    {
+        return Err(SelectedRootExecutorError::LocalFilePhaseBlocked);
+    }
+
+    let targets = plan_receive_only_missing_file_targets(&remote_items, &local_entries)?;
+    if targets.len() != 1 {
+        return Err(SelectedRootExecutorError::LocalFileTargetCountMismatch);
+    }
+    let target = targets
+        .first()
+        .ok_or(SelectedRootExecutorError::LocalFileTargetCountMismatch)?;
+    let expected_size = target
+        .size_bytes()
+        .ok_or(SelectedRootExecutorError::LocalFileSizeUnknown)?;
+    if expected_size > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+        return Err(SelectedRootExecutorError::LocalFileTooLarge);
+    }
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let outcome = apply_selected_root_file_target(
+        provider,
+        &root_path,
+        target,
+        SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
+    )?;
+
+    let post = (|| {
+        let entries = scan_selected_root_local_tree(sync_root)?;
+        let plan = plan_receive_only_materialization(&remote_items, &entries)?;
+        if !plan.ready_for_directory_phase()
+            || plan.missing_directories != 0
+            || plan.missing_files != 0
+            || plan.matching_directories != plan.remote_directories
+            || plan.existing_files_unverified != 1
+        {
+            return Err(SelectedRootExecutorError::LocalFilePostconditionFailed);
+        }
+        Ok(SelectedRootFileMaterialization {
+            files_downloaded: 1,
+            bytes_downloaded: outcome.bytes_downloaded,
+            max_file_bytes: SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
+            size_match_verified: outcome.bytes_downloaded == expected_size,
+        })
+    })();
+
+    match post {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            rollback_created_file(&outcome.target_path)?;
+            Err(error)
+        }
+    }
+}
+
+struct FileApplyOutcome {
+    target_path: PathBuf,
+    bytes_downloaded: u64,
+}
+
+fn apply_selected_root_file_target<P: SelectedRootContentProvider>(
+    provider: &P,
+    root_path: &Path,
+    target: &ReceiveOnlyFileTarget,
+    max_bytes: u64,
+) -> Result<FileApplyOutcome, SelectedRootExecutorError> {
+    let expected_size = target
+        .size_bytes()
+        .ok_or(SelectedRootExecutorError::LocalFileSizeUnknown)?;
+    if expected_size > max_bytes {
+        return Err(SelectedRootExecutorError::LocalFileTooLarge);
+    }
+
+    let target_path = root_path.join(target.relative_path());
+    if !target_path.starts_with(root_path) {
+        return Err(SelectedRootExecutorError::LocalFileTargetEscapedRoot);
+    }
+    match fs::symlink_metadata(&target_path) {
+        Ok(_) => return Err(SelectedRootExecutorError::LocalFileTargetConflict),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(SelectedRootExecutorError::LocalFilesystemInspectionFailed),
+    }
+
+    let parent = target_path
+        .parent()
+        .ok_or(SelectedRootExecutorError::LocalFileParentInvalid)?;
+    let meta = fs::symlink_metadata(parent)
+        .map_err(|_| SelectedRootExecutorError::LocalFileParentInvalid)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(SelectedRootExecutorError::LocalFileParentInvalid);
+    }
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|_| SelectedRootExecutorError::LocalFileParentInvalid)?;
+    if !canonical_parent.starts_with(root_path) {
+        return Err(SelectedRootExecutorError::LocalFileParentInvalid);
+    }
+
+    let (temp_path, mut temp_file) = create_download_temp(parent)?;
+    let bytes = match provider.download_file_content(target.remote_id(), max_bytes, &mut temp_file)
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            drop(temp_file);
+            cleanup_temp_file(&temp_path)?;
+            return Err(error);
+        }
+    };
+    if bytes != expected_size {
+        drop(temp_file);
+        cleanup_temp_file(&temp_path)?;
+        return Err(SelectedRootExecutorError::LocalFileDownloadSizeMismatch);
+    }
+    if temp_file.sync_all().is_err() {
+        drop(temp_file);
+        cleanup_temp_file(&temp_path)?;
+        return Err(SelectedRootExecutorError::LocalFileSyncFailed);
+    }
+    drop(temp_file);
+
+    match fs::hard_link(&temp_path, &target_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            cleanup_temp_file(&temp_path)?;
+            return Err(SelectedRootExecutorError::LocalFileTargetConflict);
+        }
+        Err(_) => {
+            cleanup_temp_file(&temp_path)?;
+            return Err(SelectedRootExecutorError::LocalFilePromoteFailed);
+        }
+    }
+
+    if fs::remove_file(&temp_path).is_err() {
+        rollback_created_file(&target_path)?;
+        cleanup_temp_file(&temp_path)?;
+        return Err(SelectedRootExecutorError::LocalFileTempCleanupFailed);
+    }
+    let parent_handle =
+        fs::File::open(parent).map_err(|_| SelectedRootExecutorError::LocalFileSyncFailed)?;
+    if parent_handle.sync_all().is_err() {
+        rollback_created_file(&target_path)?;
+        return Err(SelectedRootExecutorError::LocalFileSyncFailed);
+    }
+    let meta = fs::symlink_metadata(&target_path)
+        .map_err(|_| SelectedRootExecutorError::LocalFilePostconditionFailed)?;
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() != bytes {
+        rollback_created_file(&target_path)?;
+        return Err(SelectedRootExecutorError::LocalFilePostconditionFailed);
+    }
+    Ok(FileApplyOutcome {
+        target_path,
+        bytes_downloaded: bytes,
+    })
+}
+
+fn create_download_temp(parent: &Path) -> Result<(PathBuf, fs::File), SelectedRootExecutorError> {
+    for _ in 0..128 {
+        let n = DOWNLOAD_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".nubisync-download-{}-{n}.tmp", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(SelectedRootExecutorError::LocalFileTempCreateFailed),
+        }
+    }
+    Err(SelectedRootExecutorError::LocalFileTempCreateFailed)
+}
+
+fn cleanup_temp_file(path: &Path) -> Result<(), SelectedRootExecutorError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(SelectedRootExecutorError::LocalFileTempCleanupFailed),
+    }
+}
+
+fn rollback_created_file(path: &Path) -> Result<(), SelectedRootExecutorError> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                let dir = fs::File::open(parent)
+                    .map_err(|_| SelectedRootExecutorError::LocalFileRollbackFailed)?;
+                dir.sync_all()
+                    .map_err(|_| SelectedRootExecutorError::LocalFileRollbackFailed)?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(SelectedRootExecutorError::LocalFileRollbackFailed),
     }
 }
 
@@ -1022,6 +1263,34 @@ pub enum SelectedRootExecutorError {
     LocalDirectoryPostconditionFailed,
     #[error("local directory materialization rollback failed")]
     LocalDirectoryRollbackFailed,
+    #[error("local file materialization preconditions are not satisfied")]
+    LocalFilePhaseBlocked,
+    #[error("local file materialization target count did not equal one")]
+    LocalFileTargetCountMismatch,
+    #[error("local file materialization requires a known remote byte size")]
+    LocalFileSizeUnknown,
+    #[error("local file exceeds the supervised download byte limit")]
+    LocalFileTooLarge,
+    #[error("local file target escaped the configured sync root")]
+    LocalFileTargetEscapedRoot,
+    #[error("local file target appeared before no-overwrite promotion")]
+    LocalFileTargetConflict,
+    #[error("local file parent is unavailable, unsafe, or outside the sync root")]
+    LocalFileParentInvalid,
+    #[error("local file temporary download creation failed")]
+    LocalFileTempCreateFailed,
+    #[error("downloaded byte count did not match durable remote metadata")]
+    LocalFileDownloadSizeMismatch,
+    #[error("local file durability sync failed")]
+    LocalFileSyncFailed,
+    #[error("local file atomic no-overwrite promotion failed")]
+    LocalFilePromoteFailed,
+    #[error("local file temporary download cleanup failed")]
+    LocalFileTempCleanupFailed,
+    #[error("local file materialization postcondition failed")]
+    LocalFilePostconditionFailed,
+    #[error("local file materialization rollback failed")]
+    LocalFileRollbackFailed,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
     #[error("selected-root change window requires an authoritative snapshot")]
@@ -1244,6 +1513,87 @@ mod tests {
         assert!(root.join("second").is_file());
 
         std::fs::remove_file(root.join("second")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    struct FakeContentProvider {
+        bytes: Vec<u8>,
+    }
+    impl SelectedRootContentProvider for FakeContentProvider {
+        fn download_file_content(
+            &self,
+            _remote_id: &str,
+            max_bytes: u64,
+            writer: &mut dyn Write,
+        ) -> Result<u64, SelectedRootExecutorError> {
+            let len = u64::try_from(self.bytes.len())
+                .map_err(|_| SelectedRootExecutorError::ProviderOperationFailed)?;
+            if len > max_bytes {
+                return Err(SelectedRootExecutorError::ProviderOperationFailed);
+            }
+            writer
+                .write_all(&self.bytes)
+                .map_err(|_| SelectedRootExecutorError::ProviderOperationFailed)?;
+            Ok(len)
+        }
+    }
+
+    fn file_target_for_test(size: u64) -> ReceiveOnlyFileTarget {
+        let folder = directory_materialization_item(
+            "folder",
+            "selected-root",
+            "docs",
+            RemoteItemKind::Folder,
+        );
+        let mut file = directory_materialization_item(
+            "file-secret",
+            "folder",
+            "download.txt",
+            RemoteItemKind::File,
+        );
+        file.size_bytes = Some(size);
+        let local = vec![LocalTreeEntry::new("docs", LocalTreeEntryKind::Directory).unwrap()];
+        plan_receive_only_missing_file_targets(&[folder, file], &local)
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn file_materialization_is_no_overwrite_and_size_checked() {
+        let root = local_plan_temp_dir("file-download");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("docs")).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let target = file_target_for_test(5);
+        let provider = FakeContentProvider {
+            bytes: b"hello".to_vec(),
+        };
+        let out = apply_selected_root_file_target(&provider, &root, &target, 1024).unwrap();
+        assert_eq!(out.bytes_downloaded, 5);
+        assert_eq!(
+            std::fs::read(root.join("docs/download.txt")).unwrap(),
+            b"hello"
+        );
+        std::fs::remove_file(root.join("docs/download.txt")).unwrap();
+
+        std::fs::write(root.join("docs/download.txt"), b"local").unwrap();
+        assert!(matches!(
+            apply_selected_root_file_target(&provider, &root, &target, 1024),
+            Err(SelectedRootExecutorError::LocalFileTargetConflict)
+        ));
+        assert_eq!(
+            std::fs::read(root.join("docs/download.txt")).unwrap(),
+            b"local"
+        );
+        std::fs::remove_file(root.join("docs/download.txt")).unwrap();
+
+        let target = file_target_for_test(6);
+        assert!(matches!(
+            apply_selected_root_file_target(&provider, &root, &target, 1024),
+            Err(SelectedRootExecutorError::LocalFileDownloadSizeMismatch)
+        ));
+        assert!(!root.join("docs/download.txt").exists());
+        std::fs::remove_dir(root.join("docs")).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
 

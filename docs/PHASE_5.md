@@ -76,3 +76,30 @@ filesystem mutation, no Drive write, and no Drive file-content request.
 
 Phase 5C1 only grants the capability required by the later supervised file
 materialization phase; it does not download files itself.
+
+## Phase 5C2 — Supervised single-file materialization
+
+Phase 5C2 adds `nubisync sync roots materialize-file --approve`.
+
+The command is intentionally limited to exactly one missing ordinary file. It
+requires a ready receive-only selected root, no pending durable change window,
+all remote directories already present locally, no local-only/type conflicts,
+and no pre-existing unverified remote files.
+
+The durable remote size must be known and at most 16 MiB. Drive content is
+streamed with `alt=media` into a `create_new` temporary file in the target
+folder. The byte count must exactly match durable metadata and the temporary
+file is fsynced before promotion.
+
+Promotion uses an atomic hard-link creation of the final pathname, providing
+no-overwrite semantics if a local entry appears concurrently. The temp name is
+removed and the parent directory is fsynced before success. Failures clean the
+temp file; failures after promotion roll back only the file created by that
+invocation.
+
+No SQLite mutation or Drive write occurs. Existing local entries are never
+overwritten, deleted, or renamed. Output exposes only aggregate counts/bytes,
+not local names/paths, remote IDs/metadata, or OAuth token values.
+
+Descriptor-relative/openat-style filesystem race hardening remains required
+before unattended/background materialization.

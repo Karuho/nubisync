@@ -10,8 +10,9 @@ use nubisync_core::{
     ProviderAccount, ProviderId, RemoteChange, RemoteItemKind, SyncMode, SyncRoot,
 };
 use nubisync_daemon::{
-    bootstrap_selected_root_snapshot, collect_selected_root_change_window_page,
-    execute_completed_selected_root_change_window, materialize_selected_root_directories,
+    SUPERVISED_FILE_DOWNLOAD_MAX_BYTES, bootstrap_selected_root_snapshot,
+    collect_selected_root_change_window_page, execute_completed_selected_root_change_window,
+    materialize_selected_root_directories, materialize_selected_root_missing_file,
     plan_selected_root_local_materialization,
 };
 use nubisync_drive::{
@@ -109,6 +110,14 @@ fn run() -> Result<(), CliError> {
         {
             sync_roots_materialize_directories()
         }
+        [sync, roots, materialize_file, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && materialize_file == "materialize-file"
+                && approve == "--approve" =>
+        {
+            sync_roots_materialize_file()
+        }
         [sync, roots, inventory, limit, value]
             if sync == "sync"
                 && roots == "roots"
@@ -199,6 +208,7 @@ USAGE:
   nubisync sync roots metadata-step --approve
   nubisync sync roots reconcile-plan --approve
   nubisync sync roots materialize-directories --approve
+  nubisync sync roots materialize-file --approve
   nubisync sync roots inventory --limit <1-10000>
   nubisync sync roots add --mode receive_only
   nubisync sync roots add --mode receive_only --dry-run
@@ -704,6 +714,99 @@ fn sync_roots_materialize_directories() -> Result<(), CliError> {
     println!("REMOTE_METADATA_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=no");
 
+    Ok(())
+}
+
+fn sync_roots_materialize_file() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.is_empty() {
+        println!("SYNC_ROOT_FILE_MATERIALIZATION=SKIPPED");
+        println!("REASON=no_configured_root");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_FILE_MATERIALIZATION=SKIPPED");
+        println!("REASON=multiple_roots_require_selector");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_FILE_MATERIALIZATION_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+    if let Some(rotated) = tokens.refresh_token() {
+        keyring.put(&refresh_key, SecretValue::new(rotated.as_bytes().to_vec())?)?;
+    }
+
+    println!("SYNC_ROOT_FILE_MATERIALIZATION_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_FILE_MATERIALIZATION_STAGE=download_one_file");
+    let result = materialize_selected_root_missing_file(&api, &storage, root)?;
+
+    println!("SYNC_ROOT_FILE_MATERIALIZATION=PASS");
+    println!("MODE=receive_only");
+    println!("FILES_DOWNLOADED={}", result.files_downloaded);
+    println!("BYTES_DOWNLOADED={}", result.bytes_downloaded);
+    println!("MAX_FILE_BYTES={}", result.max_file_bytes);
+    println!("SIZE_MATCH_VERIFIED={}", yes_no(result.size_match_verified));
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=no");
+    println!("FILESYSTEM_MUTATION=yes");
+    println!("FILE_CONTENT_ACCESSED=yes");
+    println!("FILES_CREATED=1");
+    println!("FILES_OVERWRITTEN=0");
+    println!("FILES_DELETED=0");
+    println!("DIRECTORIES_CREATED=0");
+    println!("DIRECTORIES_REMOVED=0");
+    println!("ATOMIC_NO_OVERWRITE_PROMOTION=yes");
+    println!("TEMP_FILES_RETAINED=0");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+    println!("CONFIGURED_MAX_FILE_BYTES={SUPERVISED_FILE_DOWNLOAD_MAX_BYTES}");
     Ok(())
 }
 
