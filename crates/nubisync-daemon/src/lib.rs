@@ -135,6 +135,15 @@ impl SelectedRootRemoteReplacementPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootFileDeletion {
+    pub files_deleted: usize,
+    pub bytes_verified: u64,
+    pub stale_baseline_match: bool,
+    pub receipt_deleted: bool,
+    pub quarantine_rename: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectedRootRemoteDeletionPlan {
     pub stale_receipts_total: usize,
     pub deletion_candidates: usize,
@@ -757,6 +766,215 @@ pub fn plan_selected_root_remote_deletion(
     }
 
     Ok(result)
+}
+
+pub fn delete_selected_root_existing_file(
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootFileDeletion, SelectedRootExecutorError> {
+    let readiness = plan_selected_root_remote_deletion(storage, sync_root)?;
+    if !readiness.ready() {
+        return Err(SelectedRootExecutorError::RemoteDeletionNotReady);
+    }
+
+    let stale_receipts =
+        storage.list_sync_root_stale_file_materialization_receipts(&sync_root.id)?;
+    if stale_receipts.len() != 1 {
+        return Err(SelectedRootExecutorError::RemoteDeletionPlanStaleReceiptCountMismatch);
+    }
+    let receipt = stale_receipts
+        .first()
+        .ok_or(SelectedRootExecutorError::RemoteDeletionPlanStaleReceiptCountMismatch)?;
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let bytes_verified = delete_verified_stale_local_file(&root_path, receipt)?;
+
+    let receipt_deleted = storage
+        .delete_sync_root_stale_file_materialization_receipt(&sync_root.id, &receipt.remote_id)?;
+    if !receipt_deleted {
+        return Err(SelectedRootExecutorError::LocalFileDeletionReceiptCleanupFailed);
+    }
+
+    if storage.sync_root_materialization_receipt_count(&sync_root.id)? != 0
+        || storage.sync_root_stale_materialization_receipt_count(&sync_root.id)? != 0
+    {
+        return Err(SelectedRootExecutorError::LocalFileDeletionReceiptCleanupFailed);
+    }
+
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let post = plan_receive_only_materialization(&remote_items, &local_entries)?;
+    if post.missing_directories != 0
+        || post.missing_files != 0
+        || post.local_only_entries != 0
+        || post.type_conflicts != 0
+        || post.remote_files != 0
+        || post.existing_files_unverified != 0
+        || post.matching_directories != post.remote_directories
+    {
+        return Err(SelectedRootExecutorError::LocalFileDeletionPostconditionFailed);
+    }
+
+    Ok(SelectedRootFileDeletion {
+        files_deleted: 1,
+        bytes_verified,
+        stale_baseline_match: true,
+        receipt_deleted: true,
+        quarantine_rename: true,
+    })
+}
+
+fn delete_verified_stale_local_file(
+    root_path: &Path,
+    receipt: &SyncRootFileMaterializationReceipt,
+) -> Result<u64, SelectedRootExecutorError> {
+    let (target_path, observed_size) = match inspect_receipt_target(root_path, receipt)? {
+        ReceiptTargetInspection::File(path, size) => (path, size),
+        ReceiptTargetInspection::Missing | ReceiptTargetInspection::Conflict => {
+            return Err(SelectedRootExecutorError::RemoteDeletionNotReady);
+        }
+    };
+
+    if observed_size != receipt.size_bytes {
+        return Err(SelectedRootExecutorError::RemoteDeletionLocalConflict);
+    }
+    if receipt.size_bytes > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+        return Err(SelectedRootExecutorError::LocalFileTooLarge);
+    }
+
+    let metadata_before = fs::symlink_metadata(&target_path)
+        .map_err(|_| SelectedRootExecutorError::RemoteDeletionTargetRace)?;
+    if metadata_before.file_type().is_symlink() || !metadata_before.is_file() {
+        return Err(SelectedRootExecutorError::RemoteDeletionTargetRace);
+    }
+
+    let (bytes, sha256_hex) = hash_local_file(&target_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES)?;
+    if bytes != receipt.size_bytes || sha256_hex != receipt.sha256_hex {
+        return Err(SelectedRootExecutorError::RemoteDeletionLocalConflict);
+    }
+
+    let metadata_after = fs::symlink_metadata(&target_path)
+        .map_err(|_| SelectedRootExecutorError::RemoteDeletionTargetRace)?;
+    if !same_local_file_state(&metadata_before, &metadata_after) {
+        return Err(SelectedRootExecutorError::RemoteDeletionTargetRace);
+    }
+
+    let parent = target_path
+        .parent()
+        .ok_or(SelectedRootExecutorError::LocalFileParentInvalid)?;
+    let quarantine_path = unique_deletion_quarantine_path(parent)?;
+
+    fs::rename(&target_path, &quarantine_path)
+        .map_err(|_| SelectedRootExecutorError::LocalFileDeletionRenameFailed)?;
+
+    let quarantine_meta = match fs::symlink_metadata(&quarantine_path) {
+        Ok(meta) => meta,
+        Err(_) => {
+            rollback_deletion_quarantine(&quarantine_path, &target_path, parent)?;
+            return Err(SelectedRootExecutorError::RemoteDeletionTargetRace);
+        }
+    };
+
+    if !same_local_file_identity(&metadata_after, &quarantine_meta) {
+        rollback_deletion_quarantine(&quarantine_path, &target_path, parent)?;
+        return Err(SelectedRootExecutorError::RemoteDeletionTargetRace);
+    }
+
+    let quarantine_before_hash = quarantine_meta;
+    let (quarantine_bytes, quarantine_sha256) =
+        match hash_local_file(&quarantine_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES) {
+            Ok(value) => value,
+            Err(error) => {
+                rollback_deletion_quarantine(&quarantine_path, &target_path, parent)?;
+                return Err(error);
+            }
+        };
+
+    let quarantine_after_hash = match fs::symlink_metadata(&quarantine_path) {
+        Ok(meta) => meta,
+        Err(_) => {
+            rollback_deletion_quarantine(&quarantine_path, &target_path, parent)?;
+            return Err(SelectedRootExecutorError::RemoteDeletionTargetRace);
+        }
+    };
+
+    if !same_local_file_state(&quarantine_before_hash, &quarantine_after_hash)
+        || quarantine_bytes != receipt.size_bytes
+        || quarantine_sha256 != receipt.sha256_hex
+    {
+        rollback_deletion_quarantine(&quarantine_path, &target_path, parent)?;
+        return Err(SelectedRootExecutorError::RemoteDeletionLocalConflict);
+    }
+
+    fs::remove_file(&quarantine_path)
+        .map_err(|_| SelectedRootExecutorError::LocalFileDeletionRemoveFailed)?;
+
+    sync_parent_directory(parent)?;
+
+    match fs::symlink_metadata(&target_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(SelectedRootExecutorError::LocalFileDeletionPostconditionFailed),
+    }
+    match fs::symlink_metadata(&quarantine_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(SelectedRootExecutorError::LocalFileDeletionPostconditionFailed),
+    }
+
+    Ok(bytes)
+}
+
+fn unique_deletion_quarantine_path(parent: &Path) -> Result<PathBuf, SelectedRootExecutorError> {
+    for _ in 0..128 {
+        let counter = DOWNLOAD_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".nubisync-delete-{}-{counter}.tmp",
+            std::process::id()
+        ));
+
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(candidate);
+            }
+            Ok(_) => continue,
+            Err(_) => {
+                return Err(SelectedRootExecutorError::LocalFilesystemInspectionFailed);
+            }
+        }
+    }
+
+    Err(SelectedRootExecutorError::LocalFileDeletionQuarantineUnavailable)
+}
+
+fn rollback_deletion_quarantine(
+    quarantine_path: &Path,
+    target_path: &Path,
+    parent: &Path,
+) -> Result<(), SelectedRootExecutorError> {
+    if fs::symlink_metadata(target_path).is_ok() {
+        return Err(SelectedRootExecutorError::LocalFileDeletionRollbackFailed);
+    }
+
+    fs::rename(quarantine_path, target_path)
+        .map_err(|_| SelectedRootExecutorError::LocalFileDeletionRollbackFailed)?;
+    sync_parent_directory(parent)
+        .map_err(|_| SelectedRootExecutorError::LocalFileDeletionRollbackFailed)
+}
+
+fn sync_parent_directory(parent: &Path) -> Result<(), SelectedRootExecutorError> {
+    let parent_handle =
+        fs::File::open(parent).map_err(|_| SelectedRootExecutorError::LocalFileSyncFailed)?;
+    parent_handle
+        .sync_all()
+        .map_err(|_| SelectedRootExecutorError::LocalFileSyncFailed)
+}
+
+fn same_local_file_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.file_type().is_file()
+        && after.file_type().is_file()
+        && !before.file_type().is_symlink()
+        && !after.file_type().is_symlink()
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
 }
 
 pub fn replace_selected_root_existing_file<P: SelectedRootContentProvider>(
@@ -2226,6 +2444,24 @@ pub enum SelectedRootExecutorError {
     RemoteDeletionPlanStaleReceiptCountMismatch,
     #[error("remote deletion planning found the stale remote identity still present")]
     RemoteDeletionPlanRemoteIdentityStillPresent,
+    #[error("remote deletion is not ready because the stale local baseline is not clean")]
+    RemoteDeletionNotReady,
+    #[error("local file diverged from the stale deletion baseline")]
+    RemoteDeletionLocalConflict,
+    #[error("local deletion target changed while it was being revalidated")]
+    RemoteDeletionTargetRace,
+    #[error("unable to allocate a same-parent deletion quarantine path")]
+    LocalFileDeletionQuarantineUnavailable,
+    #[error("failed to atomically quarantine the local deletion target")]
+    LocalFileDeletionRenameFailed,
+    #[error("failed to remove the quarantined local file")]
+    LocalFileDeletionRemoveFailed,
+    #[error("failed to roll back the quarantined local file")]
+    LocalFileDeletionRollbackFailed,
+    #[error("local file deletion failed its postcondition")]
+    LocalFileDeletionPostconditionFailed,
+    #[error("stale materialization receipt cleanup failed after local deletion")]
+    LocalFileDeletionReceiptCleanupFailed,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
     #[error("selected-root change window requires an authoritative snapshot")]
@@ -2497,13 +2733,46 @@ mod tests {
         std::fs::write(&path, b"hello").unwrap();
 
         let before = std::fs::symlink_metadata(&path).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        std::fs::write(&path, b"HELLO").unwrap();
+        std::fs::write(&path, b"HELLO!").unwrap();
         let after = std::fs::symlink_metadata(&path).unwrap();
 
         assert!(!same_local_file_state(&before, &after));
 
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn verified_stale_file_deletion_removes_only_matching_baseline() {
+        let root = local_plan_temp_dir("safe-delete");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/file.txt"), b"hello").unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+
+        let receipt = SyncRootFileMaterializationReceipt {
+            remote_id: "remote".into(),
+            relative_path: "docs/file.txt".into(),
+            size_bytes: 5,
+            sha256_hex: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
+            materialized_at_unix_ms: 1,
+        };
+
+        assert_eq!(
+            delete_verified_stale_local_file(&root, &receipt).unwrap(),
+            5
+        );
+        assert!(!root.join("docs/file.txt").exists());
+
+        std::fs::write(root.join("docs/file.txt"), b"HELLO").unwrap();
+        assert!(matches!(
+            delete_verified_stale_local_file(&root, &receipt),
+            Err(SelectedRootExecutorError::RemoteDeletionLocalConflict)
+        ));
+        assert_eq!(std::fs::read(root.join("docs/file.txt")).unwrap(), b"HELLO");
+
+        std::fs::remove_file(root.join("docs/file.txt")).unwrap();
+        std::fs::remove_dir(root.join("docs")).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
 

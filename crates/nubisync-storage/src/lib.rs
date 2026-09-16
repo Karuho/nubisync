@@ -1770,6 +1770,22 @@ impl Storage {
         u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
     }
 
+    pub fn delete_sync_root_stale_file_materialization_receipt(
+        &mut self,
+        sync_root_id: &str,
+        remote_id: &str,
+    ) -> Result<bool, StorageError> {
+        let deleted = self.connection.execute(
+            "DELETE FROM sync_root_file_materialization_receipts
+             WHERE sync_root_id = ?1
+               AND remote_id = ?2
+               AND receipt_state = 'stale'",
+            params![sync_root_id, remote_id],
+        )?;
+
+        Ok(deleted == 1)
+    }
+
     pub fn sync_root_change_cursor(
         &self,
         sync_root_id: &str,
@@ -4908,6 +4924,93 @@ mod phase5c5_stale_receipt_tests {
                 .sync_root_stale_materialization_receipt_count(&root.id)
                 .unwrap(),
             0
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase5c9_deletion_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn stale_receipt_cleanup_never_deletes_current_receipt() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = ProviderAccount::new(provider.clone(), "subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5c9-root",
+            provider,
+            account.subject,
+            "/tmp/phase5c9-root",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_file_materialization_receipts (
+                    sync_root_id,
+                    remote_id,
+                    relative_path,
+                    size_bytes,
+                    sha256_hex,
+                    materialized_at_unix_ms,
+                    receipt_state
+                 ) VALUES (?1, 'gone', 'gone.txt', 5, ?2, 3, 'stale')",
+                params![root.id, "a".repeat(64)],
+            )
+            .unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_file_materialization_receipts (
+                    sync_root_id,
+                    remote_id,
+                    relative_path,
+                    size_bytes,
+                    sha256_hex,
+                    materialized_at_unix_ms,
+                    receipt_state
+                 ) VALUES (?1, 'live', 'live.txt', 5, ?2, 4, 'current')",
+                params![root.id, "b".repeat(64)],
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .delete_sync_root_stale_file_materialization_receipt(&root.id, "gone")
+                .unwrap()
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+
+        assert!(
+            !storage
+                .delete_sync_root_stale_file_materialization_receipt(&root.id, "live")
+                .unwrap()
+        );
+        assert_eq!(
+            storage
+                .sync_root_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
         );
     }
 }

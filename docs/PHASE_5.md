@@ -256,3 +256,33 @@ It does not print local names, remote IDs or hash values.
 A later supervised deletion executor must revalidate the same baseline
 immediately before unlinking and must address the pathname race boundary before
 unattended/adversarial operation.
+
+## Phase 5C9 — Supervised safe local deletion
+
+Phase 5C9 adds `nubisync sync roots delete-file --approve`.
+
+The command performs no provider request. It requires the 5C8 read-only deletion
+plan to be ready and then revalidates the stale materialization baseline
+immediately before any destructive filesystem action.
+
+NubiSync hashes the remaining local file against the stale receipt and checks
+Linux device/inode/size/mtime/ctime state around that hash. It then atomically
+renames the exact candidate into an unpredictable same-parent quarantine name,
+verifies that the quarantined inode is the one that was validated, hashes the
+quarantined bytes again, and only then removes that quarantine file.
+
+The parent directory is fsynced after deletion. The stale receipt is deleted from
+SQLite only after the filesystem deletion succeeds. If receipt cleanup fails
+after deletion, the stale receipt remains and later operations fail closed rather
+than silently claiming a completed state.
+
+The final postcondition requires no local-only entries, no missing remote targets,
+no type conflicts, no remote files and zero current/stale materialization
+receipts.
+
+Ordinary pathname APIs still leave a narrow race between the final quarantine
+verification and unlink. The quarantine+inode binding substantially narrows the
+supervised mutation window but does not replace future descriptor-relative
+openat2/dirfd hardening required for unattended/adversarial operation.
+
+Phase 5C9 performs no Drive writes and no network request.
