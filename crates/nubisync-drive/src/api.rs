@@ -360,6 +360,31 @@ impl GoogleDriveApi {
         })
     }
 
+    /// Fetches the current provider fingerprint for one ordinary Drive blob.
+    ///
+    /// This is metadata-only. The SHA-256 is returned by Drive and is never
+    /// printed by this provider.
+    pub fn fetch_blob_fingerprint(
+        &self,
+        remote_id: &str,
+    ) -> Result<DriveBlobFingerprint, DriveApiError> {
+        validate_drive_file_id(remote_id)?;
+
+        let metadata: DriveBlobFingerprintResponse = self
+            .client
+            .get(format!("{GOOGLE_DRIVE_FILES_ENDPOINT}/{remote_id}"))
+            .bearer_auth(self.access_token.as_str())
+            .query(&[(
+                "fields",
+                "id,mimeType,size,sha256Checksum,trashed,ownedByMe",
+            )])
+            .send()?
+            .error_for_status()?
+            .json()?;
+
+        validate_blob_fingerprint_response(remote_id, metadata)
+    }
+
     /// Streams one ordinary Drive blob into a caller-owned writer.
     pub fn download_blob_to_writer(
         &self,
@@ -442,6 +467,42 @@ pub enum DriveRootMembership {
     Root,
     Descendant,
     Outside,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct DriveBlobFingerprint {
+    pub size_bytes: u64,
+    sha256_hex: String,
+}
+
+impl DriveBlobFingerprint {
+    pub fn sha256_hex(&self) -> &str {
+        &self.sha256_hex
+    }
+}
+
+impl fmt::Debug for DriveBlobFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriveBlobFingerprint")
+            .field("size_bytes", &self.size_bytes)
+            .field("sha256_hex", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DriveBlobFingerprintResponse {
+    id: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    size: Option<String>,
+    #[serde(rename = "sha256Checksum")]
+    sha256_checksum: Option<String>,
+    #[serde(default)]
+    trashed: bool,
+    #[serde(rename = "ownedByMe", default)]
+    owned_by_me: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -795,6 +856,41 @@ struct GoogleFile {
     trashed: bool,
 }
 
+fn validate_blob_fingerprint_response(
+    expected_remote_id: &str,
+    metadata: DriveBlobFingerprintResponse,
+) -> Result<DriveBlobFingerprint, DriveApiError> {
+    if metadata.id != expected_remote_id {
+        return Err(DriveApiError::InvalidBlobFingerprintMetadata);
+    }
+
+    if metadata.trashed
+        || !metadata.owned_by_me
+        || metadata.mime_type == GOOGLE_DRIVE_FOLDER_MIME_TYPE
+        || metadata
+            .mime_type
+            .starts_with("application/vnd.google-apps.")
+    {
+        return Err(DriveApiError::BlobFingerprintNotOrdinaryFile);
+    }
+
+    let size_bytes = parse_optional_u64(metadata.size.as_deref(), "file.size")?
+        .ok_or(DriveApiError::BlobFingerprintSizeMissing)?;
+
+    let sha256_hex = metadata
+        .sha256_checksum
+        .ok_or(DriveApiError::BlobFingerprintSha256Missing)?;
+
+    if sha256_hex.len() != 64 || !sha256_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(DriveApiError::BlobFingerprintSha256Invalid);
+    }
+
+    Ok(DriveBlobFingerprint {
+        size_bytes,
+        sha256_hex: sha256_hex.to_ascii_lowercase(),
+    })
+}
+
 fn validate_hydration_root(item: &RemoteItem) -> Result<(), DriveApiError> {
     validate_ancestry_id(&item.remote_id)?;
 
@@ -994,6 +1090,16 @@ pub enum DriveApiError {
     DownloadSafetyLimitExceeded,
     #[error("Google Drive file download stream I/O failed")]
     ContentIo(#[from] std::io::Error),
+    #[error("Google Drive blob fingerprint metadata is invalid")]
+    InvalidBlobFingerprintMetadata,
+    #[error("Google Drive blob fingerprint target is not a supported ordinary file")]
+    BlobFingerprintNotOrdinaryFile,
+    #[error("Google Drive blob fingerprint is missing durable byte size")]
+    BlobFingerprintSizeMissing,
+    #[error("Google Drive blob fingerprint is missing SHA-256")]
+    BlobFingerprintSha256Missing,
+    #[error("Google Drive blob fingerprint SHA-256 is invalid")]
+    BlobFingerprintSha256Invalid,
     #[error("Google Drive remote root is not a folder")]
     RemoteRootNotFolder,
     #[error("Google Drive remote root is trashed")]
@@ -1048,6 +1154,48 @@ mod tests {
             Err(DriveApiError::DownloadSafetyLimitExceeded)
         ));
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn blob_fingerprint_requires_supported_sha256_metadata() {
+        let valid = DriveBlobFingerprintResponse {
+            id: "file-id".into(),
+            mime_type: "text/plain".into(),
+            size: Some("13".into()),
+            sha256_checksum: Some("a".repeat(64)),
+            trashed: false,
+            owned_by_me: true,
+        };
+
+        let fingerprint = validate_blob_fingerprint_response("file-id", valid).unwrap();
+        assert_eq!(fingerprint.size_bytes, 13);
+        assert_eq!(fingerprint.sha256_hex(), "a".repeat(64));
+
+        let missing_hash = DriveBlobFingerprintResponse {
+            id: "file-id".into(),
+            mime_type: "text/plain".into(),
+            size: Some("13".into()),
+            sha256_checksum: None,
+            trashed: false,
+            owned_by_me: true,
+        };
+        assert!(matches!(
+            validate_blob_fingerprint_response("file-id", missing_hash),
+            Err(DriveApiError::BlobFingerprintSha256Missing)
+        ));
+
+        let native = DriveBlobFingerprintResponse {
+            id: "file-id".into(),
+            mime_type: "application/vnd.google-apps.document".into(),
+            size: None,
+            sha256_checksum: None,
+            trashed: false,
+            owned_by_me: true,
+        };
+        assert!(matches!(
+            validate_blob_fingerprint_response("file-id", native),
+            Err(DriveApiError::BlobFingerprintNotOrdinaryFile)
+        ));
     }
 
     #[test]

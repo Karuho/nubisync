@@ -5,7 +5,9 @@
 use nubisync_core::{
     ChangeCursor, ChangePage, ContinuationToken, RemoteChange, RemoteItem, RemoteItemKind, SyncRoot,
 };
-use nubisync_drive::{DriveApiError, DriveFolderRoot, DriveRootMembership, GoogleDriveApi};
+use nubisync_drive::{
+    DriveApiError, DriveBlobFingerprint, DriveFolderRoot, DriveRootMembership, GoogleDriveApi,
+};
 use nubisync_storage::{
     Storage, StorageError, SyncRootCatalogBatchCommit, SyncRootCatalogMutation,
     SyncRootFileMaterializationReceipt,
@@ -20,8 +22,9 @@ use nubisync_sync::{
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashSet, VecDeque},
-    fs,
+    fmt, fs,
     io::{Read, Write},
+    os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -44,6 +47,41 @@ pub struct SelectedRootFileMaterialization {
     pub bytes_downloaded: u64,
     pub max_file_bytes: u64,
     pub size_match_verified: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootFileReplacement {
+    pub files_replaced: usize,
+    pub bytes_downloaded: u64,
+    pub stale_baseline_match: bool,
+    pub provider_fingerprint_match: bool,
+    pub receipt_recorded: bool,
+    pub atomic_replace: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectedRootContentFingerprint {
+    pub size_bytes: u64,
+    sha256_hex: String,
+}
+
+impl SelectedRootContentFingerprint {
+    fn from_drive(value: DriveBlobFingerprint) -> Self {
+        Self {
+            size_bytes: value.size_bytes,
+            sha256_hex: value.sha256_hex().to_owned(),
+        }
+    }
+}
+
+impl fmt::Debug for SelectedRootContentFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedRootContentFingerprint")
+            .field("size_bytes", &self.size_bytes)
+            .field("sha256_hex", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +135,11 @@ impl SelectedRootRemoteReplacementPlan {
 }
 
 pub trait SelectedRootContentProvider {
+    fn content_fingerprint(
+        &self,
+        remote_id: &str,
+    ) -> Result<SelectedRootContentFingerprint, SelectedRootExecutorError>;
+
     fn download_file_content(
         &self,
         remote_id: &str,
@@ -106,6 +149,14 @@ pub trait SelectedRootContentProvider {
 }
 
 impl SelectedRootContentProvider for GoogleDriveApi {
+    fn content_fingerprint(
+        &self,
+        remote_id: &str,
+    ) -> Result<SelectedRootContentFingerprint, SelectedRootExecutorError> {
+        let fingerprint = self.fetch_blob_fingerprint(remote_id)?;
+        Ok(SelectedRootContentFingerprint::from_drive(fingerprint))
+    }
+
     fn download_file_content(
         &self,
         remote_id: &str,
@@ -596,6 +647,224 @@ pub fn plan_selected_root_remote_replacement(
     }
 
     Ok(result)
+}
+
+pub fn replace_selected_root_existing_file<P: SelectedRootContentProvider>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootFileReplacement, SelectedRootExecutorError> {
+    let readiness = plan_selected_root_remote_replacement(storage, sync_root)?;
+    if !readiness.ready() {
+        return Err(SelectedRootExecutorError::RemoteReplacementNotReady);
+    }
+
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let targets = plan_receive_only_existing_file_targets(&remote_items, &local_entries)?;
+    let stale_receipts =
+        storage.list_sync_root_stale_file_materialization_receipts(&sync_root.id)?;
+
+    if targets.len() != 1 || stale_receipts.len() != 1 {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanTargetMismatch);
+    }
+
+    let target = targets
+        .first()
+        .ok_or(SelectedRootExecutorError::RemoteReplacementPlanTargetMismatch)?;
+    let stale = stale_receipts
+        .first()
+        .ok_or(SelectedRootExecutorError::RemoteReplacementPlanStaleReceiptCountMismatch)?;
+
+    if target.remote_id() != stale.remote_id.as_str()
+        || target.relative_path() != stale.relative_path.as_str()
+    {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanTargetMismatch);
+    }
+
+    let expected_remote_size = target
+        .size_bytes()
+        .ok_or(SelectedRootExecutorError::LocalFileSizeUnknown)?;
+    if expected_remote_size > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+        return Err(SelectedRootExecutorError::LocalFileTooLarge);
+    }
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let target_path = root_path.join(target.relative_path());
+    if !target_path.starts_with(&root_path) {
+        return Err(SelectedRootExecutorError::LocalFileTargetEscapedRoot);
+    }
+
+    let parent = target_path
+        .parent()
+        .ok_or(SelectedRootExecutorError::LocalFileParentInvalid)?;
+    let parent_meta = fs::symlink_metadata(parent)
+        .map_err(|_| SelectedRootExecutorError::LocalFileParentInvalid)?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+        return Err(SelectedRootExecutorError::LocalFileParentInvalid);
+    }
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|_| SelectedRootExecutorError::LocalFileParentInvalid)?;
+    if !canonical_parent.starts_with(&root_path) {
+        return Err(SelectedRootExecutorError::LocalFileParentInvalid);
+    }
+
+    let fingerprint_before = provider.content_fingerprint(target.remote_id())?;
+    if fingerprint_before.size_bytes != expected_remote_size
+        || fingerprint_before.size_bytes > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES
+    {
+        return Err(SelectedRootExecutorError::RemoteReplacementProviderFingerprintMismatch);
+    }
+
+    let (temp_path, mut temp_file) = create_download_temp(parent)?;
+    let download = (|| {
+        let mut hashing_writer = HashingWriter::new(&mut temp_file);
+        let provider_bytes = provider.download_file_content(
+            target.remote_id(),
+            SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
+            &mut hashing_writer,
+        )?;
+        let hashed_bytes = hashing_writer.bytes_written();
+        let sha256_hex = hashing_writer.finish_hex();
+
+        if provider_bytes != hashed_bytes {
+            return Err(SelectedRootExecutorError::LocalFileProviderByteCountMismatch);
+        }
+        if provider_bytes != expected_remote_size {
+            return Err(SelectedRootExecutorError::LocalFileDownloadSizeMismatch);
+        }
+
+        Ok((provider_bytes, sha256_hex))
+    })();
+
+    let (downloaded_bytes, downloaded_sha256) = match download {
+        Ok(value) => value,
+        Err(error) => {
+            drop(temp_file);
+            cleanup_temp_file(&temp_path)?;
+            return Err(error);
+        }
+    };
+
+    if temp_file.sync_all().is_err() {
+        drop(temp_file);
+        cleanup_temp_file(&temp_path)?;
+        return Err(SelectedRootExecutorError::LocalFileSyncFailed);
+    }
+    drop(temp_file);
+
+    let fingerprint_after = match provider.content_fingerprint(target.remote_id()) {
+        Ok(value) => value,
+        Err(error) => {
+            cleanup_temp_file(&temp_path)?;
+            return Err(error);
+        }
+    };
+
+    if fingerprint_before != fingerprint_after
+        || downloaded_bytes != fingerprint_after.size_bytes
+        || downloaded_sha256 != fingerprint_after.sha256_hex
+    {
+        cleanup_temp_file(&temp_path)?;
+        return Err(SelectedRootExecutorError::RemoteReplacementProviderFingerprintMismatch);
+    }
+
+    let (verified_target_path, observed_size) = match inspect_receipt_target(&root_path, stale)? {
+        ReceiptTargetInspection::File(path, size) => (path, size),
+        ReceiptTargetInspection::Missing | ReceiptTargetInspection::Conflict => {
+            cleanup_temp_file(&temp_path)?;
+            return Err(SelectedRootExecutorError::RemoteReplacementNotReady);
+        }
+    };
+
+    if verified_target_path != target_path || observed_size != stale.size_bytes {
+        cleanup_temp_file(&temp_path)?;
+        return Err(SelectedRootExecutorError::RemoteReplacementLocalConflict);
+    }
+
+    let metadata_before = fs::symlink_metadata(&target_path)
+        .map_err(|_| SelectedRootExecutorError::RemoteReplacementTargetRace)?;
+    if metadata_before.file_type().is_symlink() || !metadata_before.is_file() {
+        cleanup_temp_file(&temp_path)?;
+        return Err(SelectedRootExecutorError::RemoteReplacementTargetRace);
+    }
+
+    let (local_bytes, local_sha256) =
+        hash_local_file(&target_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES)?;
+    if local_bytes != stale.size_bytes || local_sha256 != stale.sha256_hex {
+        cleanup_temp_file(&temp_path)?;
+        return Err(SelectedRootExecutorError::RemoteReplacementLocalConflict);
+    }
+
+    let metadata_after = fs::symlink_metadata(&target_path)
+        .map_err(|_| SelectedRootExecutorError::RemoteReplacementTargetRace)?;
+    if !same_local_file_state(&metadata_before, &metadata_after) {
+        cleanup_temp_file(&temp_path)?;
+        return Err(SelectedRootExecutorError::RemoteReplacementTargetRace);
+    }
+
+    if fs::rename(&temp_path, &target_path).is_err() {
+        cleanup_temp_file(&temp_path)?;
+        return Err(SelectedRootExecutorError::LocalFileReplaceFailed);
+    }
+
+    let parent_handle =
+        fs::File::open(parent).map_err(|_| SelectedRootExecutorError::LocalFileSyncFailed)?;
+    parent_handle
+        .sync_all()
+        .map_err(|_| SelectedRootExecutorError::LocalFileSyncFailed)?;
+
+    let promoted_meta = fs::symlink_metadata(&target_path)
+        .map_err(|_| SelectedRootExecutorError::LocalFileReplacementPostconditionFailed)?;
+    if promoted_meta.file_type().is_symlink()
+        || !promoted_meta.is_file()
+        || promoted_meta.len() != downloaded_bytes
+    {
+        return Err(SelectedRootExecutorError::LocalFileReplacementPostconditionFailed);
+    }
+
+    let (promoted_bytes, promoted_sha256) =
+        hash_local_file(&target_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES)?;
+    if promoted_bytes != downloaded_bytes || promoted_sha256 != downloaded_sha256 {
+        return Err(SelectedRootExecutorError::LocalFileReplacementPostconditionFailed);
+    }
+
+    storage.record_sync_root_file_materialization(
+        &sync_root.id,
+        target.remote_id(),
+        target.relative_path(),
+        downloaded_bytes,
+        &downloaded_sha256,
+        current_unix_time_ms()?,
+    )?;
+
+    let current_receipts = storage.sync_root_materialization_receipt_count(&sync_root.id)?;
+    let stale_receipts = storage.sync_root_stale_materialization_receipt_count(&sync_root.id)?;
+    if current_receipts != 1 || stale_receipts != 0 {
+        return Err(SelectedRootExecutorError::LocalFileReceiptPostconditionFailed);
+    }
+
+    Ok(SelectedRootFileReplacement {
+        files_replaced: 1,
+        bytes_downloaded: downloaded_bytes,
+        stale_baseline_match: true,
+        provider_fingerprint_match: true,
+        receipt_recorded: true,
+        atomic_replace: true,
+    })
+}
+
+fn same_local_file_state(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.file_type().is_file()
+        && after.file_type().is_file()
+        && !before.file_type().is_symlink()
+        && !after.file_type().is_symlink()
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
 }
 
 pub fn verify_selected_root_local_receipts(
@@ -1825,6 +2094,20 @@ pub enum SelectedRootExecutorError {
     RemoteReplacementPlanStaleReceiptCountMismatch,
     #[error("remote replacement planning target does not match the stale baseline")]
     RemoteReplacementPlanTargetMismatch,
+    #[error("remote replacement is not ready because the stale local baseline is not clean")]
+    RemoteReplacementNotReady,
+    #[error("provider fingerprint changed or did not match downloaded content")]
+    RemoteReplacementProviderFingerprintMismatch,
+    #[error("local file diverged from the stale materialization baseline")]
+    RemoteReplacementLocalConflict,
+    #[error("local replacement target changed while it was being revalidated")]
+    RemoteReplacementTargetRace,
+    #[error("atomic replacement of the existing local file failed")]
+    LocalFileReplaceFailed,
+    #[error("replaced local file failed post-promotion verification")]
+    LocalFileReplacementPostconditionFailed,
+    #[error("replacement receipt state failed its durable postcondition")]
+    LocalFileReceiptPostconditionFailed,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
     #[error("selected-root change window requires an authoritative snapshot")]
@@ -2088,10 +2371,41 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
+    #[test]
+    fn local_file_state_detects_in_place_change() {
+        let root = local_plan_temp_dir("replacement-state");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("file.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(&path, b"HELLO").unwrap();
+        let after = std::fs::symlink_metadata(&path).unwrap();
+
+        assert!(!same_local_file_state(&before, &after));
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
     struct FakeContentProvider {
         bytes: Vec<u8>,
     }
     impl SelectedRootContentProvider for FakeContentProvider {
+        fn content_fingerprint(
+            &self,
+            _remote_id: &str,
+        ) -> Result<SelectedRootContentFingerprint, SelectedRootExecutorError> {
+            let mut hasher = Sha256::new();
+            hasher.update(&self.bytes);
+            Ok(SelectedRootContentFingerprint {
+                size_bytes: u64::try_from(self.bytes.len())
+                    .map_err(|_| SelectedRootExecutorError::ProviderOperationFailed)?,
+                sha256_hex: digest_to_hex(hasher.finalize().as_slice()),
+            })
+        }
+
         fn download_file_content(
             &self,
             _remote_id: &str,

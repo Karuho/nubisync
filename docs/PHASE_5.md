@@ -197,3 +197,33 @@ provider version without having detected an independent local modification.
 
 Renames, moves, missing local files and filesystem type conflicts fail closed or
 produce a non-ready plan. This phase never overwrites or deletes anything.
+
+## Phase 5C7 — Supervised safe replacement of one receive-only file
+
+Phase 5C7 adds `nubisync sync roots replace-file --approve`.
+
+The command remains supervised and is limited to exactly one ordinary remote
+file with one stale materialization baseline. Before provider access, the 5C6
+read-only replacement plan must report the candidate ready.
+
+After refreshing the existing `drive.readonly` grant and verifying the configured
+Google account, NubiSync fetches a provider-side SHA-256 fingerprint and size,
+downloads the current remote blob to a same-parent temporary file, hashes SHA-256
+while streaming, then fetches the provider fingerprint again. The pre/post
+fingerprints must match each other and the downloaded SHA-256/byte count.
+
+Immediately before the destructive step, NubiSync re-hashes the existing local
+file against the stale receipt and checks Linux inode/device/size/mtime/ctime
+state around that hash. Any detected local divergence or target race aborts.
+
+Promotion uses same-directory `rename` for atomic replacement on Linux. The
+downloaded temporary file is fsynced before promotion, the parent directory is
+synced after promotion, and the promoted file is re-hashed before the durable
+receipt is returned to `current`.
+
+If persistence fails after filesystem promotion, the stale receipt remains
+fail-closed rather than silently trusting the new local bytes. Ordinary pathname
+APIs still leave a narrow TOCTOU window; descriptor-relative/openat2 hardening
+remains required before unattended/adversarial operation.
+
+Phase 5C7 performs no Drive writes.
