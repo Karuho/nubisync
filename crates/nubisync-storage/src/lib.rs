@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
@@ -85,6 +85,24 @@ impl std::fmt::Debug for SyncRootFileMaterializationReceipt {
             .field("relative_path", &"[redacted]")
             .field("size_bytes", &self.size_bytes)
             .field("sha256_hex", &"[redacted]")
+            .field("materialized_at_unix_ms", &self.materialized_at_unix_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SyncRootDirectoryMaterializationReceipt {
+    pub remote_id: String,
+    pub relative_path: String,
+    pub materialized_at_unix_ms: i64,
+}
+
+impl std::fmt::Debug for SyncRootDirectoryMaterializationReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SyncRootDirectoryMaterializationReceipt")
+            .field("remote_id", &"[redacted]")
+            .field("relative_path", &"[redacted]")
             .field("materialized_at_unix_ms", &self.materialized_at_unix_ms)
             .finish()
     }
@@ -365,6 +383,20 @@ impl Storage {
                     REFERENCES sync_roots(id)
                     ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS sync_root_directory_materialization_receipts (
+                sync_root_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                materialized_at_unix_ms INTEGER NOT NULL,
+                receipt_state TEXT NOT NULL DEFAULT 'current' CHECK (
+                    receipt_state IN ('current', 'stale')
+                ),
+                PRIMARY KEY (sync_root_id, remote_id),
+                FOREIGN KEY (sync_root_id)
+                    REFERENCES sync_roots(id)
+                    ON DELETE CASCADE
+            );
             ",
         )?;
 
@@ -432,6 +464,17 @@ impl Storage {
             "CREATE UNIQUE INDEX IF NOT EXISTS
                 sync_root_file_materialization_current_path_idx
              ON sync_root_file_materialization_receipts (
+                sync_root_id,
+                relative_path
+             )
+             WHERE receipt_state = 'current'",
+            [],
+        )?;
+
+        transaction.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS
+                sync_root_directory_materialization_current_path_idx
+             ON sync_root_directory_materialization_receipts (
                 sync_root_id,
                 relative_path
              )
@@ -1786,6 +1829,161 @@ impl Storage {
         Ok(deleted == 1)
     }
 
+    pub fn record_sync_root_directory_materializations(
+        &mut self,
+        sync_root_id: &str,
+        directories: &[(String, String)],
+        materialized_at_unix_ms: i64,
+    ) -> Result<usize, StorageError> {
+        if directories.is_empty() {
+            return Ok(0);
+        }
+
+        let mut remote_ids = std::collections::HashSet::with_capacity(directories.len());
+        let mut relative_paths = std::collections::HashSet::with_capacity(directories.len());
+        for (remote_id, relative_path) in directories {
+            validate_directory_materialization_receipt_values(remote_id, relative_path)?;
+            if !remote_ids.insert(remote_id.as_str())
+                || !relative_paths.insert(relative_path.as_str())
+            {
+                return Err(StorageError::InvalidDirectoryMaterializationReceipt);
+            }
+        }
+
+        let transaction = self.connection.transaction()?;
+
+        for (remote_id, relative_path) in directories {
+            let remote: Option<(String, i64)> = transaction
+                .query_row(
+                    "SELECT item_kind, trashed
+                     FROM sync_root_remote_items
+                     WHERE sync_root_id = ?1 AND remote_id = ?2",
+                    params![sync_root_id, remote_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+
+            let Some((item_kind, trashed)) = remote else {
+                return Err(StorageError::DirectoryMaterializationReceiptRemoteItemMissing);
+            };
+
+            if item_kind != "folder" || trashed != 0 {
+                return Err(StorageError::DirectoryMaterializationReceiptRemoteItemMismatch);
+            }
+
+            transaction.execute(
+                "INSERT INTO sync_root_directory_materialization_receipts (
+                    sync_root_id,
+                    remote_id,
+                    relative_path,
+                    materialized_at_unix_ms,
+                    receipt_state
+                 ) VALUES (?1, ?2, ?3, ?4, 'current')
+                 ON CONFLICT(sync_root_id, remote_id) DO UPDATE SET
+                    relative_path = excluded.relative_path,
+                    materialized_at_unix_ms = excluded.materialized_at_unix_ms,
+                    receipt_state = 'current'",
+                params![
+                    sync_root_id,
+                    remote_id,
+                    relative_path,
+                    materialized_at_unix_ms
+                ],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(directories.len())
+    }
+
+    pub fn list_sync_root_directory_materialization_receipts(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<Vec<SyncRootDirectoryMaterializationReceipt>, StorageError> {
+        self.list_sync_root_directory_materialization_receipts_by_state(sync_root_id, "current")
+    }
+
+    pub fn list_sync_root_stale_directory_materialization_receipts(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<Vec<SyncRootDirectoryMaterializationReceipt>, StorageError> {
+        self.list_sync_root_directory_materialization_receipts_by_state(sync_root_id, "stale")
+    }
+
+    fn list_sync_root_directory_materialization_receipts_by_state(
+        &self,
+        sync_root_id: &str,
+        state: &str,
+    ) -> Result<Vec<SyncRootDirectoryMaterializationReceipt>, StorageError> {
+        if !matches!(state, "current" | "stale") {
+            return Err(StorageError::InvalidDirectoryMaterializationReceipt);
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT remote_id, relative_path, materialized_at_unix_ms
+             FROM sync_root_directory_materialization_receipts
+             WHERE sync_root_id = ?1
+               AND receipt_state = ?2
+             ORDER BY remote_id",
+        )?;
+
+        let rows = statement.query_map(params![sync_root_id, state], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut receipts = Vec::new();
+        for row in rows {
+            let (remote_id, relative_path, materialized_at_unix_ms) = row?;
+            validate_directory_materialization_receipt_values(&remote_id, &relative_path)?;
+            receipts.push(SyncRootDirectoryMaterializationReceipt {
+                remote_id,
+                relative_path,
+                materialized_at_unix_ms,
+            });
+        }
+
+        Ok(receipts)
+    }
+
+    pub fn sync_root_directory_materialization_receipt_count(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<u64, StorageError> {
+        self.sync_root_directory_materialization_receipt_count_by_state(sync_root_id, "current")
+    }
+
+    pub fn sync_root_stale_directory_materialization_receipt_count(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<u64, StorageError> {
+        self.sync_root_directory_materialization_receipt_count_by_state(sync_root_id, "stale")
+    }
+
+    fn sync_root_directory_materialization_receipt_count_by_state(
+        &self,
+        sync_root_id: &str,
+        state: &str,
+    ) -> Result<u64, StorageError> {
+        if !matches!(state, "current" | "stale") {
+            return Err(StorageError::InvalidDirectoryMaterializationReceipt);
+        }
+
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_directory_materialization_receipts
+             WHERE sync_root_id = ?1
+               AND receipt_state = ?2",
+            params![sync_root_id, state],
+            |row| row.get(0),
+        )?;
+
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
     pub fn sync_root_change_cursor(
         &self,
         sync_root_id: &str,
@@ -2311,6 +2509,24 @@ fn validate_materialization_receipt_values(
     Ok(())
 }
 
+fn validate_directory_materialization_receipt_values(
+    remote_id: &str,
+    relative_path: &str,
+) -> Result<(), StorageError> {
+    if remote_id.trim().is_empty()
+        || relative_path.is_empty()
+        || relative_path.starts_with('/')
+        || relative_path.ends_with('/')
+        || relative_path.contains('\0')
+        || relative_path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(StorageError::InvalidDirectoryMaterializationReceipt);
+    }
+    Ok(())
+}
+
 fn invalidate_sync_root_materialization_subtree(
     transaction: &Transaction<'_>,
     sync_root_id: &str,
@@ -2332,6 +2548,24 @@ fn invalidate_sync_root_materialization_subtree(
            AND remote_id IN (SELECT remote_id FROM subtree)",
         params![sync_root_id, remote_id],
     )?;
+
+    transaction.execute(
+        "WITH RECURSIVE subtree(remote_id) AS (
+            SELECT ?2
+            UNION
+            SELECT child.remote_id
+            FROM sync_root_remote_items AS child
+            INNER JOIN subtree AS parent ON child.parent_remote_id = parent.remote_id
+            WHERE child.sync_root_id = ?1
+         )
+         UPDATE sync_root_directory_materialization_receipts
+         SET receipt_state = 'stale'
+         WHERE sync_root_id = ?1
+           AND receipt_state = 'current'
+           AND remote_id IN (SELECT remote_id FROM subtree)",
+        params![sync_root_id, remote_id],
+    )?;
+
     Ok(())
 }
 
@@ -2712,6 +2946,12 @@ fn insert_remote_upsert(
 pub enum StorageError {
     #[error("materialization receipt contains invalid values")]
     InvalidMaterializationReceipt,
+    #[error("directory materialization receipt contains invalid values")]
+    InvalidDirectoryMaterializationReceipt,
+    #[error("directory materialization receipt remote item is missing")]
+    DirectoryMaterializationReceiptRemoteItemMissing,
+    #[error("directory materialization receipt does not match durable remote folder metadata")]
+    DirectoryMaterializationReceiptRemoteItemMismatch,
     #[error("materialization receipt remote item is missing")]
     MaterializationReceiptRemoteItemMissing,
     #[error("materialization receipt does not match durable remote file metadata")]
@@ -5009,6 +5249,114 @@ mod phase5c9_deletion_receipt_tests {
         assert_eq!(
             storage
                 .sync_root_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase5c10_directory_receipt_tests {
+    use super::*;
+
+    fn setup() -> (Storage, SyncRoot) {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5c10-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5c10-root",
+            provider,
+            account.subject,
+            "/tmp/phase5c10-root",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_remote_items (
+                    sync_root_id,
+                    remote_id,
+                    parent_remote_id,
+                    name,
+                    item_kind,
+                    size_bytes,
+                    trashed,
+                    observed_at_unix_ms
+                 ) VALUES (?1, 'folder', 'remote-root', 'folder', 'folder', NULL, 0, 3)",
+                params![root.id],
+            )
+            .unwrap();
+
+        (storage, root)
+    }
+
+    #[test]
+    fn schema_v11_contains_directory_receipts() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert_eq!(storage.schema_version().unwrap(), 11);
+
+        let exists: i64 = storage
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name = 'sync_root_directory_materialization_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+    }
+
+    #[test]
+    fn directory_receipt_records_and_invalidates_to_stale() {
+        let (mut storage, root) = setup();
+
+        assert_eq!(
+            storage
+                .record_sync_root_directory_materializations(
+                    &root.id,
+                    &[("folder".into(), "folder".into())],
+                    4,
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .sync_root_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+
+        let transaction = storage.connection.transaction().unwrap();
+        invalidate_sync_root_materialization_subtree(&transaction, &root.id, "folder").unwrap();
+        transaction.commit().unwrap();
+
+        assert_eq!(
+            storage
+                .sync_root_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_directory_materialization_receipt_count(&root.id)
                 .unwrap(),
             1
         );

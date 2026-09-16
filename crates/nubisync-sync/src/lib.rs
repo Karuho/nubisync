@@ -484,10 +484,15 @@ pub enum ReceiveOnlyMaterializationPlanError {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReceiveOnlyDirectoryTarget {
+    remote_id: String,
     relative_path: String,
 }
 
 impl ReceiveOnlyDirectoryTarget {
+    pub fn remote_id(&self) -> &str {
+        &self.remote_id
+    }
+
     pub fn relative_path(&self) -> &str {
         &self.relative_path
     }
@@ -497,6 +502,7 @@ impl std::fmt::Debug for ReceiveOnlyDirectoryTarget {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ReceiveOnlyDirectoryTarget")
+            .field("remote_id", &"[redacted]")
             .field("relative_path", &"[redacted]")
             .finish()
     }
@@ -609,8 +615,11 @@ pub fn plan_receive_only_directory_targets(
 ) -> Result<Vec<ReceiveOnlyDirectoryTarget>, ReceiveOnlyMaterializationPlanError> {
     Ok(build_remote_expected_paths(remote_items)?
         .into_iter()
-        .filter_map(|(relative_path, kind, _, _)| {
-            (kind == RemoteItemKind::Folder).then_some(ReceiveOnlyDirectoryTarget { relative_path })
+        .filter_map(|(relative_path, kind, remote_id, _)| {
+            (kind == RemoteItemKind::Folder).then_some(ReceiveOnlyDirectoryTarget {
+                remote_id,
+                relative_path,
+            })
         })
         .collect())
 }

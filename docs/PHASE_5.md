@@ -286,3 +286,31 @@ supervised mutation window but does not replace future descriptor-relative
 openat2/dirfd hardening required for unattended/adversarial operation.
 
 Phase 5C9 performs no Drive writes and no network request.
+
+## Phase 5C10 — Durable directory materialization ownership receipts
+
+Phase 5C10 introduces a separate durable ownership receipt for receive-only
+directories and advances SQLite to schema v11.
+
+A directory receipt binds a selected sync root, provider remote ID, safe relative
+path and materialization timestamp. Current and stale states are separate. Catalog
+upserts and subtree removals invalidate current directory receipts to stale in the
+same transaction that already invalidates file receipts.
+
+`materialize-directories --approve` now records directory ownership only for
+directories created by that NubiSync run. Pre-existing matching directories are
+not silently claimed.
+
+For the existing prototype test directory created before directory receipts
+existed, `sync roots adopt-directory --approve` is a deliberately narrow,
+owner-supervised migration bridge. It requires exactly one authoritative remote
+directory, exactly one matching local directory, no files, no local-only entries,
+no conflicts, no file receipts, no existing directory receipts, and an empty
+ordinary non-symlink directory. It performs no provider request and no filesystem
+mutation; it only writes the durable ownership receipt after local metadata
+validation.
+
+This adoption path is not a general background ownership inference mechanism.
+Future unattended operation must never adopt arbitrary pre-existing directories.
+
+Phase 5C10 performs no Drive writes.

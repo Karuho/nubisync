@@ -10,13 +10,13 @@ use nubisync_core::{
     ProviderAccount, ProviderId, RemoteChange, RemoteItemKind, SyncMode, SyncRoot,
 };
 use nubisync_daemon::{
-    SUPERVISED_FILE_DOWNLOAD_MAX_BYTES, bootstrap_selected_root_snapshot,
-    collect_selected_root_change_window_page, delete_selected_root_existing_file,
-    execute_completed_selected_root_change_window, materialize_selected_root_directories,
-    materialize_selected_root_missing_file, plan_selected_root_local_materialization,
-    plan_selected_root_remote_deletion, plan_selected_root_remote_replacement,
-    replace_selected_root_existing_file, verify_selected_root_existing_file,
-    verify_selected_root_local_receipts,
+    SUPERVISED_FILE_DOWNLOAD_MAX_BYTES, adopt_selected_root_existing_directory,
+    bootstrap_selected_root_snapshot, collect_selected_root_change_window_page,
+    delete_selected_root_existing_file, execute_completed_selected_root_change_window,
+    materialize_selected_root_directories, materialize_selected_root_missing_file,
+    plan_selected_root_local_materialization, plan_selected_root_remote_deletion,
+    plan_selected_root_remote_replacement, replace_selected_root_existing_file,
+    verify_selected_root_existing_file, verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -112,6 +112,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_materialize_directories()
+        }
+        [sync, roots, adopt_directory, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && adopt_directory == "adopt-directory"
+                && approve == "--approve" =>
+        {
+            sync_roots_adopt_directory()
         }
         [sync, roots, materialize_file, approve]
             if sync == "sync"
@@ -259,6 +267,7 @@ USAGE:
   nubisync sync roots metadata-step --approve
   nubisync sync roots reconcile-plan --approve
   nubisync sync roots materialize-directories --approve
+  nubisync sync roots adopt-directory --approve
   nubisync sync roots materialize-file --approve
   nubisync sync roots verify-file --approve
   nubisync sync roots verify-local --approve
@@ -717,7 +726,7 @@ fn sync_roots_materialize_directories() -> Result<(), CliError> {
         return Err(CliError::NoLocalGoogleAccount);
     }
 
-    let storage = Storage::open(&db_path)?;
+    let mut storage = Storage::open(&db_path)?;
     let provider = ProviderId::new("google-drive")?;
     let account = single_google_account(storage.list_accounts(&provider)?)?;
     let roots = storage.list_sync_roots(&provider, &account.subject)?;
@@ -747,7 +756,11 @@ fn sync_roots_materialize_directories() -> Result<(), CliError> {
     let root = roots
         .first()
         .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
-    let result = materialize_selected_root_directories(&storage, root)?;
+    let result = materialize_selected_root_directories(&mut storage, root)?;
+    let current_directory_receipts =
+        storage.sync_root_directory_materialization_receipt_count(&root.id)?;
+    let stale_directory_receipts =
+        storage.sync_root_stale_directory_materialization_receipt_count(&root.id)?;
 
     println!("SYNC_ROOT_DIRECTORY_MATERIALIZATION=PASS");
     println!("MODE=receive_only");
@@ -758,8 +771,13 @@ fn sync_roots_materialize_directories() -> Result<(), CliError> {
         result.existing_directories
     );
     println!("PENDING_FILES={}", result.pending_files);
+    println!("CURRENT_DIRECTORY_RECEIPTS={current_directory_receipts}");
+    println!("STALE_DIRECTORY_RECEIPTS={stale_directory_receipts}");
     println!("NETWORK_CHECK=not_performed");
-    println!("DATABASE_MUTATION=no");
+    println!(
+        "DATABASE_MUTATION={}",
+        yes_no(result.created_directories > 0)
+    );
     println!("FILESYSTEM_READ=metadata_only");
     println!(
         "FILESYSTEM_MUTATION={}",
@@ -773,6 +791,68 @@ fn sync_roots_materialize_directories() -> Result<(), CliError> {
     println!("LOCAL_NAMES_PRINTED=no");
     println!("REMOTE_ROOT_ID_PRINTED=no");
     println!("REMOTE_METADATA_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_adopt_directory() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_DIRECTORY_ADOPTION=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    let result = adopt_selected_root_existing_directory(&mut storage, root)?;
+    let schema_version = storage.schema_version()?;
+
+    println!("SYNC_ROOT_DIRECTORY_ADOPTION=PASS");
+    println!("MODE=receive_only");
+    println!("DIRECTORIES_ADOPTED={}", result.directories_adopted);
+    println!(
+        "CURRENT_DIRECTORY_RECEIPTS={}",
+        result.current_directory_receipts
+    );
+    println!(
+        "STALE_DIRECTORY_RECEIPTS={}",
+        result.stale_directory_receipts
+    );
+    println!("SCHEMA_VERSION={schema_version}");
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())

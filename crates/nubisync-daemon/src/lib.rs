@@ -38,6 +38,13 @@ pub struct SelectedRootDirectoryMaterialization {
     pub pending_files: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootDirectoryAdoption {
+    pub directories_adopted: usize,
+    pub current_directory_receipts: u64,
+    pub stale_directory_receipts: u64,
+}
+
 pub const SUPERVISED_FILE_DOWNLOAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
 static DOWNLOAD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -212,7 +219,7 @@ pub fn plan_selected_root_local_materialization(
 }
 
 pub fn materialize_selected_root_directories(
-    storage: &Storage,
+    storage: &mut Storage,
     sync_root: &SyncRoot,
 ) -> Result<SelectedRootDirectoryMaterialization, SelectedRootExecutorError> {
     let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
@@ -243,6 +250,26 @@ pub fn materialize_selected_root_directories(
             return Err(SelectedRootExecutorError::LocalDirectoryPostconditionFailed);
         }
 
+        let created_receipts = outcome
+            .created_targets
+            .iter()
+            .map(|target| {
+                (
+                    target.remote_id().to_owned(),
+                    target.relative_path().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let recorded = storage.record_sync_root_directory_materializations(
+            &sync_root.id,
+            &created_receipts,
+            current_unix_time_ms()?,
+        )?;
+        if recorded != created_receipts.len() {
+            return Err(SelectedRootExecutorError::DirectoryReceiptPostconditionFailed);
+        }
+
         Ok(SelectedRootDirectoryMaterialization {
             remote_directories: post_plan.remote_directories,
             created_directories: outcome.created_paths.len(),
@@ -258,6 +285,94 @@ pub fn materialize_selected_root_directories(
             Err(error)
         }
     }
+}
+
+pub fn adopt_selected_root_existing_directory(
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootDirectoryAdoption, SelectedRootExecutorError> {
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let plan = plan_receive_only_materialization(&remote_items, &local_entries)?;
+
+    if plan.remote_items != 1
+        || plan.remote_directories != 1
+        || plan.remote_files != 0
+        || plan.local_entries != 1
+        || plan.missing_directories != 0
+        || plan.missing_files != 0
+        || plan.matching_directories != 1
+        || plan.existing_files_unverified != 0
+        || plan.local_only_entries != 0
+        || plan.type_conflicts != 0
+    {
+        return Err(SelectedRootExecutorError::DirectoryAdoptionPhaseBlocked);
+    }
+
+    if storage.sync_root_materialization_receipt_count(&sync_root.id)? != 0
+        || storage.sync_root_stale_materialization_receipt_count(&sync_root.id)? != 0
+        || storage.sync_root_directory_materialization_receipt_count(&sync_root.id)? != 0
+        || storage.sync_root_stale_directory_materialization_receipt_count(&sync_root.id)? != 0
+    {
+        return Err(SelectedRootExecutorError::DirectoryAdoptionReceiptStateConflict);
+    }
+
+    let targets = plan_receive_only_directory_targets(&remote_items)?;
+    if targets.len() != 1 {
+        return Err(SelectedRootExecutorError::DirectoryAdoptionTargetMismatch);
+    }
+    let target = targets
+        .first()
+        .ok_or(SelectedRootExecutorError::DirectoryAdoptionTargetMismatch)?;
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let target_path = root_path.join(target.relative_path());
+    if !target_path.starts_with(&root_path) {
+        return Err(SelectedRootExecutorError::LocalDirectoryTargetEscapedRoot);
+    }
+
+    let metadata = fs::symlink_metadata(&target_path)
+        .map_err(|_| SelectedRootExecutorError::DirectoryAdoptionTargetMismatch)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(SelectedRootExecutorError::DirectoryAdoptionTargetMismatch);
+    }
+
+    let canonical_target = fs::canonicalize(&target_path)
+        .map_err(|_| SelectedRootExecutorError::LocalFilesystemInspectionFailed)?;
+    if !canonical_target.starts_with(&root_path) {
+        return Err(SelectedRootExecutorError::LocalDirectoryTargetEscapedRoot);
+    }
+
+    let mut entries = fs::read_dir(&target_path)
+        .map_err(|_| SelectedRootExecutorError::LocalFilesystemInspectionFailed)?;
+    match entries.next() {
+        None => {}
+        Some(Ok(_)) => return Err(SelectedRootExecutorError::DirectoryAdoptionTargetNotEmpty),
+        Some(Err(_)) => return Err(SelectedRootExecutorError::LocalFilesystemInspectionFailed),
+    }
+
+    let recorded = storage.record_sync_root_directory_materializations(
+        &sync_root.id,
+        &[(
+            target.remote_id().to_owned(),
+            target.relative_path().to_owned(),
+        )],
+        current_unix_time_ms()?,
+    )?;
+    if recorded != 1 {
+        return Err(SelectedRootExecutorError::DirectoryReceiptPostconditionFailed);
+    }
+
+    let current = storage.sync_root_directory_materialization_receipt_count(&sync_root.id)?;
+    let stale = storage.sync_root_stale_directory_materialization_receipt_count(&sync_root.id)?;
+    if current != 1 || stale != 0 {
+        return Err(SelectedRootExecutorError::DirectoryReceiptPostconditionFailed);
+    }
+
+    Ok(SelectedRootDirectoryAdoption {
+        directories_adopted: 1,
+        current_directory_receipts: current,
+        stale_directory_receipts: stale,
+    })
 }
 
 pub fn materialize_selected_root_missing_file<P: SelectedRootContentProvider>(
@@ -1563,6 +1678,7 @@ fn scan_selected_root_local_tree(
 
 struct DirectoryApplyOutcome {
     created_paths: Vec<PathBuf>,
+    created_targets: Vec<ReceiveOnlyDirectoryTarget>,
     existing_directories: usize,
 }
 
@@ -1571,6 +1687,7 @@ fn apply_selected_root_directory_targets(
     targets: &[ReceiveOnlyDirectoryTarget],
 ) -> Result<DirectoryApplyOutcome, SelectedRootExecutorError> {
     let mut created_paths = Vec::new();
+    let mut created_targets = Vec::new();
     let mut existing_directories = 0_usize;
 
     let apply_result = (|| {
@@ -1623,6 +1740,7 @@ fn apply_selected_root_directory_targets(
             fs::create_dir(&target_path)
                 .map_err(|_| SelectedRootExecutorError::LocalDirectoryCreateFailed)?;
             created_paths.push(target_path.clone());
+            created_targets.push(target.clone());
 
             let created_metadata = fs::symlink_metadata(&target_path)
                 .map_err(|_| SelectedRootExecutorError::LocalDirectoryPostconditionFailed)?;
@@ -1647,6 +1765,7 @@ fn apply_selected_root_directory_targets(
 
     Ok(DirectoryApplyOutcome {
         created_paths,
+        created_targets,
         existing_directories,
     })
 }
@@ -2370,6 +2489,16 @@ pub enum SelectedRootExecutorError {
     LocalDirectoryPostconditionFailed,
     #[error("local directory materialization rollback failed")]
     LocalDirectoryRollbackFailed,
+    #[error("directory materialization receipt failed its durable postcondition")]
+    DirectoryReceiptPostconditionFailed,
+    #[error("directory adoption is blocked by the current receive-only state")]
+    DirectoryAdoptionPhaseBlocked,
+    #[error("directory adoption requires a clean receipt state")]
+    DirectoryAdoptionReceiptStateConflict,
+    #[error("directory adoption target does not match the authoritative remote catalog")]
+    DirectoryAdoptionTargetMismatch,
+    #[error("directory adoption target must be empty")]
+    DirectoryAdoptionTargetNotEmpty,
     #[error("local file materialization preconditions are not satisfied")]
     LocalFilePhaseBlocked,
     #[error("local file materialization target count did not equal one")]
