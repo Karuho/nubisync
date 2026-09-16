@@ -227,3 +227,32 @@ APIs still leave a narrow TOCTOU window; descriptor-relative/openat2 hardening
 remains required before unattended/adversarial operation.
 
 Phase 5C7 performs no Drive writes.
+
+## Phase 5C8 — Read-only remote deletion decision plan
+
+Phase 5C8 adds `nubisync sync roots deletion-plan --approve`.
+
+This phase does not delete anything. It is a read-only decision boundary for one
+receive-only file whose authoritative remote identity has disappeared.
+
+The plan requires:
+
+- an authoritative selected-root catalog with no pending change window,
+- no current materialization receipt,
+- exactly one stale receipt,
+- the stale remote ID to be absent from the current authoritative catalog,
+- exactly one local-only entry,
+- no missing remote targets or type conflicts,
+- and the remaining local file to match the stale receipt SHA-256 and byte size.
+
+The stale receipt therefore acts as proof of the last provider version that
+NubiSync had materialized locally. If the local bytes still match it, the plan
+reports `SAFE_TO_DELETE=1`. If local bytes diverged after the provider deletion,
+the plan reports a local conflict and does not authorize deletion.
+
+The command performs no provider request, SQLite mutation or filesystem mutation.
+It does not print local names, remote IDs or hash values.
+
+A later supervised deletion executor must revalidate the same baseline
+immediately before unlinking and must address the pathname race boundary before
+unattended/adversarial operation.

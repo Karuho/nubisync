@@ -134,6 +134,30 @@ impl SelectedRootRemoteReplacementPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootRemoteDeletionPlan {
+    pub stale_receipts_total: usize,
+    pub deletion_candidates: usize,
+    pub safe_to_delete: usize,
+    pub local_conflicts: usize,
+    pub files_already_missing: usize,
+    pub type_conflicts: usize,
+    pub bytes_hashed: u64,
+    pub remote_id_absent: bool,
+}
+
+impl SelectedRootRemoteDeletionPlan {
+    pub fn ready(self) -> bool {
+        self.stale_receipts_total == 1
+            && self.deletion_candidates == 1
+            && self.safe_to_delete == 1
+            && self.local_conflicts == 0
+            && self.files_already_missing == 0
+            && self.type_conflicts == 0
+            && self.remote_id_absent
+    }
+}
+
 pub trait SelectedRootContentProvider {
     fn content_fingerprint(
         &self,
@@ -640,6 +664,92 @@ pub fn plan_selected_root_remote_replacement(
 
             if bytes == receipt.size_bytes && sha256_hex == receipt.sha256_hex {
                 result.safe_to_replace = 1;
+            } else {
+                result.local_conflicts = 1;
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+pub fn plan_selected_root_remote_deletion(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootRemoteDeletionPlan, SelectedRootExecutorError> {
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let materialization = plan_receive_only_materialization(&remote_items, &local_entries)?;
+
+    if materialization.missing_directories != 0
+        || materialization.missing_files != 0
+        || materialization.matching_directories != materialization.remote_directories
+        || materialization.remote_files != 0
+        || materialization.existing_files_unverified != 0
+        || materialization.local_only_entries != 1
+        || materialization.type_conflicts != 0
+    {
+        return Err(SelectedRootExecutorError::RemoteDeletionPlanPhaseBlocked);
+    }
+
+    if storage.sync_root_materialization_receipt_count(&sync_root.id)? != 0 {
+        return Err(SelectedRootExecutorError::RemoteDeletionPlanCurrentReceiptPresent);
+    }
+
+    let stale_count = storage.sync_root_stale_materialization_receipt_count(&sync_root.id)?;
+    let stale_receipts =
+        storage.list_sync_root_stale_file_materialization_receipts(&sync_root.id)?;
+
+    if stale_count != 1 || stale_receipts.len() != 1 {
+        return Err(SelectedRootExecutorError::RemoteDeletionPlanStaleReceiptCountMismatch);
+    }
+
+    let receipt = stale_receipts
+        .first()
+        .ok_or(SelectedRootExecutorError::RemoteDeletionPlanStaleReceiptCountMismatch)?;
+
+    let remote_id_absent = !remote_items
+        .iter()
+        .any(|item| item.remote_id == receipt.remote_id);
+
+    if !remote_id_absent {
+        return Err(SelectedRootExecutorError::RemoteDeletionPlanRemoteIdentityStillPresent);
+    }
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let mut result = SelectedRootRemoteDeletionPlan {
+        stale_receipts_total: 1,
+        deletion_candidates: 1,
+        safe_to_delete: 0,
+        local_conflicts: 0,
+        files_already_missing: 0,
+        type_conflicts: 0,
+        bytes_hashed: 0,
+        remote_id_absent,
+    };
+
+    match inspect_receipt_target(&root_path, receipt)? {
+        ReceiptTargetInspection::Missing => {
+            result.files_already_missing = 1;
+        }
+        ReceiptTargetInspection::Conflict => {
+            result.type_conflicts = 1;
+        }
+        ReceiptTargetInspection::File(target_path, observed_size) => {
+            if observed_size != receipt.size_bytes {
+                result.local_conflicts = 1;
+                return Ok(result);
+            }
+
+            if receipt.size_bytes > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+                return Err(SelectedRootExecutorError::LocalFileTooLarge);
+            }
+
+            let (bytes, sha256_hex) =
+                hash_local_file(&target_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES)?;
+            result.bytes_hashed = bytes;
+
+            if bytes == receipt.size_bytes && sha256_hex == receipt.sha256_hex {
+                result.safe_to_delete = 1;
             } else {
                 result.local_conflicts = 1;
             }
@@ -2108,6 +2218,14 @@ pub enum SelectedRootExecutorError {
     LocalFileReplacementPostconditionFailed,
     #[error("replacement receipt state failed its durable postcondition")]
     LocalFileReceiptPostconditionFailed,
+    #[error("remote deletion planning is blocked by the current receive-only state")]
+    RemoteDeletionPlanPhaseBlocked,
+    #[error("remote deletion planning requires no current receipt")]
+    RemoteDeletionPlanCurrentReceiptPresent,
+    #[error("remote deletion planning requires exactly one stale receipt")]
+    RemoteDeletionPlanStaleReceiptCountMismatch,
+    #[error("remote deletion planning found the stale remote identity still present")]
+    RemoteDeletionPlanRemoteIdentityStillPresent,
     #[error("selected-root provider operation failed")]
     ProviderOperationFailed,
     #[error("selected-root change window requires an authoritative snapshot")]

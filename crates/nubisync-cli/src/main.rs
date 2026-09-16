@@ -13,9 +13,9 @@ use nubisync_daemon::{
     SUPERVISED_FILE_DOWNLOAD_MAX_BYTES, bootstrap_selected_root_snapshot,
     collect_selected_root_change_window_page, execute_completed_selected_root_change_window,
     materialize_selected_root_directories, materialize_selected_root_missing_file,
-    plan_selected_root_local_materialization, plan_selected_root_remote_replacement,
-    replace_selected_root_existing_file, verify_selected_root_existing_file,
-    verify_selected_root_local_receipts,
+    plan_selected_root_local_materialization, plan_selected_root_remote_deletion,
+    plan_selected_root_remote_replacement, replace_selected_root_existing_file,
+    verify_selected_root_existing_file, verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -152,6 +152,14 @@ fn run() -> Result<(), CliError> {
         {
             sync_roots_replace_file()
         }
+        [sync, roots, deletion_plan, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && deletion_plan == "deletion-plan"
+                && approve == "--approve" =>
+        {
+            sync_roots_deletion_plan()
+        }
         [sync, roots, inventory, limit, value]
             if sync == "sync"
                 && roots == "roots"
@@ -247,6 +255,7 @@ USAGE:
   nubisync sync roots verify-local --approve
   nubisync sync roots replacement-plan --approve
   nubisync sync roots replace-file --approve
+  nubisync sync roots deletion-plan --approve
   nubisync sync roots inventory --limit <1-10000>
   nubisync sync roots add --mode receive_only
   nubisync sync roots add --mode receive_only --dry-run
@@ -1175,6 +1184,70 @@ fn sync_roots_replace_file() -> Result<(), CliError> {
     println!("FILES_DELETED=0");
     println!("DIRECTORIES_CREATED=0");
     println!("DIRECTORIES_REMOVED=0");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_deletion_plan() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_REMOTE_DELETION_PLAN=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("LOCAL_FILE_CONTENT_ACCESSED=no");
+        println!("REMOTE_FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    let result = plan_selected_root_remote_deletion(&storage, root)?;
+
+    println!("SYNC_ROOT_REMOTE_DELETION_PLAN=PASS");
+    println!("MODE=receive_only");
+    println!("STALE_RECEIPTS_TOTAL={}", result.stale_receipts_total);
+    println!("DELETION_CANDIDATES={}", result.deletion_candidates);
+    println!("SAFE_TO_DELETE={}", result.safe_to_delete);
+    println!("LOCAL_CONFLICTS={}", result.local_conflicts);
+    println!("FILES_ALREADY_MISSING={}", result.files_already_missing);
+    println!("TYPE_CONFLICTS={}", result.type_conflicts);
+    println!("BYTES_HASHED={}", result.bytes_hashed);
+    println!("REMOTE_ID_ABSENT={}", yes_no(result.remote_id_absent));
+    println!("READY_TO_DELETE={}", yes_no(result.ready()));
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=no");
+    println!("FILESYSTEM_READ=file_content");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("LOCAL_FILE_CONTENT_ACCESSED=yes");
+    println!("REMOTE_FILE_CONTENT_ACCESSED=no");
     println!("ROOT_PATH_PRINTED=no");
     println!("LOCAL_NAMES_PRINTED=no");
     println!("REMOTE_ROOT_ID_PRINTED=no");
