@@ -2662,18 +2662,64 @@ fn invalidate_sync_root_materialization_subtree(
     Ok(())
 }
 
+fn invalidate_sync_root_file_materialization(
+    transaction: &Transaction<'_>,
+    sync_root_id: &str,
+    remote_id: &str,
+) -> Result<(), StorageError> {
+    transaction.execute(
+        "UPDATE sync_root_file_materialization_receipts
+         SET receipt_state = 'stale'
+         WHERE sync_root_id = ?1
+           AND remote_id = ?2
+           AND receipt_state = 'current'",
+        params![sync_root_id, remote_id],
+    )?;
+
+    Ok(())
+}
+
 fn upsert_sync_root_catalog_item(
     transaction: &Transaction<'_>,
     sync_root_id: &str,
     item: &RemoteItem,
     observed_at_unix_ms: i64,
 ) -> Result<(), StorageError> {
-    invalidate_sync_root_materialization_subtree(transaction, sync_root_id, &item.remote_id)?;
+    let existing: Option<(Option<String>, String, String)> = transaction
+        .query_row(
+            "SELECT parent_remote_id, name, item_kind
+             FROM sync_root_remote_items
+             WHERE sync_root_id = ?1 AND remote_id = ?2",
+            params![sync_root_id, item.remote_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
 
     let item_kind = match item.kind {
         RemoteItemKind::File => "file",
         RemoteItemKind::Folder => "folder",
     };
+
+    if let Some((existing_parent, existing_name, existing_kind)) = existing {
+        if existing_kind == "folder" {
+            let structural_change = item_kind != "folder"
+                || existing_parent != item.parent_remote_id
+                || existing_name != item.name;
+
+            if structural_change {
+                invalidate_sync_root_materialization_subtree(
+                    transaction,
+                    sync_root_id,
+                    &item.remote_id,
+                )?;
+            }
+        } else {
+            // A provider file upsert can represent a content revision even when
+            // path and size are unchanged. Only that file's content receipt is
+            // invalidated; directory ownership is unaffected by file content.
+            invalidate_sync_root_file_materialization(transaction, sync_root_id, &item.remote_id)?;
+        }
+    }
 
     let size_bytes = item
         .size_bytes
@@ -5534,6 +5580,207 @@ mod phase5c12_directory_receipt_cleanup_tests {
         assert_eq!(
             storage
                 .sync_root_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase5d4_upsert_receipt_scope_tests {
+    use super::*;
+
+    fn setup() -> (Storage, SyncRoot) {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5d4-scope-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5d4-scope-root",
+            provider,
+            account.subject,
+            "/tmp/nubisync-phase5d4-scope",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_remote_items (
+                    sync_root_id, remote_id, parent_remote_id, name, item_kind,
+                    size_bytes, trashed, observed_at_unix_ms
+                 ) VALUES (?1, 'folder', 'remote-root', 'folder', 'folder', NULL, 0, 3)",
+                params![root.id],
+            )
+            .unwrap();
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_remote_items (
+                    sync_root_id, remote_id, parent_remote_id, name, item_kind,
+                    size_bytes, trashed, observed_at_unix_ms
+                 ) VALUES (?1, 'file', 'folder', 'file.txt', 'file', 10, 0, 3)",
+                params![root.id],
+            )
+            .unwrap();
+
+        storage
+            .record_sync_root_directory_materializations(
+                &root.id,
+                &[("folder".into(), "folder".into())],
+                4,
+            )
+            .unwrap();
+        storage
+            .record_sync_root_file_materialization(
+                &root.id,
+                "file",
+                "folder/file.txt",
+                10,
+                &"a".repeat(64),
+                4,
+            )
+            .unwrap();
+
+        (storage, root)
+    }
+
+    fn apply_upsert(storage: &mut Storage, root: &SyncRoot, item: RemoteItem) {
+        let transaction = storage.connection.transaction().unwrap();
+        upsert_sync_root_catalog_item(&transaction, &root.id, &item, 5).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn unchanged_folder_upsert_preserves_directory_and_descendant_file_receipts() {
+        let (mut storage, root) = setup();
+        apply_upsert(
+            &mut storage,
+            &root,
+            RemoteItem {
+                remote_id: "folder".into(),
+                parent_remote_id: Some("remote-root".into()),
+                name: "folder".into(),
+                kind: RemoteItemKind::Folder,
+                size_bytes: None,
+                modified_unix_ms: None,
+                trashed: false,
+            },
+        );
+
+        assert_eq!(
+            storage
+                .sync_root_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn file_upsert_invalidates_only_the_file_receipt() {
+        let (mut storage, root) = setup();
+        apply_upsert(
+            &mut storage,
+            &root,
+            RemoteItem {
+                remote_id: "file".into(),
+                parent_remote_id: Some("folder".into()),
+                name: "file.txt".into(),
+                kind: RemoteItemKind::File,
+                size_bytes: Some(20),
+                modified_unix_ms: None,
+                trashed: false,
+            },
+        );
+
+        assert_eq!(
+            storage
+                .sync_root_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .sync_root_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn structural_folder_upsert_still_invalidates_the_owned_subtree() {
+        let (mut storage, root) = setup();
+        apply_upsert(
+            &mut storage,
+            &root,
+            RemoteItem {
+                remote_id: "folder".into(),
+                parent_remote_id: Some("remote-root".into()),
+                name: "renamed-folder".into(),
+                kind: RemoteItemKind::Folder,
+                size_bytes: None,
+                modified_unix_ms: None,
+                trashed: false,
+            },
+        );
+
+        assert_eq!(
+            storage
+                .sync_root_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .sync_root_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_materialization_receipt_count(&root.id)
                 .unwrap(),
             1
         );
