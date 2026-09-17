@@ -1890,6 +1890,42 @@ impl Storage {
         u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
     }
 
+    pub fn delete_sync_root_stale_file_materialization_receipts(
+        &mut self,
+        sync_root_id: &str,
+        remote_ids: &[String],
+    ) -> Result<usize, StorageError> {
+        if remote_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut unique_ids = std::collections::HashSet::with_capacity(remote_ids.len());
+        for remote_id in remote_ids {
+            if remote_id.trim().is_empty() || !unique_ids.insert(remote_id.as_str()) {
+                return Err(StorageError::InvalidMaterializationReceipt);
+            }
+        }
+
+        let transaction = self.connection.transaction()?;
+
+        for remote_id in remote_ids {
+            let deleted = transaction.execute(
+                "DELETE FROM sync_root_file_materialization_receipts
+                 WHERE sync_root_id = ?1
+                   AND remote_id = ?2
+                   AND receipt_state = 'stale'",
+                params![sync_root_id, remote_id],
+            )?;
+
+            if deleted != 1 {
+                return Err(StorageError::StaleMaterializationReceiptBatchMismatch);
+            }
+        }
+
+        transaction.commit()?;
+        Ok(remote_ids.len())
+    }
+
     pub fn delete_sync_root_stale_file_materialization_receipt(
         &mut self,
         sync_root_id: &str,
@@ -3095,6 +3131,8 @@ pub enum StorageError {
     MaterializationReceiptRemoteItemMissing,
     #[error("materialization receipt does not match durable remote file metadata")]
     MaterializationReceiptRemoteItemMismatch,
+    #[error("stale materialization receipt batch did not match durable state")]
+    StaleMaterializationReceiptBatchMismatch,
     #[error("SQLite operation failed")]
     Sqlite(#[from] rusqlite::Error),
     #[error("stored NubiSync domain value is invalid")]
@@ -3266,6 +3304,151 @@ mod tests {
             .any(|name| name == "change_cursor");
 
         assert!(has_change_cursor);
+    }
+
+    #[test]
+    fn phase5d6_stale_receipt_batch_delete_is_atomic_and_exact() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5d6-root",
+            provider,
+            account.subject,
+            "/tmp/phase5d6-root",
+            Some("root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let mut first = test_remote_item("phase5d6-a", Some("root"), "a.txt", RemoteItemKind::File);
+        first.size_bytes = Some(5);
+        let mut second =
+            test_remote_item("phase5d6-b", Some("root"), "b.txt", RemoteItemKind::File);
+        second.size_bytes = Some(5);
+
+        prepare_root_snapshot(
+            &mut storage,
+            &root,
+            &[first.clone(), second.clone()],
+            "fence",
+            3,
+        );
+
+        storage
+            .record_sync_root_file_materializations(
+                &root.id,
+                &[
+                    (
+                        first.remote_id.clone(),
+                        first.name.clone(),
+                        5,
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    ),
+                    (
+                        second.remote_id.clone(),
+                        second.name.clone(),
+                        5,
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    ),
+                ],
+                5,
+            )
+            .unwrap();
+
+        storage
+            .delete_sync_root_remote_subtree(&root.id, &first.remote_id)
+            .unwrap();
+        storage
+            .delete_sync_root_remote_subtree(&root.id, &second.remote_id)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .sync_root_stale_materialization_receipt_count(&root.id)
+                .unwrap(),
+            2
+        );
+
+        let deleted = storage
+            .delete_sync_root_stale_file_materialization_receipts(
+                &root.id,
+                &[first.remote_id.clone(), second.remote_id.clone()],
+            )
+            .unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(
+            storage
+                .sync_root_stale_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn phase5d6_stale_receipt_batch_delete_rolls_back_on_mismatch() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5d6-rollback-root",
+            provider,
+            account.subject,
+            "/tmp/phase5d6-rollback-root",
+            Some("root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let mut first = test_remote_item(
+            "phase5d6-only",
+            Some("root"),
+            "only.txt",
+            RemoteItemKind::File,
+        );
+        first.size_bytes = Some(5);
+
+        prepare_root_snapshot(&mut storage, &root, &[first.clone()], "fence", 3);
+
+        storage
+            .record_sync_root_file_materialization(
+                &root.id,
+                &first.remote_id,
+                &first.name,
+                5,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                5,
+            )
+            .unwrap();
+        storage
+            .delete_sync_root_remote_subtree(&root.id, &first.remote_id)
+            .unwrap();
+
+        let error = storage
+            .delete_sync_root_stale_file_materialization_receipts(
+                &root.id,
+                &[first.remote_id.clone(), "missing-stale".into()],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::StaleMaterializationReceiptBatchMismatch
+        ));
+
+        assert_eq!(
+            storage
+                .sync_root_stale_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
