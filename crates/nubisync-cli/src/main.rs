@@ -19,7 +19,8 @@ use nubisync_daemon::{
     plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
     plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
     plan_selected_root_stale_files, replace_selected_root_existing_file,
-    verify_selected_root_existing_file, verify_selected_root_local_receipts,
+    replace_selected_root_stale_files, verify_selected_root_existing_file,
+    verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -115,6 +116,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_stale_files_plan()
+        }
+        [sync, roots, replace_stale_files, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && replace_stale_files == "replace-stale-files"
+                && approve == "--approve" =>
+        {
+            sync_roots_replace_stale_files()
         }
         [sync, roots, reconcile_plan, approve]
             if sync == "sync"
@@ -310,6 +319,7 @@ USAGE:
   nubisync sync roots metadata-step --approve
   nubisync sync roots convergence-plan --approve
   nubisync sync roots stale-files-plan --approve
+  nubisync sync roots replace-stale-files --approve
   nubisync sync roots reconcile-plan --approve
   nubisync sync roots materialize-directories --approve
   nubisync sync roots adopt-directory --approve
@@ -1430,6 +1440,141 @@ fn sync_roots_verify_local() -> Result<(), CliError> {
     println!("FILESYSTEM_MUTATION=no");
     println!("LOCAL_FILE_CONTENT_ACCESSED=yes");
     println!("REMOTE_FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_replace_stale_files() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_STALE_FILE_BATCH_REPLACEMENT=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("LOCAL_FILE_CONTENT_ACCESSED=no");
+        println!("REMOTE_FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    let readiness = plan_selected_root_stale_files(&storage, root)?;
+    if !readiness.all_stale_files_safe()
+        || readiness.replacement_candidates == 0
+        || readiness.deletion_candidates != 0
+    {
+        return Err(
+            nubisync_daemon::SelectedRootExecutorError::RemoteReplacementBatchNotReady.into(),
+        );
+    }
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_STALE_FILE_BATCH_REPLACEMENT_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("SYNC_ROOT_STALE_FILE_BATCH_REPLACEMENT_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_STALE_FILE_BATCH_REPLACEMENT_STAGE=download_and_replace_batch");
+    let result = replace_selected_root_stale_files(&api, &mut storage, root)?;
+
+    let current_receipts = storage.sync_root_materialization_receipt_count(&root.id)?;
+    let stale_receipts = storage.sync_root_stale_materialization_receipt_count(&root.id)?;
+
+    println!("SYNC_ROOT_STALE_FILE_BATCH_REPLACEMENT=PASS");
+    println!("MODE=receive_only");
+    println!("BATCH_ACTION_LIMIT={}", result.batch_action_limit);
+    println!(
+        "REPLACEMENT_ACTIONS_PLANNED={}",
+        result.planned_replacement_actions
+    );
+    println!("FILES_REPLACED={}", result.files_replaced);
+    println!("BYTES_DOWNLOADED={}", result.bytes_downloaded);
+    println!("MAX_FILE_BYTES={}", result.max_file_bytes);
+    println!(
+        "PROVIDER_FINGERPRINTS_VERIFIED={}",
+        result.provider_fingerprints_verified
+    );
+    println!(
+        "STALE_BASELINES_VERIFIED={}",
+        result.stale_baselines_verified
+    );
+    println!("RECEIPTS_RECORDED={}", result.receipts_recorded);
+    println!("ATOMIC_REPLACEMENTS={}", result.atomic_replacements);
+    println!(
+        "REPLACEMENT_BACKUPS_CLEANED={}",
+        result.replacement_backups_cleaned
+    );
+    println!("CURRENT_FILE_RECEIPTS={current_receipts}");
+    println!("STALE_FILE_RECEIPTS={stale_receipts}");
+    println!("BATCH_MODE=bounded_supervised");
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_MUTATION=yes");
+    println!("LOCAL_FILE_CONTENT_ACCESSED=yes");
+    println!("REMOTE_FILE_CONTENT_ACCESSED=yes");
+    println!("FILES_CREATED=0");
+    println!("FILES_OVERWRITTEN={}", result.files_replaced);
+    println!("FILES_DELETED=0");
+    println!("DIRECTORIES_CREATED=0");
+    println!("DIRECTORIES_REMOVED=0");
+    println!("ATOMIC_REPLACE=yes");
+    println!("PROVIDER_FINGERPRINT_BEFORE_AFTER=yes");
+    println!("PROMOTED_SHA256_VERIFIED=yes");
+    println!("STALE_BASELINE_REVALIDATED=yes");
+    println!("REPLACEMENT_BACKUPS_RETAINED=0");
+    println!("TEMP_FILES_RETAINED=0");
     println!("ROOT_PATH_PRINTED=no");
     println!("LOCAL_NAMES_PRINTED=no");
     println!("REMOTE_ROOT_ID_PRINTED=no");
