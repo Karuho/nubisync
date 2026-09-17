@@ -52,6 +52,7 @@ pub struct SelectedRootDirectoryAdoption {
 
 pub const SELECTED_ROOT_CONVERGENCE_MAX_ACTIONS: usize = 10_000;
 pub const SUPERVISED_FILE_BATCH_MAX_ACTIONS: usize = 64;
+pub const SUPERVISED_STALE_FILE_PLAN_MAX_ACTIONS: usize = 64;
 pub const SUPERVISED_FILE_DOWNLOAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
 static DOWNLOAD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -132,6 +133,35 @@ impl SelectedRootLocalReceiptVerification {
         self.receipts_total > 0
             && self.files_matching_receipt == self.receipts_total
             && self.files_modified_since_receipt == 0
+            && self.files_missing == 0
+            && self.type_conflicts == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootStaleFileBatchPlan {
+    pub max_actions: usize,
+    pub current_receipts: usize,
+    pub stale_receipts_total: usize,
+    pub replacement_candidates: usize,
+    pub deletion_candidates: usize,
+    pub safe_to_replace: usize,
+    pub safe_to_delete: usize,
+    pub local_conflicts: usize,
+    pub files_missing: usize,
+    pub type_conflicts: usize,
+    pub bytes_hashed: u64,
+    pub convergence_replacement_actions: usize,
+    pub convergence_deletion_actions: usize,
+}
+
+impl SelectedRootStaleFileBatchPlan {
+    pub fn all_stale_files_safe(self) -> bool {
+        self.stale_receipts_total > 0
+            && self.replacement_candidates + self.deletion_candidates == self.stale_receipts_total
+            && self.safe_to_replace == self.replacement_candidates
+            && self.safe_to_delete == self.deletion_candidates
+            && self.local_conflicts == 0
             && self.files_missing == 0
             && self.type_conflicts == 0
     }
@@ -1044,6 +1074,175 @@ fn rollback_created_file(path: &Path) -> Result<(), SelectedRootExecutorError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(SelectedRootExecutorError::LocalFileRollbackFailed),
     }
+}
+
+pub fn plan_selected_root_stale_files(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootStaleFileBatchPlan, SelectedRootExecutorError> {
+    let convergence = plan_selected_root_receive_only_convergence(storage, sync_root)?;
+
+    if convergence.blocked()
+        || convergence.create_directories != 0
+        || convergence.materialize_missing_files != 0
+        || convergence.verify_existing_files != 0
+        || convergence.delete_owned_empty_directories != 0
+    {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanPhaseBlocked);
+    }
+
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let materialization = plan_receive_only_materialization(&remote_items, &local_entries)?;
+
+    if !materialization.ready_for_directory_phase()
+        || materialization.missing_directories != 0
+        || materialization.missing_files != 0
+        || materialization.matching_directories != materialization.remote_directories
+        || materialization.type_conflicts != 0
+    {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanPhaseBlocked);
+    }
+
+    let current_count = storage.sync_root_materialization_receipt_count(&sync_root.id)?;
+    let stale_count = storage.sync_root_stale_materialization_receipt_count(&sync_root.id)?;
+    let stale_receipts =
+        storage.list_sync_root_stale_file_materialization_receipts(&sync_root.id)?;
+
+    let current_receipts =
+        usize::try_from(current_count).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+    let stale_receipts_total =
+        usize::try_from(stale_count).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+
+    if stale_receipts.len() != stale_receipts_total {
+        return Err(SelectedRootExecutorError::LocalReceiptVerificationCountMismatch);
+    }
+    if stale_receipts_total > SUPERVISED_STALE_FILE_PLAN_MAX_ACTIONS {
+        return Err(SelectedRootExecutorError::LocalReceiptVerificationSafetyLimitExceeded);
+    }
+
+    let expected_stale_actions = convergence
+        .revalidate_stale_file_replacements
+        .checked_add(convergence.revalidate_stale_file_deletions)
+        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+
+    if expected_stale_actions != stale_receipts_total {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanPhaseBlocked);
+    }
+
+    let current_targets = plan_receive_only_existing_file_targets(&remote_items, &local_entries)?;
+    let root_path = validated_selected_root_path(sync_root)?;
+
+    let mut result = SelectedRootStaleFileBatchPlan {
+        max_actions: SUPERVISED_STALE_FILE_PLAN_MAX_ACTIONS,
+        current_receipts,
+        stale_receipts_total,
+        replacement_candidates: 0,
+        deletion_candidates: 0,
+        safe_to_replace: 0,
+        safe_to_delete: 0,
+        local_conflicts: 0,
+        files_missing: 0,
+        type_conflicts: 0,
+        bytes_hashed: 0,
+        convergence_replacement_actions: convergence.revalidate_stale_file_replacements,
+        convergence_deletion_actions: convergence.revalidate_stale_file_deletions,
+    };
+
+    for receipt in &stale_receipts {
+        let remote_identity_present = remote_items
+            .iter()
+            .any(|item| item.remote_id == receipt.remote_id);
+
+        let matching_target = current_targets.iter().find(|target| {
+            target.remote_id() == receipt.remote_id.as_str()
+                && target.relative_path() == receipt.relative_path.as_str()
+        });
+
+        if remote_identity_present {
+            result.replacement_candidates = result
+                .replacement_candidates
+                .checked_add(1)
+                .ok_or(SelectedRootExecutorError::CountOverflow)?;
+
+            let Some(target) = matching_target else {
+                return Err(SelectedRootExecutorError::RemoteReplacementPlanTargetMismatch);
+            };
+
+            let current_remote_size = target
+                .size_bytes()
+                .ok_or(SelectedRootExecutorError::LocalFileSizeUnknown)?;
+            if current_remote_size > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+                return Err(SelectedRootExecutorError::LocalFileTooLarge);
+            }
+        } else {
+            result.deletion_candidates = result
+                .deletion_candidates
+                .checked_add(1)
+                .ok_or(SelectedRootExecutorError::CountOverflow)?;
+        }
+
+        match inspect_receipt_target(&root_path, receipt)? {
+            ReceiptTargetInspection::Missing => {
+                result.files_missing = result
+                    .files_missing
+                    .checked_add(1)
+                    .ok_or(SelectedRootExecutorError::CountOverflow)?;
+            }
+            ReceiptTargetInspection::Conflict => {
+                result.type_conflicts = result
+                    .type_conflicts
+                    .checked_add(1)
+                    .ok_or(SelectedRootExecutorError::CountOverflow)?;
+            }
+            ReceiptTargetInspection::File(target_path, observed_size) => {
+                if observed_size != receipt.size_bytes {
+                    result.local_conflicts = result
+                        .local_conflicts
+                        .checked_add(1)
+                        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+                    continue;
+                }
+
+                if receipt.size_bytes > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+                    return Err(SelectedRootExecutorError::LocalFileTooLarge);
+                }
+
+                let (bytes, sha256_hex) =
+                    hash_local_file(&target_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES)?;
+                result.bytes_hashed = result
+                    .bytes_hashed
+                    .checked_add(bytes)
+                    .ok_or(SelectedRootExecutorError::CountOverflow)?;
+
+                if bytes == receipt.size_bytes && sha256_hex == receipt.sha256_hex {
+                    if remote_identity_present {
+                        result.safe_to_replace = result
+                            .safe_to_replace
+                            .checked_add(1)
+                            .ok_or(SelectedRootExecutorError::CountOverflow)?;
+                    } else {
+                        result.safe_to_delete = result
+                            .safe_to_delete
+                            .checked_add(1)
+                            .ok_or(SelectedRootExecutorError::CountOverflow)?;
+                    }
+                } else {
+                    result.local_conflicts = result
+                        .local_conflicts
+                        .checked_add(1)
+                        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+                }
+            }
+        }
+    }
+
+    if result.replacement_candidates != result.convergence_replacement_actions
+        || result.deletion_candidates != result.convergence_deletion_actions
+    {
+        return Err(SelectedRootExecutorError::RemoteReplacementPlanTargetMismatch);
+    }
+
+    Ok(result)
 }
 
 pub fn plan_selected_root_remote_replacement(

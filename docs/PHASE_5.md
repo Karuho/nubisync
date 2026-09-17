@@ -475,3 +475,27 @@ the exact-one prototype path; Phase 5D3 uses the explicit plural command.
 
 Descriptor-relative/openat2 hardening remains required before unattended or
 adversarial filesystem mutation.
+
+## Phase 5D4 — Bounded stale-file revalidation plan
+
+Phase 5D4 begins stale-state handling with a read-only owner-supervised planner:
+
+`nubisync sync roots stale-files-plan --approve`
+
+The planner handles at most 64 stale file receipts per invocation. It is bound to
+the Phase 5D1 convergence classifications and accepts only stale-file replacement
+and stale-file deletion revalidation work; unrelated create/materialize/verify or
+directory-deletion work blocks the phase.
+
+For each stale receipt it distinguishes a replacement candidate when the remote
+identity remains present at the same expected path, or a deletion candidate when
+that remote identity is absent. The local file is then revalidated against the
+durable stale receipt size and SHA-256 baseline.
+
+The planner performs no provider request, no OAuth/keyring access, no SQLite
+mutation and no filesystem mutation. It may read and hash local file content.
+Output is aggregate-only and does not print local paths/names, remote IDs, remote
+metadata, hashes, cursors or token values.
+
+Phase 5D4 deliberately does not execute replacement or deletion. Batch mutation is
+designed only after this multi-file stale-state planner is owner-proven.
