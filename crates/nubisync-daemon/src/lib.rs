@@ -51,8 +51,20 @@ pub struct SelectedRootDirectoryAdoption {
 }
 
 pub const SELECTED_ROOT_CONVERGENCE_MAX_ACTIONS: usize = 10_000;
+pub const SUPERVISED_FILE_BATCH_MAX_ACTIONS: usize = 64;
 pub const SUPERVISED_FILE_DOWNLOAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
 static DOWNLOAD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootFileBatchMaterialization {
+    pub planned_file_actions: usize,
+    pub batch_action_limit: usize,
+    pub files_downloaded: usize,
+    pub bytes_downloaded: u64,
+    pub max_file_bytes: u64,
+    pub provider_fingerprints_verified: usize,
+    pub receipts_recorded: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectedRootFileMaterialization {
@@ -487,6 +499,228 @@ pub fn adopt_selected_root_existing_directory(
         current_directory_receipts: current,
         stale_directory_receipts: stale,
     })
+}
+
+pub fn materialize_selected_root_missing_files<P: SelectedRootContentProvider>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootFileBatchMaterialization, SelectedRootExecutorError> {
+    let convergence = plan_selected_root_receive_only_convergence(storage, sync_root)?;
+
+    if convergence.blocked()
+        || convergence.create_directories != 0
+        || convergence.verify_existing_files != 0
+        || convergence.revalidate_stale_file_replacements != 0
+        || convergence.revalidate_stale_file_deletions != 0
+        || convergence.delete_owned_empty_directories != 0
+    {
+        return Err(SelectedRootExecutorError::LocalFilePhaseBlocked);
+    }
+
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let preflight = plan_receive_only_materialization(&remote_items, &local_entries)?;
+
+    if !preflight.ready_for_directory_phase()
+        || preflight.missing_directories != 0
+        || preflight.matching_directories != preflight.remote_directories
+        || convergence.remote_items != preflight.remote_items
+        || convergence.local_entries != preflight.local_entries
+        || convergence.materialize_missing_files != preflight.missing_files
+        || preflight.existing_files_unverified
+            != convergence
+                .current_owned_files
+                .checked_add(convergence.verify_existing_files)
+                .ok_or(SelectedRootExecutorError::CountOverflow)?
+    {
+        return Err(SelectedRootExecutorError::LocalFilePhaseBlocked);
+    }
+
+    let targets = plan_receive_only_missing_file_targets(&remote_items, &local_entries)?;
+    if targets.len() != preflight.missing_files
+        || targets.len() != convergence.materialize_missing_files
+        || targets.len() > SUPERVISED_FILE_BATCH_MAX_ACTIONS
+    {
+        return Err(SelectedRootExecutorError::LocalFileTargetCountMismatch);
+    }
+
+    if targets.is_empty() {
+        return Ok(SelectedRootFileBatchMaterialization {
+            planned_file_actions: 0,
+            batch_action_limit: SUPERVISED_FILE_BATCH_MAX_ACTIONS,
+            files_downloaded: 0,
+            bytes_downloaded: 0,
+            max_file_bytes: SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
+            provider_fingerprints_verified: 0,
+            receipts_recorded: 0,
+        });
+    }
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let mut completed = Vec::with_capacity(targets.len());
+    let mut total_bytes = 0_u64;
+
+    for target in &targets {
+        let expected_size = target
+            .size_bytes()
+            .ok_or(SelectedRootExecutorError::LocalFileSizeUnknown)?;
+        if expected_size > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+            rollback_file_batch(&completed)?;
+            return Err(SelectedRootExecutorError::LocalFileTooLarge);
+        }
+
+        let fingerprint_before = match provider.content_fingerprint(target.remote_id()) {
+            Ok(value) => value,
+            Err(error) => {
+                rollback_file_batch(&completed)?;
+                return Err(error);
+            }
+        };
+
+        if fingerprint_before.size_bytes != expected_size {
+            rollback_file_batch(&completed)?;
+            return Err(SelectedRootExecutorError::RemoteReplacementProviderFingerprintMismatch);
+        }
+
+        let outcome = match apply_selected_root_file_target(
+            provider,
+            &root_path,
+            target,
+            SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                rollback_file_batch(&completed)?;
+                return Err(error);
+            }
+        };
+
+        let fingerprint_after = match provider.content_fingerprint(target.remote_id()) {
+            Ok(value) => value,
+            Err(error) => {
+                rollback_created_file(&outcome.target_path)?;
+                rollback_file_batch(&completed)?;
+                return Err(error);
+            }
+        };
+
+        if fingerprint_before != fingerprint_after
+            || outcome.bytes_downloaded != fingerprint_after.size_bytes
+            || outcome.sha256_hex != fingerprint_after.sha256_hex
+        {
+            rollback_created_file(&outcome.target_path)?;
+            rollback_file_batch(&completed)?;
+            return Err(SelectedRootExecutorError::RemoteReplacementProviderFingerprintMismatch);
+        }
+
+        let (promoted_bytes, promoted_sha256) =
+            match hash_local_file(&outcome.target_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES) {
+                Ok(value) => value,
+                Err(error) => {
+                    rollback_created_file(&outcome.target_path)?;
+                    rollback_file_batch(&completed)?;
+                    return Err(error);
+                }
+            };
+
+        if promoted_bytes != outcome.bytes_downloaded
+            || promoted_sha256 != outcome.sha256_hex
+            || promoted_sha256 != fingerprint_after.sha256_hex
+        {
+            rollback_created_file(&outcome.target_path)?;
+            rollback_file_batch(&completed)?;
+            return Err(SelectedRootExecutorError::LocalFilePostconditionFailed);
+        }
+
+        total_bytes = match total_bytes.checked_add(outcome.bytes_downloaded) {
+            Some(value) => value,
+            None => {
+                rollback_created_file(&outcome.target_path)?;
+                rollback_file_batch(&completed)?;
+                return Err(SelectedRootExecutorError::CountOverflow);
+            }
+        };
+
+        completed.push((
+            target.clone(),
+            outcome.target_path,
+            outcome.bytes_downloaded,
+            outcome.sha256_hex,
+        ));
+    }
+
+    let post_entries = match scan_selected_root_local_tree(sync_root) {
+        Ok(value) => value,
+        Err(error) => {
+            rollback_file_batch(&completed)?;
+            return Err(error);
+        }
+    };
+    let post_plan = match plan_receive_only_materialization(&remote_items, &post_entries) {
+        Ok(value) => value,
+        Err(error) => {
+            rollback_file_batch(&completed)?;
+            return Err(error.into());
+        }
+    };
+
+    if !post_plan.ready_for_directory_phase()
+        || post_plan.missing_directories != 0
+        || post_plan.missing_files != 0
+        || post_plan.matching_directories != post_plan.remote_directories
+        || post_plan.existing_files_unverified != post_plan.remote_files
+    {
+        rollback_file_batch(&completed)?;
+        return Err(SelectedRootExecutorError::LocalFilePostconditionFailed);
+    }
+
+    let receipt_rows = completed
+        .iter()
+        .map(|(target, _, bytes, sha256_hex)| {
+            (
+                target.remote_id().to_owned(),
+                target.relative_path().to_owned(),
+                *bytes,
+                sha256_hex.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let recorded = match storage.record_sync_root_file_materializations(
+        &sync_root.id,
+        &receipt_rows,
+        current_unix_time_ms()?,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            rollback_file_batch(&completed)?;
+            return Err(error.into());
+        }
+    };
+
+    if recorded != receipt_rows.len() {
+        rollback_file_batch(&completed)?;
+        return Err(SelectedRootExecutorError::LocalFileReceiptPostconditionFailed);
+    }
+
+    Ok(SelectedRootFileBatchMaterialization {
+        planned_file_actions: targets.len(),
+        batch_action_limit: SUPERVISED_FILE_BATCH_MAX_ACTIONS,
+        files_downloaded: completed.len(),
+        bytes_downloaded: total_bytes,
+        max_file_bytes: SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
+        provider_fingerprints_verified: completed.len(),
+        receipts_recorded: recorded,
+    })
+}
+
+fn rollback_file_batch(
+    completed: &[(ReceiveOnlyFileTarget, PathBuf, u64, String)],
+) -> Result<(), SelectedRootExecutorError> {
+    for (_, path, _, _) in completed.iter().rev() {
+        rollback_created_file(path)?;
+    }
+    Ok(())
 }
 
 pub fn materialize_selected_root_missing_file<P: SelectedRootContentProvider>(

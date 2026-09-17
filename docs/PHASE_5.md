@@ -444,3 +444,34 @@ directory receipt counts.
 
 Descriptor-relative/openat2 hardening is still required before unattended or
 adversarial filesystem mutation.
+
+## Phase 5D3 — Supervised bounded multi-file materialization
+
+Phase 5D3 adds:
+
+`nubisync sync roots materialize-files --approve`
+
+This is a supervised bounded receive-only executor for `MaterializeMissingFile`
+actions produced by the Phase 5D1 convergence planner.
+
+The batch is limited to 64 file actions per invocation. The existing per-file
+16 MiB cap remains in force.
+
+For each file, NubiSync requires completed directory work, obtains a provider
+SHA-256 fingerprint before download, streams into a same-parent temporary file
+while hashing, verifies byte count and expected size, fsyncs, promotes with
+no-overwrite semantics, obtains the provider fingerprint again, rejects a changed
+remote object, and hashes the promoted local file again.
+
+Only after every file in the batch passes these checks does storage persist all
+corresponding current file receipts in one SQLite transaction. If receipt
+persistence fails, files created by the current invocation are rolled back.
+
+The executor never overwrites or deletes a pre-existing local file, creates no
+directories, uses Drive readonly only, and performs no Drive write.
+
+The existing singular `materialize-file --approve` command remains available for
+the exact-one prototype path; Phase 5D3 uses the explicit plural command.
+
+Descriptor-relative/openat2 hardening remains required before unattended or
+adversarial filesystem mutation.

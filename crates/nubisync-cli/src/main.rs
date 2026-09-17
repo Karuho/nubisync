@@ -10,11 +10,12 @@ use nubisync_core::{
     ProviderAccount, ProviderId, RemoteChange, RemoteItemKind, SyncMode, SyncRoot,
 };
 use nubisync_daemon::{
-    SUPERVISED_FILE_DOWNLOAD_MAX_BYTES, adopt_selected_root_existing_directory,
-    bootstrap_selected_root_snapshot, collect_selected_root_change_window_page,
-    delete_selected_root_existing_directory, delete_selected_root_existing_file,
-    execute_completed_selected_root_change_window, materialize_selected_root_directories,
-    materialize_selected_root_missing_file, plan_selected_root_local_materialization,
+    SUPERVISED_FILE_BATCH_MAX_ACTIONS, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
+    adopt_selected_root_existing_directory, bootstrap_selected_root_snapshot,
+    collect_selected_root_change_window_page, delete_selected_root_existing_directory,
+    delete_selected_root_existing_file, execute_completed_selected_root_change_window,
+    materialize_selected_root_directories, materialize_selected_root_missing_file,
+    materialize_selected_root_missing_files, plan_selected_root_local_materialization,
     plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
     plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
     replace_selected_root_existing_file, verify_selected_root_existing_file,
@@ -130,6 +131,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_adopt_directory()
+        }
+        [sync, roots, materialize_files, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && materialize_files == "materialize-files"
+                && approve == "--approve" =>
+        {
+            sync_roots_materialize_files()
         }
         [sync, roots, materialize_file, approve]
             if sync == "sync"
@@ -295,6 +304,7 @@ USAGE:
   nubisync sync roots reconcile-plan --approve
   nubisync sync roots materialize-directories --approve
   nubisync sync roots adopt-directory --approve
+  nubisync sync roots materialize-files --approve
   nubisync sync roots materialize-file --approve
   nubisync sync roots verify-file --approve
   nubisync sync roots verify-local --approve
@@ -977,6 +987,119 @@ fn sync_roots_adopt_directory() -> Result<(), CliError> {
     println!("REMOTE_METADATA_PRINTED=no");
     println!("TOKEN_VALUES_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_materialize_files() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_FILE_BATCH_MATERIALIZATION=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_FILE_BATCH_MATERIALIZATION_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+    if let Some(rotated) = tokens.refresh_token() {
+        keyring.put(&refresh_key, SecretValue::new(rotated.as_bytes().to_vec())?)?;
+    }
+
+    println!("SYNC_ROOT_FILE_BATCH_MATERIALIZATION_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_FILE_BATCH_MATERIALIZATION_STAGE=download_file_batch");
+    let result = materialize_selected_root_missing_files(&api, &mut storage, root)?;
+
+    let current_file_receipts = storage.sync_root_materialization_receipt_count(&root.id)?;
+    let stale_file_receipts = storage.sync_root_stale_materialization_receipt_count(&root.id)?;
+
+    println!("SYNC_ROOT_FILE_BATCH_MATERIALIZATION=PASS");
+    println!("MODE=receive_only");
+    println!("BATCH_ACTION_LIMIT={}", result.batch_action_limit);
+    println!("FILE_ACTIONS_PLANNED={}", result.planned_file_actions);
+    println!("FILES_DOWNLOADED={}", result.files_downloaded);
+    println!("BYTES_DOWNLOADED={}", result.bytes_downloaded);
+    println!("MAX_FILE_BYTES={}", result.max_file_bytes);
+    println!(
+        "PROVIDER_FINGERPRINTS_VERIFIED={}",
+        result.provider_fingerprints_verified
+    );
+    println!("RECEIPTS_RECORDED={}", result.receipts_recorded);
+    println!("CURRENT_FILE_RECEIPTS={current_file_receipts}");
+    println!("STALE_FILE_RECEIPTS={stale_file_receipts}");
+    println!("BATCH_MODE=bounded_supervised");
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION={}", yes_no(result.files_downloaded > 0));
+    println!(
+        "FILESYSTEM_MUTATION={}",
+        yes_no(result.files_downloaded > 0)
+    );
+    println!(
+        "FILE_CONTENT_ACCESSED={}",
+        yes_no(result.files_downloaded > 0)
+    );
+    println!("FILES_CREATED={}", result.files_downloaded);
+    println!("FILES_OVERWRITTEN=0");
+    println!("FILES_DELETED=0");
+    println!("DIRECTORIES_CREATED=0");
+    println!("DIRECTORIES_REMOVED=0");
+    println!("ATOMIC_NO_OVERWRITE_PROMOTION=yes");
+    println!("PROVIDER_FINGERPRINT_BEFORE_AFTER=yes");
+    println!("PROMOTED_SHA256_VERIFIED=yes");
+    println!("TEMP_FILES_RETAINED=0");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+    println!("CONFIGURED_MAX_FILE_BYTES={SUPERVISED_FILE_DOWNLOAD_MAX_BYTES}");
+    println!("CONFIGURED_MAX_FILE_ACTIONS={SUPERVISED_FILE_BATCH_MAX_ACTIONS}");
 
     Ok(())
 }

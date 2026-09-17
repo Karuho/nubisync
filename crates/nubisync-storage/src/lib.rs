@@ -1693,6 +1693,83 @@ impl Storage {
         Ok(())
     }
 
+    pub fn record_sync_root_file_materializations(
+        &mut self,
+        sync_root_id: &str,
+        files: &[(String, String, u64, String)],
+        materialized_at_unix_ms: i64,
+    ) -> Result<usize, StorageError> {
+        if files.is_empty() {
+            return Ok(0);
+        }
+
+        let mut remote_ids = std::collections::HashSet::with_capacity(files.len());
+        let mut relative_paths = std::collections::HashSet::with_capacity(files.len());
+
+        for (remote_id, relative_path, _, sha256_hex) in files {
+            validate_materialization_receipt_values(remote_id, relative_path, sha256_hex)?;
+            if !remote_ids.insert(remote_id.as_str())
+                || !relative_paths.insert(relative_path.as_str())
+            {
+                return Err(StorageError::InvalidMaterializationReceipt);
+            }
+        }
+
+        let transaction = self.connection.transaction()?;
+
+        for (remote_id, relative_path, size_bytes, sha256_hex) in files {
+            let size_bytes_i64 =
+                i64::try_from(*size_bytes).map_err(|_| StorageError::NumericOverflow)?;
+
+            let remote: Option<(String, Option<i64>, i64)> = transaction
+                .query_row(
+                    "SELECT item_kind, size_bytes, trashed
+                     FROM sync_root_remote_items
+                     WHERE sync_root_id = ?1 AND remote_id = ?2",
+                    params![sync_root_id, remote_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+
+            let Some((item_kind, durable_size, trashed)) = remote else {
+                return Err(StorageError::MaterializationReceiptRemoteItemMissing);
+            };
+
+            if item_kind != "file" || trashed != 0 || durable_size != Some(size_bytes_i64) {
+                return Err(StorageError::MaterializationReceiptRemoteItemMismatch);
+            }
+
+            transaction.execute(
+                "INSERT INTO sync_root_file_materialization_receipts (
+                    sync_root_id,
+                    remote_id,
+                    relative_path,
+                    size_bytes,
+                    sha256_hex,
+                    materialized_at_unix_ms,
+                    receipt_state
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'current')
+                 ON CONFLICT(sync_root_id, remote_id) DO UPDATE SET
+                    relative_path = excluded.relative_path,
+                    size_bytes = excluded.size_bytes,
+                    sha256_hex = excluded.sha256_hex,
+                    materialized_at_unix_ms = excluded.materialized_at_unix_ms,
+                    receipt_state = 'current'",
+                params![
+                    sync_root_id,
+                    remote_id,
+                    relative_path,
+                    size_bytes_i64,
+                    sha256_hex,
+                    materialized_at_unix_ms
+                ],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(files.len())
+    }
+
     pub fn list_sync_root_file_materialization_receipts(
         &self,
         sync_root_id: &str,
