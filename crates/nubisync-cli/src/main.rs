@@ -13,14 +13,15 @@ use nubisync_daemon::{
     SUPERVISED_FILE_BATCH_MAX_ACTIONS, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
     adopt_selected_root_existing_directory, bootstrap_selected_root_snapshot,
     collect_selected_root_change_window_page, delete_selected_root_existing_directory,
-    delete_selected_root_existing_file, delete_selected_root_stale_files,
-    execute_completed_selected_root_change_window, materialize_selected_root_directories,
-    materialize_selected_root_missing_file, materialize_selected_root_missing_files,
-    plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
-    plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
-    plan_selected_root_remote_replacement, plan_selected_root_stale_files,
-    replace_selected_root_existing_file, replace_selected_root_stale_files,
-    verify_selected_root_existing_file, verify_selected_root_local_receipts,
+    delete_selected_root_existing_file, delete_selected_root_stale_directories,
+    delete_selected_root_stale_files, execute_completed_selected_root_change_window,
+    materialize_selected_root_directories, materialize_selected_root_missing_file,
+    materialize_selected_root_missing_files, plan_selected_root_local_materialization,
+    plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
+    plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
+    plan_selected_root_stale_files, replace_selected_root_existing_file,
+    replace_selected_root_stale_files, verify_selected_root_existing_file,
+    verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -132,6 +133,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_delete_stale_files()
+        }
+        [sync, roots, delete_stale_directories, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && delete_stale_directories == "delete-stale-directories"
+                && approve == "--approve" =>
+        {
+            sync_roots_delete_stale_directories()
         }
         [sync, roots, reconcile_plan, approve]
             if sync == "sync"
@@ -329,6 +338,7 @@ USAGE:
   nubisync sync roots stale-files-plan --approve
   nubisync sync roots replace-stale-files --approve
   nubisync sync roots delete-stale-files --approve
+  nubisync sync roots delete-stale-directories --approve
   nubisync sync roots reconcile-plan --approve
   nubisync sync roots materialize-directories --approve
   nubisync sync roots adopt-directory --approve
@@ -1677,6 +1687,91 @@ fn sync_roots_delete_stale_files() -> Result<(), CliError> {
     println!("STALE_BASELINE_REVALIDATED=yes");
     println!("SAME_PARENT_QUARANTINE=yes");
     println!("QUARANTINE_FILES_RETAINED=0");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_delete_stale_directories() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_STALE_DIRECTORY_BATCH_DELETION=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    println!("SYNC_ROOT_STALE_DIRECTORY_BATCH_DELETION_STAGE=quarantine_and_delete_batch");
+    let result = delete_selected_root_stale_directories(&mut storage, root)?;
+
+    let current_directory_receipts =
+        storage.sync_root_directory_materialization_receipt_count(&root.id)?;
+    let stale_directory_receipts =
+        storage.sync_root_stale_directory_materialization_receipt_count(&root.id)?;
+
+    println!("SYNC_ROOT_STALE_DIRECTORY_BATCH_DELETION=PASS");
+    println!("MODE=receive_only");
+    println!("BATCH_ACTION_LIMIT={}", result.batch_action_limit);
+    println!(
+        "DELETION_ACTIONS_PLANNED={}",
+        result.planned_deletion_actions
+    );
+    println!("DIRECTORIES_DELETED={}", result.directories_deleted);
+    println!(
+        "EMPTY_DIRECTORIES_VERIFIED={}",
+        result.empty_directories_verified
+    );
+    println!("RECEIPTS_DELETED={}", result.receipts_deleted);
+    println!("QUARANTINE_RENAMES={}", result.quarantine_renames);
+    println!(
+        "QUARANTINE_DIRECTORIES_REMOVED={}",
+        result.quarantine_directories_removed
+    );
+    println!("CURRENT_DIRECTORY_RECEIPTS={current_directory_receipts}");
+    println!("STALE_DIRECTORY_RECEIPTS={stale_directory_receipts}");
+    println!("BATCH_MODE=bounded_supervised");
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_MUTATION=yes");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("FILES_CREATED=0");
+    println!("FILES_OVERWRITTEN=0");
+    println!("FILES_DELETED=0");
+    println!("DIRECTORIES_CREATED=0");
+    println!("DIRECTORIES_REMOVED={}", result.directories_deleted);
+    println!("EMPTY_DIRECTORY_REVALIDATED=yes");
+    println!("SAME_PARENT_QUARANTINE=yes");
+    println!("QUARANTINE_DIRECTORIES_RETAINED=0");
     println!("ROOT_PATH_PRINTED=no");
     println!("LOCAL_NAMES_PRINTED=no");
     println!("REMOTE_ROOT_ID_PRINTED=no");

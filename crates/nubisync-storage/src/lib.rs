@@ -1942,6 +1942,42 @@ impl Storage {
         Ok(deleted == 1)
     }
 
+    pub fn delete_sync_root_stale_directory_materialization_receipts(
+        &mut self,
+        sync_root_id: &str,
+        remote_ids: &[String],
+    ) -> Result<usize, StorageError> {
+        if remote_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut unique_ids = std::collections::HashSet::with_capacity(remote_ids.len());
+        for remote_id in remote_ids {
+            if remote_id.trim().is_empty() || !unique_ids.insert(remote_id.as_str()) {
+                return Err(StorageError::InvalidDirectoryMaterializationReceipt);
+            }
+        }
+
+        let transaction = self.connection.transaction()?;
+
+        for remote_id in remote_ids {
+            let deleted = transaction.execute(
+                "DELETE FROM sync_root_directory_materialization_receipts
+                 WHERE sync_root_id = ?1
+                   AND remote_id = ?2
+                   AND receipt_state = 'stale'",
+                params![sync_root_id, remote_id],
+            )?;
+
+            if deleted != 1 {
+                return Err(StorageError::StaleDirectoryMaterializationReceiptBatchMismatch);
+            }
+        }
+
+        transaction.commit()?;
+        Ok(remote_ids.len())
+    }
+
     pub fn delete_sync_root_stale_directory_materialization_receipt(
         &mut self,
         sync_root_id: &str,
@@ -3133,6 +3169,8 @@ pub enum StorageError {
     MaterializationReceiptRemoteItemMismatch,
     #[error("stale materialization receipt batch did not match durable state")]
     StaleMaterializationReceiptBatchMismatch,
+    #[error("stale directory materialization receipt batch did not match durable state")]
+    StaleDirectoryMaterializationReceiptBatchMismatch,
     #[error("SQLite operation failed")]
     Sqlite(#[from] rusqlite::Error),
     #[error("stored NubiSync domain value is invalid")]
@@ -5966,6 +6004,99 @@ mod phase5d4_upsert_receipt_scope_tests {
                 .sync_root_stale_materialization_receipt_count(&root.id)
                 .unwrap(),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase5d7_directory_receipt_batch_tests {
+    use super::*;
+
+    fn fixture() -> (Storage, SyncRoot) {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5d7-storage-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5d7-storage-root",
+            provider,
+            account.subject,
+            "/tmp/nubisync-phase5d7-storage-root",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        for (remote_id, relative_path) in [("dir-a", "dir-a"), ("dir-b", "dir-b")] {
+            storage
+                .connection
+                .execute(
+                    "INSERT INTO sync_root_directory_materialization_receipts (
+                        sync_root_id,
+                        remote_id,
+                        relative_path,
+                        materialized_at_unix_ms,
+                        receipt_state
+                     ) VALUES (?1, ?2, ?3, 3, 'stale')",
+                    params![&root.id, remote_id, relative_path],
+                )
+                .unwrap();
+        }
+
+        (storage, root)
+    }
+
+    #[test]
+    fn phase5d7_stale_directory_receipt_batch_delete_is_atomic_and_exact() {
+        let (mut storage, root) = fixture();
+
+        assert_eq!(
+            storage
+                .sync_root_stale_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            2
+        );
+
+        let deleted = storage
+            .delete_sync_root_stale_directory_materialization_receipts(
+                &root.id,
+                &["dir-a".into(), "dir-b".into()],
+            )
+            .unwrap();
+
+        assert_eq!(deleted, 2);
+        assert_eq!(
+            storage
+                .sync_root_stale_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn phase5d7_stale_directory_receipt_batch_delete_rolls_back_on_mismatch() {
+        let (mut storage, root) = fixture();
+
+        let error = storage
+            .delete_sync_root_stale_directory_materialization_receipts(
+                &root.id,
+                &["dir-a".into(), "missing-stale-dir".into()],
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::StaleDirectoryMaterializationReceiptBatchMismatch
+        ));
+        assert_eq!(
+            storage
+                .sync_root_stale_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            2
         );
     }
 }
