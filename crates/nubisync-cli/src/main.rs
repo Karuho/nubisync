@@ -13,10 +13,11 @@ use nubisync_daemon::{
     SUPERVISED_FILE_BATCH_MAX_ACTIONS, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
     SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS, SelectedRootReceiveOnlySingleFlightResult,
     adopt_selected_root_existing_directory, bootstrap_selected_root_snapshot,
-    collect_selected_root_change_window_page, delete_selected_root_existing_directory,
-    delete_selected_root_existing_file, delete_selected_root_stale_directories,
-    delete_selected_root_stale_files, execute_completed_selected_root_change_window,
-    execute_selected_root_receive_only_cycle, execute_selected_root_receive_only_single_flight,
+    capture_selected_root_local_baseline, collect_selected_root_change_window_page,
+    delete_selected_root_existing_directory, delete_selected_root_existing_file,
+    delete_selected_root_stale_directories, delete_selected_root_stale_files,
+    execute_completed_selected_root_change_window, execute_selected_root_receive_only_cycle,
+    execute_selected_root_receive_only_single_flight,
     execute_selected_root_unified_convergence_step, materialize_selected_root_directories,
     materialize_selected_root_missing_file, materialize_selected_root_missing_files,
     plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
@@ -117,6 +118,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_run_to_idle()
+        }
+        [sync, roots, local_baseline, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && local_baseline == "local-baseline"
+                && approve == "--approve" =>
+        {
+            sync_roots_local_baseline()
         }
         [sync, roots, convergence_plan, approve]
             if sync == "sync"
@@ -368,6 +377,7 @@ USAGE:
   nubisync sync roots metadata-step --approve
   nubisync sync roots cycle --approve
   nubisync sync roots run-to-idle --approve
+  nubisync sync roots local-baseline --approve
   nubisync sync roots convergence-plan --approve
   nubisync sync roots converge --approve
   nubisync sync roots stale-files-plan --approve
@@ -1086,6 +1096,90 @@ fn sync_roots_run_to_idle() -> Result<(), CliError> {
     println!("NETWORK_CHECK=performed");
     println!("DATABASE_MUTATION=yes");
     println!("FILESYSTEM_MUTATION={}", yes_no(filesystem_mutation));
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_local_baseline() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_LOCAL_BASELINE=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    if root.mode != SyncMode::ReceiveOnly {
+        return Err(CliError::SyncRootMetadataStepModeUnsupported);
+    }
+
+    let existing = storage.sync_root_local_inventory_state(&root.id)?;
+    if existing.snapshot_complete {
+        println!("SYNC_ROOT_LOCAL_BASELINE=ALREADY_CAPTURED");
+        println!("MODE=receive_only");
+        println!("ITEMS_CAPTURED={}", existing.item_count);
+        println!("SNAPSHOT_COMPLETE=yes");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_READ=not_performed");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("ROOT_PATH_PRINTED=no");
+        println!("LOCAL_NAMES_PRINTED=no");
+        println!("REMOTE_ROOT_ID_PRINTED=no");
+        println!("REMOTE_METADATA_PRINTED=no");
+        println!("HASH_VALUE_PRINTED=no");
+        println!("TOKEN_VALUES_PRINTED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    println!("SYNC_ROOT_LOCAL_BASELINE_STAGE=capture_metadata_snapshot");
+    let result = capture_selected_root_local_baseline(&mut storage, root, unix_time_ms()?)?;
+
+    println!("SYNC_ROOT_LOCAL_BASELINE=PASS");
+    println!("MODE=receive_only");
+    println!("ITEMS_CAPTURED={}", result.items_captured);
+    println!("FILES_CAPTURED={}", result.files_captured);
+    println!("DIRECTORIES_CAPTURED={}", result.directories_captured);
+    println!("CONVERGENCE_ACTIONS={}", result.convergence_actions);
+    println!("SNAPSHOT_COMPLETE={}", yes_no(result.snapshot_complete));
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
     println!("ROOT_PATH_PRINTED=no");
     println!("LOCAL_NAMES_PRINTED=no");
     println!("REMOTE_ROOT_ID_PRINTED=no");

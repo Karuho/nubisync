@@ -3,8 +3,8 @@
 #![forbid(unsafe_code)]
 
 use nubisync_core::{
-    ChangeCursor, ChangePage, ContinuationToken, RemoteChange, RemoteItem, RemoteItemKind,
-    SyncMode, SyncRoot,
+    ChangeCursor, ChangePage, ContinuationToken, LocalItemKind, LocalItemSnapshot, RemoteChange,
+    RemoteItem, RemoteItemKind, SyncMode, SyncRoot,
 };
 use nubisync_drive::{
     DriveApiError, DriveBlobFingerprint, DriveFolderRoot, DriveRootMembership, GoogleDriveApi,
@@ -36,6 +36,15 @@ use std::{
     },
 };
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootLocalBaselineCapture {
+    pub items_captured: usize,
+    pub files_captured: usize,
+    pub directories_captured: usize,
+    pub convergence_actions: usize,
+    pub snapshot_complete: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectedRootDirectoryMaterialization {
@@ -4995,6 +5004,169 @@ pub fn verify_selected_root_existing_file<P: SelectedRootContentProvider>(
     })
 }
 
+pub fn capture_selected_root_local_baseline(
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    observed_at_unix_ms: i64,
+) -> Result<SelectedRootLocalBaselineCapture, SelectedRootExecutorError> {
+    if sync_root.mode != SyncMode::ReceiveOnly {
+        return Err(SelectedRootExecutorError::LocalBaselineModeUnsupported);
+    }
+
+    let existing = storage.sync_root_local_inventory_state(&sync_root.id)?;
+    if existing.snapshot_complete {
+        return Err(SelectedRootExecutorError::LocalBaselineAlreadyComplete);
+    }
+
+    let pre = plan_selected_root_receive_only_convergence(storage, sync_root)?;
+    if pre.blocked() || pre.action_count() != 0 {
+        return Err(SelectedRootExecutorError::LocalBaselineConvergenceNotClean);
+    }
+
+    let first = scan_selected_root_local_snapshot(sync_root)?;
+
+    storage.begin_sync_root_local_inventory_staging(&sync_root.id)?;
+    storage.stage_sync_root_local_inventory_items(&sync_root.id, &first, observed_at_unix_ms)?;
+
+    let second = match scan_selected_root_local_snapshot(sync_root) {
+        Ok(value) => value,
+        Err(error) => {
+            storage.begin_sync_root_local_inventory_staging(&sync_root.id)?;
+            return Err(error);
+        }
+    };
+
+    if first != second {
+        storage.begin_sync_root_local_inventory_staging(&sync_root.id)?;
+        return Err(SelectedRootExecutorError::LocalBaselineScanRace);
+    }
+
+    let post = match plan_selected_root_receive_only_convergence(storage, sync_root) {
+        Ok(value) => value,
+        Err(error) => {
+            storage.begin_sync_root_local_inventory_staging(&sync_root.id)?;
+            return Err(error);
+        }
+    };
+
+    if post.blocked() || post.action_count() != 0 {
+        storage.begin_sync_root_local_inventory_staging(&sync_root.id)?;
+        return Err(SelectedRootExecutorError::LocalBaselineScanRace);
+    }
+
+    let staged = storage.staged_sync_root_local_inventory_count(&sync_root.id)?;
+    let expected =
+        u64::try_from(first.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+    if staged != expected {
+        storage.begin_sync_root_local_inventory_staging(&sync_root.id)?;
+        return Err(SelectedRootExecutorError::LocalBaselineStagingMismatch);
+    }
+
+    let committed =
+        storage.commit_sync_root_local_inventory_snapshot(&sync_root.id, observed_at_unix_ms)?;
+
+    if committed != first.len() {
+        return Err(SelectedRootExecutorError::LocalBaselineCommitMismatch);
+    }
+
+    let durable = storage.sync_root_local_inventory_state(&sync_root.id)?;
+    if !durable.snapshot_complete || durable.item_count != expected {
+        return Err(SelectedRootExecutorError::LocalBaselineCommitMismatch);
+    }
+
+    let files_captured = first
+        .iter()
+        .filter(|item| item.kind() == LocalItemKind::File)
+        .count();
+    let directories_captured = first
+        .iter()
+        .filter(|item| item.kind() == LocalItemKind::Directory)
+        .count();
+
+    Ok(SelectedRootLocalBaselineCapture {
+        items_captured: first.len(),
+        files_captured,
+        directories_captured,
+        convergence_actions: 0,
+        snapshot_complete: true,
+    })
+}
+
+fn scan_selected_root_local_snapshot(
+    sync_root: &SyncRoot,
+) -> Result<Vec<LocalItemSnapshot>, SelectedRootExecutorError> {
+    let configured_root = validated_selected_root_path(sync_root)?;
+    let mut queue = VecDeque::from([(configured_root, String::new())]);
+    let mut items = Vec::new();
+
+    while let Some((absolute_parent, relative_parent)) = queue.pop_front() {
+        let directory = fs::read_dir(&absolute_parent)
+            .map_err(|_| SelectedRootExecutorError::LocalFilesystemInspectionFailed)?;
+
+        for entry in directory {
+            let entry =
+                entry.map_err(|_| SelectedRootExecutorError::LocalFilesystemInspectionFailed)?;
+
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| SelectedRootExecutorError::LocalEntryNonUtf8)?;
+
+            let relative_path = if relative_parent.is_empty() {
+                name
+            } else {
+                format!("{relative_parent}/{name}")
+            };
+
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|_| SelectedRootExecutorError::LocalFilesystemInspectionFailed)?;
+
+            if metadata.file_type().is_symlink() {
+                return Err(SelectedRootExecutorError::LocalEntrySymlinkUnsupported);
+            }
+
+            let (kind, size_bytes) = if metadata.is_dir() {
+                (LocalItemKind::Directory, None)
+            } else if metadata.is_file() {
+                (LocalItemKind::File, Some(metadata.len()))
+            } else {
+                return Err(SelectedRootExecutorError::LocalEntryTypeUnsupported);
+            };
+
+            let modified_unix_ns = metadata
+                .mtime()
+                .checked_mul(1_000_000_000)
+                .and_then(|value| value.checked_add(metadata.mtime_nsec()))
+                .ok_or(SelectedRootExecutorError::LocalMetadataTimestampOverflow)?;
+
+            items.push(
+                LocalItemSnapshot::new(
+                    relative_path.clone(),
+                    kind,
+                    size_bytes,
+                    modified_unix_ns,
+                    metadata.dev(),
+                    metadata.ino(),
+                )
+                .map_err(|_| SelectedRootExecutorError::LocalBaselineSnapshotInvalid)?,
+            );
+
+            if items.len() > 1_000_000 {
+                return Err(SelectedRootExecutorError::LocalScanSafetyLimitExceeded);
+            }
+
+            if kind == LocalItemKind::Directory {
+                queue.push_back((entry.path(), relative_path));
+            }
+        }
+    }
+
+    let _ = validated_selected_root_path(sync_root)?;
+
+    items.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
+    Ok(items)
+}
+
 fn selected_root_materialization_inputs(
     storage: &Storage,
     sync_root: &SyncRoot,
@@ -5916,6 +6088,22 @@ pub enum SelectedRootExecutorError {
     LocalFilesystemInspectionFailed,
     #[error("local sync tree scan exceeded its safety limit")]
     LocalScanSafetyLimitExceeded,
+    #[error("local baseline capture supports only receive_only roots")]
+    LocalBaselineModeUnsupported,
+    #[error("local baseline snapshot is already complete")]
+    LocalBaselineAlreadyComplete,
+    #[error("local baseline requires zero receive-only convergence actions")]
+    LocalBaselineConvergenceNotClean,
+    #[error("local baseline filesystem changed while the supervised scan was running")]
+    LocalBaselineScanRace,
+    #[error("local baseline staged row count mismatched the scanned snapshot")]
+    LocalBaselineStagingMismatch,
+    #[error("local baseline durable commit failed its postcondition")]
+    LocalBaselineCommitMismatch,
+    #[error("local filesystem timestamp does not fit durable nanosecond storage")]
+    LocalMetadataTimestampOverflow,
+    #[error("local baseline scan produced an invalid durable snapshot item")]
+    LocalBaselineSnapshotInvalid,
     #[error("local directory materialization is blocked by local-only entries or type conflicts")]
     LocalDirectoryPhaseBlocked,
     #[error("local directory target count mismatched the remote directory plan")]
@@ -9185,5 +9373,86 @@ mod phase5e4_periodic_scheduler_tests {
         assert_eq!(RECEIVE_ONLY_PERIODIC_BUSY_RETRY_MS, 5_000);
         assert_eq!(RECEIVE_ONLY_PERIODIC_ERROR_BACKOFF_INITIAL_MS, 5_000);
         assert_eq!(RECEIVE_ONLY_PERIODIC_ERROR_BACKOFF_MAX_MS, 300_000);
+    }
+}
+
+#[cfg(test)]
+mod phase5f2_local_baseline_tests {
+    use super::*;
+    use std::{
+        fs::{self, File},
+        os::unix::fs::symlink,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_root(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("nubisync-{label}-{stamp}"));
+        fs::create_dir_all(&path).unwrap();
+        fs::canonicalize(path).unwrap()
+    }
+
+    fn sync_root(path: &Path) -> SyncRoot {
+        SyncRoot::new(
+            "phase5f2-root",
+            nubisync_core::ProviderId::new("google-drive").unwrap(),
+            "phase5f2-subject",
+            path.to_str().unwrap(),
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn phase5f2_snapshot_scan_is_deterministic_and_metadata_only() {
+        let root = temp_root("baseline");
+        fs::create_dir(root.join("docs")).unwrap();
+        let mut file = File::create(root.join("docs/file.txt")).unwrap();
+        file.write_all(b"hello").unwrap();
+        drop(file);
+
+        let selected = sync_root(&root);
+        let first = scan_selected_root_local_snapshot(&selected).unwrap();
+        let second = scan_selected_root_local_snapshot(&selected).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|item| item.kind() == LocalItemKind::File)
+                .count(),
+            1
+        );
+        assert_eq!(
+            first
+                .iter()
+                .find(|item| item.kind() == LocalItemKind::File)
+                .unwrap()
+                .size_bytes(),
+            Some(5)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn phase5f2_snapshot_scan_rejects_symlinks() {
+        let root = temp_root("symlink");
+        File::create(root.join("target.txt")).unwrap();
+        symlink(root.join("target.txt"), root.join("link.txt")).unwrap();
+
+        let selected = sync_root(&root);
+        assert!(matches!(
+            scan_selected_root_local_snapshot(&selected),
+            Err(SelectedRootExecutorError::LocalEntrySymlinkUnsupported)
+        ));
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
