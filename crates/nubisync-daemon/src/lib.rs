@@ -25,7 +25,7 @@ use nubisync_sync::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     fmt, fs,
     io::{Read, Write},
     os::unix::fs::MetadataExt,
@@ -36,6 +36,76 @@ use std::{
     },
 };
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootLocalDiffKind {
+    Created,
+    Deleted,
+    Modified,
+    TypeChanged,
+}
+
+impl SelectedRootLocalDiffKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Deleted => "deleted",
+            Self::Modified => "modified",
+            Self::TypeChanged => "type_changed",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectedRootLocalDiffEntry {
+    relative_path: String,
+    pub kind: SelectedRootLocalDiffKind,
+    pub baseline_kind: Option<LocalItemKind>,
+    pub current_kind: Option<LocalItemKind>,
+}
+
+impl SelectedRootLocalDiffEntry {
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+}
+
+impl fmt::Debug for SelectedRootLocalDiffEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedRootLocalDiffEntry")
+            .field("relative_path", &"[redacted]")
+            .field("kind", &self.kind)
+            .field("baseline_kind", &self.baseline_kind)
+            .field("current_kind", &self.current_kind)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedRootLocalInventoryDiff {
+    pub baseline_items: usize,
+    pub observed_items: usize,
+    pub created: usize,
+    pub deleted: usize,
+    pub modified: usize,
+    pub type_changed: usize,
+    entries: Vec<SelectedRootLocalDiffEntry>,
+}
+
+impl SelectedRootLocalInventoryDiff {
+    pub fn action_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn entries(&self) -> &[SelectedRootLocalDiffEntry] {
+        &self.entries
+    }
+
+    pub fn clean(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectedRootLocalBaselineCapture {
@@ -5004,6 +5074,150 @@ pub fn verify_selected_root_existing_file<P: SelectedRootContentProvider>(
     })
 }
 
+pub fn plan_selected_root_local_inventory_diff(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootLocalInventoryDiff, SelectedRootExecutorError> {
+    if sync_root.mode != SyncMode::ReceiveOnly {
+        return Err(SelectedRootExecutorError::LocalDiffModeUnsupported);
+    }
+
+    let state = storage.sync_root_local_inventory_state(&sync_root.id)?;
+    if !state.snapshot_complete {
+        return Err(SelectedRootExecutorError::LocalDiffBaselineMissing);
+    }
+
+    let baseline = storage.list_sync_root_local_items(&sync_root.id)?;
+    let baseline_count =
+        u64::try_from(baseline.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+    if baseline_count != state.item_count {
+        return Err(SelectedRootExecutorError::LocalDiffBaselineCountMismatch);
+    }
+
+    let first = scan_selected_root_local_snapshot(sync_root)?;
+    let second = scan_selected_root_local_snapshot(sync_root)?;
+    if first != second {
+        return Err(SelectedRootExecutorError::LocalDiffScanRace);
+    }
+
+    build_selected_root_local_inventory_diff(&baseline, &first)
+}
+
+fn build_selected_root_local_inventory_diff(
+    baseline: &[LocalItemSnapshot],
+    current: &[LocalItemSnapshot],
+) -> Result<SelectedRootLocalInventoryDiff, SelectedRootExecutorError> {
+    let baseline_by_path = baseline
+        .iter()
+        .map(|item| (item.relative_path(), item))
+        .collect::<BTreeMap<_, _>>();
+    let current_by_path = current
+        .iter()
+        .map(|item| (item.relative_path(), item))
+        .collect::<BTreeMap<_, _>>();
+
+    if baseline_by_path.len() != baseline.len() || current_by_path.len() != current.len() {
+        return Err(SelectedRootExecutorError::LocalDiffDuplicatePath);
+    }
+
+    let mut all_paths = baseline_by_path
+        .keys()
+        .chain(current_by_path.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    all_paths.sort_unstable();
+    all_paths.dedup();
+
+    let mut entries = Vec::new();
+
+    for path in all_paths {
+        match (baseline_by_path.get(path), current_by_path.get(path)) {
+            (None, Some(current_item)) => {
+                entries.push(SelectedRootLocalDiffEntry {
+                    relative_path: path.to_owned(),
+                    kind: SelectedRootLocalDiffKind::Created,
+                    baseline_kind: None,
+                    current_kind: Some(current_item.kind()),
+                });
+            }
+            (Some(baseline_item), None) => {
+                entries.push(SelectedRootLocalDiffEntry {
+                    relative_path: path.to_owned(),
+                    kind: SelectedRootLocalDiffKind::Deleted,
+                    baseline_kind: Some(baseline_item.kind()),
+                    current_kind: None,
+                });
+            }
+            (Some(baseline_item), Some(current_item))
+                if baseline_item.kind() != current_item.kind() =>
+            {
+                entries.push(SelectedRootLocalDiffEntry {
+                    relative_path: path.to_owned(),
+                    kind: SelectedRootLocalDiffKind::TypeChanged,
+                    baseline_kind: Some(baseline_item.kind()),
+                    current_kind: Some(current_item.kind()),
+                });
+            }
+            (Some(baseline_item), Some(current_item))
+                if local_snapshot_metadata_changed(baseline_item, current_item) =>
+            {
+                entries.push(SelectedRootLocalDiffEntry {
+                    relative_path: path.to_owned(),
+                    kind: SelectedRootLocalDiffKind::Modified,
+                    baseline_kind: Some(baseline_item.kind()),
+                    current_kind: Some(current_item.kind()),
+                });
+            }
+            (Some(_), Some(_)) => {}
+            (None, None) => unreachable!("path came from the union of baseline and current maps"),
+        }
+    }
+
+    let created = entries
+        .iter()
+        .filter(|entry| entry.kind == SelectedRootLocalDiffKind::Created)
+        .count();
+    let deleted = entries
+        .iter()
+        .filter(|entry| entry.kind == SelectedRootLocalDiffKind::Deleted)
+        .count();
+    let modified = entries
+        .iter()
+        .filter(|entry| entry.kind == SelectedRootLocalDiffKind::Modified)
+        .count();
+    let type_changed = entries
+        .iter()
+        .filter(|entry| entry.kind == SelectedRootLocalDiffKind::TypeChanged)
+        .count();
+
+    Ok(SelectedRootLocalInventoryDiff {
+        baseline_items: baseline.len(),
+        observed_items: current.len(),
+        created,
+        deleted,
+        modified,
+        type_changed,
+        entries,
+    })
+}
+
+fn local_snapshot_metadata_changed(
+    baseline: &LocalItemSnapshot,
+    current: &LocalItemSnapshot,
+) -> bool {
+    match baseline.kind() {
+        LocalItemKind::File => {
+            baseline.size_bytes() != current.size_bytes()
+                || baseline.modified_unix_ns() != current.modified_unix_ns()
+                || baseline.device_id() != current.device_id()
+                || baseline.inode() != current.inode()
+        }
+        LocalItemKind::Directory => {
+            baseline.device_id() != current.device_id() || baseline.inode() != current.inode()
+        }
+    }
+}
+
 pub fn capture_selected_root_local_baseline(
     storage: &mut Storage,
     sync_root: &SyncRoot,
@@ -6104,6 +6318,16 @@ pub enum SelectedRootExecutorError {
     LocalMetadataTimestampOverflow,
     #[error("local baseline scan produced an invalid durable snapshot item")]
     LocalBaselineSnapshotInvalid,
+    #[error("local inventory diff supports only receive_only roots")]
+    LocalDiffModeUnsupported,
+    #[error("local inventory diff requires a durable baseline")]
+    LocalDiffBaselineMissing,
+    #[error("local inventory baseline count mismatched durable state")]
+    LocalDiffBaselineCountMismatch,
+    #[error("local inventory diff scan changed while planning")]
+    LocalDiffScanRace,
+    #[error("local inventory diff encountered a duplicate relative path")]
+    LocalDiffDuplicatePath,
     #[error("local directory materialization is blocked by local-only entries or type conflicts")]
     LocalDirectoryPhaseBlocked,
     #[error("local directory target count mismatched the remote directory plan")]
@@ -9454,5 +9678,91 @@ mod phase5f2_local_baseline_tests {
         ));
 
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod phase5f3_local_diff_tests {
+    use super::*;
+
+    fn file(path: &str, size: u64, mtime: i64, dev: u64, inode: u64) -> LocalItemSnapshot {
+        LocalItemSnapshot::new(path, LocalItemKind::File, Some(size), mtime, dev, inode).unwrap()
+    }
+
+    fn directory(path: &str, mtime: i64, dev: u64, inode: u64) -> LocalItemSnapshot {
+        LocalItemSnapshot::new(path, LocalItemKind::Directory, None, mtime, dev, inode).unwrap()
+    }
+
+    #[test]
+    fn phase5f3_diff_classifies_create_delete_modify_and_type_change() {
+        let baseline = vec![
+            directory("docs", 10, 1, 10),
+            file("docs/modified.txt", 5, 10, 1, 11),
+            file("deleted.txt", 4, 10, 1, 12),
+            file("type.txt", 1, 10, 1, 13),
+            file("old-name.txt", 8, 10, 1, 99),
+        ];
+
+        let current = vec![
+            directory("docs", 999, 1, 10),
+            file("docs/modified.txt", 6, 11, 1, 11),
+            file("created.txt", 3, 12, 1, 14),
+            directory("type.txt", 12, 1, 15),
+            file("new-name.txt", 8, 10, 1, 99),
+        ];
+
+        let diff = build_selected_root_local_inventory_diff(&baseline, &current).unwrap();
+
+        assert_eq!(diff.created, 2);
+        assert_eq!(diff.deleted, 2);
+        assert_eq!(diff.modified, 1);
+        assert_eq!(diff.type_changed, 1);
+        assert_eq!(diff.action_count(), 6);
+        assert!(!diff.clean());
+
+        assert!(diff.entries().iter().any(|entry| {
+            entry.relative_path() == "old-name.txt"
+                && entry.kind == SelectedRootLocalDiffKind::Deleted
+        }));
+        assert!(diff.entries().iter().any(|entry| {
+            entry.relative_path() == "new-name.txt"
+                && entry.kind == SelectedRootLocalDiffKind::Created
+        }));
+
+        assert!(!diff.entries().iter().any(|entry| {
+            entry.relative_path() == "docs" && entry.kind == SelectedRootLocalDiffKind::Modified
+        }));
+    }
+
+    #[test]
+    fn phase5f3_diff_entry_debug_redacts_relative_path() {
+        let entry = SelectedRootLocalDiffEntry {
+            relative_path: "private/secret.txt".to_owned(),
+            kind: SelectedRootLocalDiffKind::Created,
+            baseline_kind: None,
+            current_kind: Some(LocalItemKind::File),
+        };
+
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains("private/secret.txt"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn phase5f3_clean_diff_has_zero_actions() {
+        let baseline = vec![
+            directory("docs", 10, 1, 10),
+            file("docs/file.txt", 5, 10, 1, 11),
+        ];
+        let current = baseline.clone();
+
+        let diff = build_selected_root_local_inventory_diff(&baseline, &current).unwrap();
+
+        assert!(diff.clean());
+        assert_eq!(diff.action_count(), 0);
+        assert_eq!(diff.created, 0);
+        assert_eq!(diff.deleted, 0);
+        assert_eq!(diff.modified, 0);
+        assert_eq!(diff.type_changed, 0);
     }
 }

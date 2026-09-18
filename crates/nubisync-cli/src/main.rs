@@ -20,12 +20,13 @@ use nubisync_daemon::{
     execute_selected_root_receive_only_single_flight,
     execute_selected_root_unified_convergence_step, materialize_selected_root_directories,
     materialize_selected_root_missing_file, materialize_selected_root_missing_files,
-    plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
-    plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
-    plan_selected_root_remote_replacement, plan_selected_root_stale_files,
-    plan_selected_root_unified_convergence_step, replace_selected_root_existing_file,
-    replace_selected_root_stale_files, verify_selected_root_existing_file,
-    verify_selected_root_existing_files, verify_selected_root_local_receipts,
+    plan_selected_root_local_inventory_diff, plan_selected_root_local_materialization,
+    plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
+    plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
+    plan_selected_root_stale_files, plan_selected_root_unified_convergence_step,
+    replace_selected_root_existing_file, replace_selected_root_stale_files,
+    verify_selected_root_existing_file, verify_selected_root_existing_files,
+    verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -126,6 +127,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_local_baseline()
+        }
+        [sync, roots, local_diff, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && local_diff == "local-diff"
+                && approve == "--approve" =>
+        {
+            sync_roots_local_diff()
         }
         [sync, roots, convergence_plan, approve]
             if sync == "sync"
@@ -378,6 +387,7 @@ USAGE:
   nubisync sync roots cycle --approve
   nubisync sync roots run-to-idle --approve
   nubisync sync roots local-baseline --approve
+  nubisync sync roots local-diff --approve
   nubisync sync roots convergence-plan --approve
   nubisync sync roots converge --approve
   nubisync sync roots stale-files-plan --approve
@@ -1177,6 +1187,73 @@ fn sync_roots_local_baseline() -> Result<(), CliError> {
     println!("SNAPSHOT_COMPLETE={}", yes_no(result.snapshot_complete));
     println!("NETWORK_CHECK=not_performed");
     println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_local_diff() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_LOCAL_DIFF=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    if root.mode != SyncMode::ReceiveOnly {
+        return Err(CliError::SyncRootMetadataStepModeUnsupported);
+    }
+
+    println!("SYNC_ROOT_LOCAL_DIFF_STAGE=scan_metadata");
+    let result = plan_selected_root_local_inventory_diff(&storage, root)?;
+
+    println!("SYNC_ROOT_LOCAL_DIFF=PASS");
+    println!("MODE=receive_only");
+    println!("BASELINE_ITEMS={}", result.baseline_items);
+    println!("OBSERVED_ITEMS={}", result.observed_items);
+    println!("CHANGES_TOTAL={}", result.action_count());
+    println!("CREATED={}", result.created);
+    println!("DELETED={}", result.deleted);
+    println!("MODIFIED={}", result.modified);
+    println!("TYPE_CHANGED={}", result.type_changed);
+    println!("CLEAN={}", yes_no(result.clean()));
+    println!("RENAME_COALESCING=no");
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=no");
     println!("FILESYSTEM_READ=metadata_only");
     println!("FILESYSTEM_MUTATION=no");
     println!("FILE_CONTENT_ACCESSED=no");
