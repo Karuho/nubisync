@@ -56,6 +56,10 @@ pub struct SelectedRootDirectoryAdoption {
 
 pub const SELECTED_ROOT_CONVERGENCE_MAX_ACTIONS: usize = 10_000;
 pub const SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS: usize = 8;
+pub const RECEIVE_ONLY_PERIODIC_POLL_INTERVAL_MS: i64 = 30_000;
+pub const RECEIVE_ONLY_PERIODIC_BUSY_RETRY_MS: i64 = 5_000;
+pub const RECEIVE_ONLY_PERIODIC_ERROR_BACKOFF_INITIAL_MS: i64 = 5_000;
+pub const RECEIVE_ONLY_PERIODIC_ERROR_BACKOFF_MAX_MS: i64 = 300_000;
 pub const SUPERVISED_FILE_BATCH_MAX_ACTIONS: usize = 64;
 pub const SUPERVISED_STALE_FILE_PLAN_MAX_ACTIONS: usize = 64;
 pub const SUPERVISED_STALE_DIRECTORY_DELETION_MAX_ACTIONS: usize = 64;
@@ -437,6 +441,127 @@ pub fn selected_root_receive_only_single_flight_status(
     } else {
         SelectedRootReceiveOnlySingleFlightStatus::Idle
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootReceiveOnlyPeriodicDecision {
+    Due,
+    Waiting { delay_ms: i64 },
+    PausedForManualIntervention,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootReceiveOnlyPeriodicTick {
+    Waiting {
+        delay_ms: i64,
+    },
+    PausedForManualIntervention,
+    Shutdown,
+    Busy {
+        retry_after_ms: i64,
+    },
+    Executed {
+        execution: SelectedRootReceiveOnlyRunExecution,
+        next_delay_ms: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootReceiveOnlyPeriodicState {
+    next_due_unix_ms: i64,
+    consecutive_failures: u32,
+    paused_for_manual_intervention: bool,
+    shutdown_requested: bool,
+}
+
+impl SelectedRootReceiveOnlyPeriodicState {
+    pub fn new_immediate(now_unix_ms: i64) -> Self {
+        Self {
+            next_due_unix_ms: now_unix_ms,
+            consecutive_failures: 0,
+            paused_for_manual_intervention: false,
+            shutdown_requested: false,
+        }
+    }
+
+    pub fn decision(self, now_unix_ms: i64) -> SelectedRootReceiveOnlyPeriodicDecision {
+        if self.shutdown_requested {
+            return SelectedRootReceiveOnlyPeriodicDecision::Shutdown;
+        }
+
+        if self.paused_for_manual_intervention {
+            return SelectedRootReceiveOnlyPeriodicDecision::PausedForManualIntervention;
+        }
+
+        if now_unix_ms >= self.next_due_unix_ms {
+            SelectedRootReceiveOnlyPeriodicDecision::Due
+        } else {
+            SelectedRootReceiveOnlyPeriodicDecision::Waiting {
+                delay_ms: self.next_due_unix_ms.saturating_sub(now_unix_ms),
+            }
+        }
+    }
+
+    pub fn request_shutdown(&mut self) {
+        self.shutdown_requested = true;
+    }
+
+    pub fn resume_after_manual_intervention(&mut self, now_unix_ms: i64) {
+        if !self.shutdown_requested {
+            self.paused_for_manual_intervention = false;
+            self.consecutive_failures = 0;
+            self.next_due_unix_ms = now_unix_ms;
+        }
+    }
+
+    pub fn next_due_unix_ms(self) -> i64 {
+        self.next_due_unix_ms
+    }
+
+    pub fn consecutive_failures(self) -> u32 {
+        self.consecutive_failures
+    }
+
+    pub fn paused_for_manual_intervention(self) -> bool {
+        self.paused_for_manual_intervention
+    }
+
+    pub fn shutdown_requested(self) -> bool {
+        self.shutdown_requested
+    }
+
+    fn schedule_success(&mut self, now_unix_ms: i64) {
+        self.consecutive_failures = 0;
+        self.next_due_unix_ms = now_unix_ms.saturating_add(RECEIVE_ONLY_PERIODIC_POLL_INTERVAL_MS);
+    }
+
+    fn schedule_busy_retry(&mut self, now_unix_ms: i64) {
+        self.next_due_unix_ms = now_unix_ms.saturating_add(RECEIVE_ONLY_PERIODIC_BUSY_RETRY_MS);
+    }
+
+    fn schedule_failure(&mut self, now_unix_ms: i64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.next_due_unix_ms = now_unix_ms.saturating_add(self.error_backoff_ms());
+    }
+
+    fn pause_for_manual_intervention(&mut self) {
+        self.consecutive_failures = 0;
+        self.paused_for_manual_intervention = true;
+    }
+
+    fn error_backoff_ms(self) -> i64 {
+        let mut delay = RECEIVE_ONLY_PERIODIC_ERROR_BACKOFF_INITIAL_MS;
+        let doublings = self.consecutive_failures.saturating_sub(1).min(16);
+
+        for _ in 0..doublings {
+            delay = delay
+                .saturating_mul(2)
+                .min(RECEIVE_ONLY_PERIODIC_ERROR_BACKOFF_MAX_MS);
+        }
+
+        delay.min(RECEIVE_ONLY_PERIODIC_ERROR_BACKOFF_MAX_MS)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1133,6 +1258,70 @@ where
     Ok(SelectedRootReceiveOnlySingleFlightResult::Executed(
         execution,
     ))
+}
+
+pub fn execute_selected_root_receive_only_periodic_tick<P>(
+    state: &mut SelectedRootReceiveOnlyPeriodicState,
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    now_unix_ms: i64,
+) -> Result<SelectedRootReceiveOnlyPeriodicTick, SelectedRootExecutorError>
+where
+    P: SelectedRootBootstrapProvider
+        + SelectedRootChangeProvider
+        + SelectedRootProvider
+        + SelectedRootContentProvider,
+{
+    match state.decision(now_unix_ms) {
+        SelectedRootReceiveOnlyPeriodicDecision::Waiting { delay_ms } => {
+            return Ok(SelectedRootReceiveOnlyPeriodicTick::Waiting { delay_ms });
+        }
+        SelectedRootReceiveOnlyPeriodicDecision::PausedForManualIntervention => {
+            return Ok(SelectedRootReceiveOnlyPeriodicTick::PausedForManualIntervention);
+        }
+        SelectedRootReceiveOnlyPeriodicDecision::Shutdown => {
+            return Ok(SelectedRootReceiveOnlyPeriodicTick::Shutdown);
+        }
+        SelectedRootReceiveOnlyPeriodicDecision::Due => {}
+    }
+
+    let execution = match execute_selected_root_receive_only_single_flight(
+        provider,
+        storage,
+        sync_root,
+        now_unix_ms,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            state.schedule_failure(now_unix_ms);
+            return Err(error);
+        }
+    };
+
+    match execution {
+        SelectedRootReceiveOnlySingleFlightResult::Busy => {
+            state.schedule_busy_retry(now_unix_ms);
+            Ok(SelectedRootReceiveOnlyPeriodicTick::Busy {
+                retry_after_ms: RECEIVE_ONLY_PERIODIC_BUSY_RETRY_MS,
+            })
+        }
+        SelectedRootReceiveOnlySingleFlightResult::Executed(execution) => {
+            if execution.manual_intervention_required {
+                state.pause_for_manual_intervention();
+                Ok(SelectedRootReceiveOnlyPeriodicTick::Executed {
+                    execution,
+                    next_delay_ms: None,
+                })
+            } else {
+                state.schedule_success(now_unix_ms);
+                Ok(SelectedRootReceiveOnlyPeriodicTick::Executed {
+                    execution,
+                    next_delay_ms: Some(RECEIVE_ONLY_PERIODIC_POLL_INTERVAL_MS),
+                })
+            }
+        }
+    }
 }
 
 pub fn plan_selected_root_unified_convergence_step(
@@ -8876,5 +9065,119 @@ mod phase5e3_single_flight_tests {
             SelectedRootReceiveOnlySingleFlightResult::Busy.status(),
             SelectedRootReceiveOnlySingleFlightStatus::Busy
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5e4_periodic_scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn phase5e4_scheduler_is_due_immediately_then_waits_normal_interval() {
+        let mut state = SelectedRootReceiveOnlyPeriodicState::new_immediate(1_000);
+
+        assert_eq!(
+            state.decision(1_000),
+            SelectedRootReceiveOnlyPeriodicDecision::Due
+        );
+
+        state.schedule_success(1_000);
+
+        assert_eq!(state.consecutive_failures(), 0);
+        assert_eq!(state.next_due_unix_ms(), 31_000);
+        assert_eq!(
+            state.decision(1_001),
+            SelectedRootReceiveOnlyPeriodicDecision::Waiting { delay_ms: 29_999 }
+        );
+        assert_eq!(
+            state.decision(31_000),
+            SelectedRootReceiveOnlyPeriodicDecision::Due
+        );
+    }
+
+    #[test]
+    fn phase5e4_busy_uses_short_retry_without_counting_as_failure() {
+        let mut state = SelectedRootReceiveOnlyPeriodicState::new_immediate(5_000);
+
+        state.schedule_busy_retry(5_000);
+
+        assert_eq!(state.consecutive_failures(), 0);
+        assert_eq!(state.next_due_unix_ms(), 10_000);
+        assert_eq!(
+            state.decision(9_000),
+            SelectedRootReceiveOnlyPeriodicDecision::Waiting { delay_ms: 1_000 }
+        );
+    }
+
+    #[test]
+    fn phase5e4_failures_back_off_and_success_resets_counter() {
+        let mut state = SelectedRootReceiveOnlyPeriodicState::new_immediate(0);
+
+        state.schedule_failure(0);
+        assert_eq!(state.consecutive_failures(), 1);
+        assert_eq!(state.next_due_unix_ms(), 5_000);
+
+        state.schedule_failure(5_000);
+        assert_eq!(state.consecutive_failures(), 2);
+        assert_eq!(state.next_due_unix_ms(), 15_000);
+
+        state.schedule_failure(15_000);
+        assert_eq!(state.consecutive_failures(), 3);
+        assert_eq!(state.next_due_unix_ms(), 35_000);
+
+        for _ in 0..16 {
+            state.schedule_failure(state.next_due_unix_ms());
+        }
+        assert_eq!(
+            state.error_backoff_ms(),
+            RECEIVE_ONLY_PERIODIC_ERROR_BACKOFF_MAX_MS
+        );
+
+        state.schedule_success(1_000_000);
+        assert_eq!(state.consecutive_failures(), 0);
+        assert_eq!(
+            state.next_due_unix_ms(),
+            1_000_000 + RECEIVE_ONLY_PERIODIC_POLL_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn phase5e4_manual_intervention_pause_can_resume_but_shutdown_is_sticky() {
+        let mut state = SelectedRootReceiveOnlyPeriodicState::new_immediate(10);
+
+        state.pause_for_manual_intervention();
+        assert!(state.paused_for_manual_intervention());
+        assert_eq!(
+            state.decision(10),
+            SelectedRootReceiveOnlyPeriodicDecision::PausedForManualIntervention
+        );
+
+        state.resume_after_manual_intervention(20);
+        assert!(!state.paused_for_manual_intervention());
+        assert_eq!(
+            state.decision(20),
+            SelectedRootReceiveOnlyPeriodicDecision::Due
+        );
+
+        state.request_shutdown();
+        assert!(state.shutdown_requested());
+        assert_eq!(
+            state.decision(20),
+            SelectedRootReceiveOnlyPeriodicDecision::Shutdown
+        );
+
+        state.resume_after_manual_intervention(30);
+        assert_eq!(
+            state.decision(30),
+            SelectedRootReceiveOnlyPeriodicDecision::Shutdown
+        );
+    }
+
+    #[test]
+    fn phase5e4_policy_constants_are_explicit_and_bounded() {
+        assert_eq!(RECEIVE_ONLY_PERIODIC_POLL_INTERVAL_MS, 30_000);
+        assert_eq!(RECEIVE_ONLY_PERIODIC_BUSY_RETRY_MS, 5_000);
+        assert_eq!(RECEIVE_ONLY_PERIODIC_ERROR_BACKOFF_INITIAL_MS, 5_000);
+        assert_eq!(RECEIVE_ONLY_PERIODIC_ERROR_BACKOFF_MAX_MS, 300_000);
     }
 }
