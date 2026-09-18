@@ -507,6 +507,12 @@ impl SelectedRootReceiveOnlyPeriodicState {
         self.shutdown_requested = true;
     }
 
+    pub fn record_external_failure(&mut self, now_unix_ms: i64) {
+        if !self.shutdown_requested && !self.paused_for_manual_intervention {
+            self.schedule_failure(now_unix_ms);
+        }
+    }
+
     pub fn resume_after_manual_intervention(&mut self, now_unix_ms: i64) {
         if !self.shutdown_requested {
             self.paused_for_manual_intervention = false;
