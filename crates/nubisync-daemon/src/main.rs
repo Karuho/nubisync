@@ -13,6 +13,10 @@ use nubisync_storage::Storage;
 use std::{
     env,
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -23,6 +27,7 @@ const OAUTH_CLIENT_SUBJECT: &str = "oauth-desktop-client";
 const OAUTH_CLIENT_ID_PURPOSE: &str = "client-id";
 const OAUTH_CLIENT_SECRET_PURPOSE: &str = "client-secret";
 const ACCESS_TOKEN_REFRESH_SAFETY_SECONDS: u64 = 60;
+const INTERRUPTIBLE_SLEEP_SLICE_MS: u64 = 250;
 const MAX_TEST_TICKS: usize = 10_000;
 
 fn main() {
@@ -122,6 +127,7 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
     let mut session: Option<DriveSession> = None;
     let now = unix_time_ms()?;
     let mut scheduler = SelectedRootReceiveOnlyPeriodicState::new_immediate(now);
+    let shutdown_requested = install_shutdown_handler()?;
     let mut executed_ticks = 0usize;
 
     println!("NUBISYNCD=STARTED");
@@ -139,6 +145,10 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
     println!("DRIVE_WRITE_ACCESS=no");
 
     loop {
+        if shutdown_requested.load(Ordering::SeqCst) {
+            scheduler.request_shutdown();
+        }
+
         if max_ticks.is_some_and(|limit| executed_ticks >= limit) {
             scheduler.request_shutdown();
         }
@@ -146,7 +156,9 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
         let now = unix_time_ms()?;
         match scheduler.decision(now) {
             SelectedRootReceiveOnlyPeriodicDecision::Waiting { delay_ms } => {
-                sleep_ms(delay_ms)?;
+                if sleep_interruptibly(delay_ms, &shutdown_requested)? {
+                    scheduler.request_shutdown();
+                }
                 continue;
             }
             SelectedRootReceiveOnlyPeriodicDecision::PausedForManualIntervention => {
@@ -158,7 +170,10 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
             }
             SelectedRootReceiveOnlyPeriodicDecision::Shutdown => {
                 println!("NUBISYNCD=STOPPED");
-                println!("STOP_REASON=max_ticks_reached");
+                println!(
+                    "STOP_REASON={}",
+                    shutdown_stop_reason(shutdown_requested.load(Ordering::SeqCst))
+                );
                 println!("EXECUTED_TICKS={executed_ticks}");
                 println!("DRIVE_WRITE_ACCESS=no");
                 return Ok(());
@@ -252,7 +267,9 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
                 println!("DRIVE_WRITE_ACCESS=no");
             }
             Ok(SelectedRootReceiveOnlyPeriodicTick::Waiting { delay_ms }) => {
-                sleep_ms(delay_ms)?;
+                if sleep_interruptibly(delay_ms, &shutdown_requested)? {
+                    scheduler.request_shutdown();
+                }
             }
             Ok(SelectedRootReceiveOnlyPeriodicTick::PausedForManualIntervention) => {
                 println!("NUBISYNCD=PAUSED");
@@ -458,10 +475,42 @@ fn unix_time_ms() -> Result<i64, DaemonError> {
     i64::try_from(duration.as_millis()).map_err(|_| DaemonError::ClockOverflow)
 }
 
-fn sleep_ms(delay_ms: i64) -> Result<(), DaemonError> {
-    let delay = u64::try_from(delay_ms).map_err(|_| DaemonError::InvalidSchedulerDelay)?;
-    thread::sleep(Duration::from_millis(delay));
-    Ok(())
+fn install_shutdown_handler() -> Result<Arc<AtomicBool>, DaemonError> {
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&shutdown_requested);
+
+    ctrlc::set_handler(move || {
+        handler_flag.store(true, Ordering::SeqCst);
+    })?;
+
+    Ok(shutdown_requested)
+}
+
+fn sleep_interruptibly(
+    delay_ms: i64,
+    shutdown_requested: &AtomicBool,
+) -> Result<bool, DaemonError> {
+    let mut remaining = u64::try_from(delay_ms).map_err(|_| DaemonError::InvalidSchedulerDelay)?;
+
+    while remaining != 0 {
+        if shutdown_requested.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
+
+        let slice = remaining.min(INTERRUPTIBLE_SLEEP_SLICE_MS);
+        thread::sleep(Duration::from_millis(slice));
+        remaining -= slice;
+    }
+
+    Ok(shutdown_requested.load(Ordering::SeqCst))
+}
+
+fn shutdown_stop_reason(signal_requested: bool) -> &'static str {
+    if signal_requested {
+        "signal_requested"
+    } else {
+        "max_ticks_reached"
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -508,6 +557,8 @@ enum DaemonError {
     GoogleAccountMismatch,
     #[error("Drive session is unavailable")]
     DriveSessionUnavailable,
+    #[error("process signal handler is unavailable")]
+    SignalHandler(#[from] ctrlc::Error),
     #[error("core operation failed")]
     Core(#[from] nubisync_core::CoreError),
     #[error("secret-store operation failed")]
@@ -543,6 +594,7 @@ impl DaemonError {
             Self::GoogleReadonlyScopeNotGranted => "drive_readonly_scope_missing",
             Self::GoogleAccountMismatch => "google_account_mismatch",
             Self::DriveSessionUnavailable => "drive_session_unavailable",
+            Self::SignalHandler(_) => "signal_handler_unavailable",
             Self::Core(_) => "core_error",
             Self::Secrets(_) => "secret_store_error",
             Self::Storage(_) => "storage_error",
@@ -580,6 +632,18 @@ mod phase5e5_daemon_wiring_tests {
         assert_eq!(safe_access_token_refresh_after(120), 60);
         assert_eq!(safe_access_token_refresh_after(20), 10);
         assert_eq!(safe_access_token_refresh_after(1), 1);
+    }
+
+    #[test]
+    fn phase5e6_interruptible_sleep_observes_preexisting_shutdown() {
+        let flag = AtomicBool::new(true);
+        assert!(sleep_interruptibly(30_000, &flag).unwrap());
+    }
+
+    #[test]
+    fn phase5e6_shutdown_reason_distinguishes_signal_from_bounded_test_stop() {
+        assert_eq!(shutdown_stop_reason(true), "signal_requested");
+        assert_eq!(shutdown_stop_reason(false), "max_ticks_reached");
     }
 
     #[test]

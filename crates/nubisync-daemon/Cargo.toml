@@ -16,6 +16,7 @@ nubisync-auth = { path = "../nubisync-auth" }
 nubisync-core = { path = "../nubisync-core" }
 nubisync-drive = { path = "../nubisync-drive" }
 nubisync-storage = { path = "../nubisync-storage" }
+ctrlc.workspace = true
 nubisync-sync = { path = "../nubisync-sync" }
 thiserror.workspace = true
 sha2.workspace = true
