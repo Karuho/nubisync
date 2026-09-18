@@ -3,20 +3,27 @@
 #![forbid(unsafe_code)]
 
 use nubisync_core::{
-    ChangeCursor, ContinuationToken, ProviderAccount, ProviderId, RemoteChange, RemoteItem,
-    RemoteItemKind, SyncMode, SyncRoot,
+    ChangeCursor, ContinuationToken, LocalItemKind, LocalItemSnapshot, ProviderAccount, ProviderId,
+    RemoteChange, RemoteItem, RemoteItemKind, SyncMode, SyncRoot,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
 type SyncRootRemoteCatalogRow = (String, Option<String>, String, String, Option<i64>, i64);
 type SyncRootCursorStateRow = (i64, i64, Option<String>, Option<String>);
 type SyncRootChangeWindowStateRow = (String, Option<String>, Option<String>, i64, i64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalInventoryState {
+    pub snapshot_complete: bool,
+    pub item_count: u64,
+    pub snapshot_completed_at_unix_ms: Option<i64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteInventoryState {
@@ -186,6 +193,58 @@ impl Storage {
                 PRIMARY KEY (provider, account_subject),
                 FOREIGN KEY (provider, account_subject)
                     REFERENCES accounts(provider, subject)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_root_local_inventory_staging (
+                sync_root_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                item_kind TEXT NOT NULL CHECK (
+                    item_kind IN ('file', 'directory')
+                ),
+                size_bytes INTEGER CHECK (
+                    size_bytes IS NULL OR size_bytes >= 0
+                ),
+                modified_unix_ns INTEGER NOT NULL,
+                device_id TEXT NOT NULL,
+                inode TEXT NOT NULL,
+                observed_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (sync_root_id, relative_path),
+                FOREIGN KEY (sync_root_id)
+                    REFERENCES sync_roots(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_root_local_items (
+                sync_root_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                item_kind TEXT NOT NULL CHECK (
+                    item_kind IN ('file', 'directory')
+                ),
+                size_bytes INTEGER CHECK (
+                    size_bytes IS NULL OR size_bytes >= 0
+                ),
+                modified_unix_ns INTEGER NOT NULL,
+                device_id TEXT NOT NULL,
+                inode TEXT NOT NULL,
+                observed_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (sync_root_id, relative_path),
+                FOREIGN KEY (sync_root_id)
+                    REFERENCES sync_roots(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_root_local_inventory_state (
+                sync_root_id TEXT PRIMARY KEY,
+                snapshot_complete INTEGER NOT NULL DEFAULT 0 CHECK (
+                    snapshot_complete IN (0, 1)
+                ),
+                item_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                    item_count >= 0
+                ),
+                snapshot_completed_at_unix_ms INTEGER,
+                FOREIGN KEY (sync_root_id)
+                    REFERENCES sync_roots(id)
                     ON DELETE CASCADE
             );
 
@@ -636,6 +695,202 @@ impl Storage {
         )?;
 
         u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn begin_sync_root_local_inventory_staging(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM sync_root_local_inventory_staging WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn stage_sync_root_local_inventory_items(
+        &mut self,
+        sync_root_id: &str,
+        items: &[LocalItemSnapshot],
+        observed_at_unix_ms: i64,
+    ) -> Result<usize, StorageError> {
+        let transaction = self.connection.transaction()?;
+        for item in items {
+            insert_sync_root_local_inventory_item(
+                &transaction,
+                sync_root_id,
+                item,
+                observed_at_unix_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(items.len())
+    }
+
+    pub fn staged_sync_root_local_inventory_count(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_local_inventory_staging
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn commit_sync_root_local_inventory_snapshot(
+        &mut self,
+        sync_root_id: &str,
+        completed_at_unix_ms: i64,
+    ) -> Result<usize, StorageError> {
+        let transaction = self.connection.transaction()?;
+
+        transaction.execute(
+            "DELETE FROM sync_root_local_items WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+
+        let inserted = transaction.execute(
+            "INSERT INTO sync_root_local_items (
+                sync_root_id,
+                relative_path,
+                item_kind,
+                size_bytes,
+                modified_unix_ns,
+                device_id,
+                inode,
+                observed_at_unix_ms
+             )
+             SELECT
+                sync_root_id,
+                relative_path,
+                item_kind,
+                size_bytes,
+                modified_unix_ns,
+                device_id,
+                inode,
+                observed_at_unix_ms
+             FROM sync_root_local_inventory_staging
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+
+        let item_count = i64::try_from(inserted).map_err(|_| StorageError::NumericOverflow)?;
+
+        transaction.execute(
+            "INSERT INTO sync_root_local_inventory_state (
+                sync_root_id,
+                snapshot_complete,
+                item_count,
+                snapshot_completed_at_unix_ms
+             ) VALUES (?1, 1, ?2, ?3)
+             ON CONFLICT(sync_root_id) DO UPDATE SET
+                snapshot_complete = 1,
+                item_count = excluded.item_count,
+                snapshot_completed_at_unix_ms = excluded.snapshot_completed_at_unix_ms",
+            params![sync_root_id, item_count, completed_at_unix_ms],
+        )?;
+
+        transaction.execute(
+            "DELETE FROM sync_root_local_inventory_staging WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn sync_root_local_inventory_state(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<LocalInventoryState, StorageError> {
+        let row: Option<(i64, i64, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT
+                    snapshot_complete,
+                    item_count,
+                    snapshot_completed_at_unix_ms
+                 FROM sync_root_local_inventory_state
+                 WHERE sync_root_id = ?1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        match row {
+            Some((snapshot_complete, item_count, completed_at)) => Ok(LocalInventoryState {
+                snapshot_complete: snapshot_complete != 0,
+                item_count: u64::try_from(item_count).map_err(|_| StorageError::NumericOverflow)?,
+                snapshot_completed_at_unix_ms: completed_at,
+            }),
+            None => Ok(LocalInventoryState {
+                snapshot_complete: false,
+                item_count: 0,
+                snapshot_completed_at_unix_ms: None,
+            }),
+        }
+    }
+
+    pub fn list_sync_root_local_items(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<Vec<LocalItemSnapshot>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                relative_path,
+                item_kind,
+                size_bytes,
+                modified_unix_ns,
+                device_id,
+                inode
+             FROM sync_root_local_items
+             WHERE sync_root_id = ?1
+             ORDER BY relative_path ASC",
+        )?;
+
+        let rows = statement.query_map(params![sync_root_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            let (relative_path, item_kind, size_bytes, modified_unix_ns, device_id, inode) = row?;
+            let kind = LocalItemKind::parse(&item_kind)
+                .map_err(|_| StorageError::InvalidStoredLocalItemKind)?;
+            let size_bytes = size_bytes
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| StorageError::NumericOverflow)?;
+            let device_id = device_id
+                .parse::<u64>()
+                .map_err(|_| StorageError::InvalidStoredLocalIdentity)?;
+            let inode = inode
+                .parse::<u64>()
+                .map_err(|_| StorageError::InvalidStoredLocalIdentity)?;
+
+            items.push(LocalItemSnapshot::new(
+                relative_path,
+                kind,
+                size_bytes,
+                modified_unix_ns,
+                device_id,
+                inode,
+            )?);
+        }
+
+        Ok(items)
     }
 
     pub fn begin_sync_root_remote_inventory_staging(
@@ -2879,6 +3134,51 @@ fn refresh_sync_root_catalog_count(
     Ok(())
 }
 
+fn insert_sync_root_local_inventory_item(
+    transaction: &Transaction<'_>,
+    sync_root_id: &str,
+    item: &LocalItemSnapshot,
+    observed_at_unix_ms: i64,
+) -> Result<(), StorageError> {
+    let size_bytes = item
+        .size_bytes()
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| StorageError::NumericOverflow)?;
+
+    transaction.execute(
+        "INSERT INTO sync_root_local_inventory_staging (
+            sync_root_id,
+            relative_path,
+            item_kind,
+            size_bytes,
+            modified_unix_ns,
+            device_id,
+            inode,
+            observed_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(sync_root_id, relative_path) DO UPDATE SET
+            item_kind = excluded.item_kind,
+            size_bytes = excluded.size_bytes,
+            modified_unix_ns = excluded.modified_unix_ns,
+            device_id = excluded.device_id,
+            inode = excluded.inode,
+            observed_at_unix_ms = excluded.observed_at_unix_ms",
+        params![
+            sync_root_id,
+            item.relative_path(),
+            item.kind().as_str(),
+            size_bytes,
+            item.modified_unix_ns(),
+            item.device_id().to_string(),
+            item.inode().to_string(),
+            observed_at_unix_ms
+        ],
+    )?;
+
+    Ok(())
+}
+
 fn insert_sync_root_inventory_item(
     transaction: &Transaction<'_>,
     sync_root_id: &str,
@@ -3181,6 +3481,10 @@ pub enum StorageError {
     InvalidInternalTable,
     #[error("stored root-catalog item kind is invalid")]
     InvalidStoredRemoteItemKind,
+    #[error("stored local inventory item kind is invalid")]
+    InvalidStoredLocalItemKind,
+    #[error("stored local inventory identity is invalid")]
+    InvalidStoredLocalIdentity,
     #[error("SQLite schema version {found} is newer than supported version {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     #[error("remote catalog does not have a complete authoritative snapshot")]
@@ -5659,9 +5963,9 @@ mod phase5c10_directory_receipt_tests {
     }
 
     #[test]
-    fn schema_v11_contains_directory_receipts() {
+    fn schema_v12_contains_directory_receipts() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 11);
+        assert_eq!(storage.schema_version().unwrap(), 12);
 
         let exists: i64 = storage
             .connection
@@ -6098,5 +6402,116 @@ mod phase5d7_directory_receipt_batch_tests {
                 .unwrap(),
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5f1_local_inventory_tests {
+    use super::*;
+
+    fn setup() -> (Storage, SyncRoot) {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5f1-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5f1-root",
+            provider,
+            account.subject,
+            "/tmp/phase5f1-root",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+        (storage, root)
+    }
+
+    #[test]
+    fn phase5f1_local_inventory_snapshot_is_staged_and_committed_atomically() {
+        let (mut storage, root) = setup();
+
+        let initial = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        assert!(!initial.snapshot_complete);
+        assert_eq!(initial.item_count, 0);
+
+        let items = vec![
+            LocalItemSnapshot::new("docs", LocalItemKind::Directory, None, 100, 8, 40).unwrap(),
+            LocalItemSnapshot::new("docs/file.txt", LocalItemKind::File, Some(5), 101, 8, 41)
+                .unwrap(),
+        ];
+
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_local_inventory_items(&root.id, &items, 10)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .staged_sync_root_local_inventory_count(&root.id)
+                .unwrap(),
+            2
+        );
+        assert!(
+            storage
+                .list_sync_root_local_items(&root.id)
+                .unwrap()
+                .is_empty()
+        );
+
+        let committed = storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 11)
+            .unwrap();
+        assert_eq!(committed, 2);
+
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        assert!(state.snapshot_complete);
+        assert_eq!(state.item_count, 2);
+        assert_eq!(state.snapshot_completed_at_unix_ms, Some(11));
+
+        let current = storage.list_sync_root_local_items(&root.id).unwrap();
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[0].relative_path(), "docs");
+        assert_eq!(current[1].relative_path(), "docs/file.txt");
+
+        let replacement = vec![
+            LocalItemSnapshot::new("docs/file.txt", LocalItemKind::File, Some(6), 200, 8, 41)
+                .unwrap(),
+        ];
+
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_local_inventory_items(&root.id, &replacement, 20)
+            .unwrap();
+
+        assert_eq!(
+            storage.list_sync_root_local_items(&root.id).unwrap().len(),
+            2
+        );
+
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 21)
+            .unwrap();
+
+        let current = storage.list_sync_root_local_items(&root.id).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].size_bytes(), Some(6));
+
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        assert_eq!(state.item_count, 1);
+        assert_eq!(state.snapshot_completed_at_unix_ms, Some(21));
+    }
+
+    #[test]
+    fn phase5f1_schema_is_v12() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert_eq!(storage.schema_version().unwrap(), 12);
     }
 }

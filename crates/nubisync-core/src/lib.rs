@@ -203,6 +203,128 @@ impl SyncRoot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalItemKind {
+    File,
+    Directory,
+}
+
+impl LocalItemKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CoreError> {
+        match value {
+            "file" => Ok(Self::File),
+            "directory" => Ok(Self::Directory),
+            _ => Err(CoreError::InvalidLocalItemKind),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalItemSnapshot {
+    relative_path: String,
+    kind: LocalItemKind,
+    size_bytes: Option<u64>,
+    modified_unix_ns: i64,
+    device_id: u64,
+    inode: u64,
+}
+
+impl LocalItemSnapshot {
+    pub fn new(
+        relative_path: impl Into<String>,
+        kind: LocalItemKind,
+        size_bytes: Option<u64>,
+        modified_unix_ns: i64,
+        device_id: u64,
+        inode: u64,
+    ) -> Result<Self, CoreError> {
+        let relative_path = relative_path.into();
+        validate_local_snapshot_relative_path(&relative_path)?;
+
+        match kind {
+            LocalItemKind::File if size_bytes.is_none() => {
+                return Err(CoreError::InvalidLocalItemSize);
+            }
+            LocalItemKind::Directory if size_bytes.is_some() => {
+                return Err(CoreError::InvalidLocalItemSize);
+            }
+            LocalItemKind::File | LocalItemKind::Directory => {}
+        }
+
+        Ok(Self {
+            relative_path,
+            kind,
+            size_bytes,
+            modified_unix_ns,
+            device_id,
+            inode,
+        })
+    }
+
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    pub fn kind(&self) -> LocalItemKind {
+        self.kind
+    }
+
+    pub fn size_bytes(&self) -> Option<u64> {
+        self.size_bytes
+    }
+
+    pub fn modified_unix_ns(&self) -> i64 {
+        self.modified_unix_ns
+    }
+
+    pub fn device_id(&self) -> u64 {
+        self.device_id
+    }
+
+    pub fn inode(&self) -> u64 {
+        self.inode
+    }
+}
+
+impl fmt::Debug for LocalItemSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalItemSnapshot")
+            .field("relative_path", &"[redacted]")
+            .field("kind", &self.kind)
+            .field("size_bytes", &self.size_bytes)
+            .field("modified_unix_ns", &self.modified_unix_ns)
+            .field("device_id", &self.device_id)
+            .field("inode", &self.inode)
+            .finish()
+    }
+}
+
+fn validate_local_snapshot_relative_path(relative_path: &str) -> Result<(), CoreError> {
+    if relative_path.is_empty()
+        || relative_path.starts_with('/')
+        || relative_path.ends_with('/')
+        || relative_path.contains('\0')
+    {
+        return Err(CoreError::InvalidLocalItemRelativePath);
+    }
+
+    for component in relative_path.split('/') {
+        if component.is_empty() || matches!(component, "." | "..") {
+            return Err(CoreError::InvalidLocalItemRelativePath);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteItemKind {
     File,
     Folder,
@@ -269,6 +391,12 @@ pub enum CoreError {
     InvalidSyncRootLocalPath,
     #[error("sync root remote id is invalid")]
     InvalidRemoteRootId,
+    #[error("local snapshot relative path is invalid")]
+    InvalidLocalItemRelativePath,
+    #[error("local snapshot item kind is invalid")]
+    InvalidLocalItemKind,
+    #[error("local snapshot item size is invalid for its kind")]
+    InvalidLocalItemSize,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -348,5 +476,50 @@ mod tests {
         let cursor = ChangeCursor::new("secret-ish-provider-token").unwrap();
         assert_eq!(format!("{cursor:?}"), "ChangeCursor([redacted])");
         assert!(!format!("{cursor:?}").contains(cursor.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod phase5f1_local_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn phase5f1_local_snapshot_validates_shape_and_redacts_path() {
+        let file = LocalItemSnapshot::new(
+            "docs/private.txt",
+            LocalItemKind::File,
+            Some(12),
+            123,
+            8,
+            42,
+        )
+        .unwrap();
+
+        assert_eq!(file.kind(), LocalItemKind::File);
+        assert_eq!(file.size_bytes(), Some(12));
+        assert_eq!(file.relative_path(), "docs/private.txt");
+
+        let debug = format!("{file:?}");
+        assert!(!debug.contains("docs/private.txt"));
+        assert!(debug.contains("[redacted]"));
+
+        assert!(
+            LocalItemSnapshot::new("../escape", LocalItemKind::File, Some(1), 1, 1, 1,).is_err()
+        );
+
+        assert!(
+            LocalItemSnapshot::new("directory", LocalItemKind::Directory, Some(1), 1, 1, 1,)
+                .is_err()
+        );
+
+        assert!(LocalItemSnapshot::new("file", LocalItemKind::File, None, 1, 1, 1,).is_err());
+    }
+
+    #[test]
+    fn phase5f1_local_item_kind_storage_names_round_trip() {
+        for kind in [LocalItemKind::File, LocalItemKind::Directory] {
+            assert_eq!(LocalItemKind::parse(kind.as_str()).unwrap(), kind);
+        }
+        assert!(LocalItemKind::parse("other").is_err());
     }
 }
