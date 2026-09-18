@@ -11,11 +11,12 @@ use nubisync_core::{
 };
 use nubisync_daemon::{
     SUPERVISED_FILE_BATCH_MAX_ACTIONS, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
-    adopt_selected_root_existing_directory, bootstrap_selected_root_snapshot,
-    collect_selected_root_change_window_page, delete_selected_root_existing_directory,
-    delete_selected_root_existing_file, delete_selected_root_stale_directories,
-    delete_selected_root_stale_files, execute_completed_selected_root_change_window,
-    execute_selected_root_receive_only_cycle, execute_selected_root_unified_convergence_step,
+    SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS, adopt_selected_root_existing_directory,
+    bootstrap_selected_root_snapshot, collect_selected_root_change_window_page,
+    delete_selected_root_existing_directory, delete_selected_root_existing_file,
+    delete_selected_root_stale_directories, delete_selected_root_stale_files,
+    execute_completed_selected_root_change_window, execute_selected_root_receive_only_cycle,
+    execute_selected_root_receive_only_run_to_idle, execute_selected_root_unified_convergence_step,
     materialize_selected_root_directories, materialize_selected_root_missing_file,
     materialize_selected_root_missing_files, plan_selected_root_local_materialization,
     plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
@@ -108,6 +109,14 @@ fn run() -> Result<(), CliError> {
             if sync == "sync" && roots == "roots" && cycle == "cycle" && approve == "--approve" =>
         {
             sync_roots_cycle()
+        }
+        [sync, roots, run_to_idle, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && run_to_idle == "run-to-idle"
+                && approve == "--approve" =>
+        {
+            sync_roots_run_to_idle()
         }
         [sync, roots, convergence_plan, approve]
             if sync == "sync"
@@ -358,6 +367,7 @@ USAGE:
   nubisync sync roots status
   nubisync sync roots metadata-step --approve
   nubisync sync roots cycle --approve
+  nubisync sync roots run-to-idle --approve
   nubisync sync roots convergence-plan --approve
   nubisync sync roots converge --approve
   nubisync sync roots stale-files-plan --approve
@@ -871,6 +881,153 @@ fn sync_roots_cycle() -> Result<(), CliError> {
     println!("BYTES_VERIFIED={}", result.bytes_verified);
     println!("RECEIPTS_RECORDED={}", result.receipts_recorded);
     println!("RECEIPTS_DELETED={}", result.receipts_deleted);
+    println!("FINAL_ACTIONS={}", result.final_actions);
+    println!("FINAL_BLOCKED_ACTIONS={}", result.final_blocked_actions);
+    println!(
+        "NEXT_METADATA_PHASE={}",
+        result.next_metadata_phase.as_str()
+    );
+    println!(
+        "NEXT_CONVERGENCE_PHASE={}",
+        result
+            .next_convergence_phase
+            .map(|phase| phase.as_str())
+            .unwrap_or("none")
+    );
+    println!("CONVERGED={}", yes_no(result.converged));
+    println!(
+        "REQUIRES_ANOTHER_INVOCATION={}",
+        yes_no(result.requires_another_invocation)
+    );
+    println!(
+        "MANUAL_INTERVENTION_REQUIRED={}",
+        yes_no(result.manual_intervention_required)
+    );
+    println!("STOP_REASON={}", result.stop_reason.as_str());
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_MUTATION={}", yes_no(filesystem_mutation));
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_run_to_idle() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_RECEIVE_ONLY_RUN_TO_IDLE=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    if root.mode != SyncMode::ReceiveOnly {
+        return Err(CliError::SyncRootMetadataStepModeUnsupported);
+    }
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_RECEIVE_ONLY_RUN_TO_IDLE_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("SYNC_ROOT_RECEIVE_ONLY_RUN_TO_IDLE_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_RECEIVE_ONLY_RUN_TO_IDLE_STAGE=execute_bounded_run");
+    let result =
+        execute_selected_root_receive_only_run_to_idle(&api, &mut storage, root, unix_time_ms()?)?;
+
+    let filesystem_mutation = result.directories_created != 0
+        || result.files_materialized != 0
+        || result.files_replaced != 0
+        || result.files_deleted != 0
+        || result.directories_deleted != 0;
+
+    println!("SYNC_ROOT_RECEIVE_ONLY_RUN_TO_IDLE=PASS");
+    println!("MODE=receive_only");
+    println!("BOUNDARY=bounded_run_to_observed_idle");
+    println!("MAX_ROUNDS={}", SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS);
+    println!("ROUNDS_EXECUTED={}", result.rounds_executed);
+    println!("METADATA_ROUNDS={}", result.metadata_rounds);
+    println!("CONVERGENCE_ONLY_ROUNDS={}", result.convergence_only_rounds);
+    println!("BOOTSTRAP_ROUNDS={}", result.bootstrap_rounds);
+    println!(
+        "COLLECT_CHANGE_PAGE_ROUNDS={}",
+        result.collect_change_page_rounds
+    );
+    println!("EXECUTE_WINDOW_ROUNDS={}", result.execute_window_rounds);
+    println!(
+        "CONVERGENCE_PHASES_EXECUTED={}",
+        result.convergence_phases_executed
+    );
+    println!("DIRECTORIES_CREATED={}", result.directories_created);
+    println!("FILES_MATERIALIZED={}", result.files_materialized);
+    println!("FILES_VERIFIED={}", result.files_verified);
+    println!("FILES_REPLACED={}", result.files_replaced);
+    println!("FILES_DELETED={}", result.files_deleted);
+    println!("DIRECTORIES_DELETED={}", result.directories_deleted);
+    println!("BYTES_DOWNLOADED={}", result.bytes_downloaded);
+    println!("BYTES_VERIFIED={}", result.bytes_verified);
+    println!("RECEIPTS_RECORDED={}", result.receipts_recorded);
+    println!("RECEIPTS_DELETED={}", result.receipts_deleted);
+    println!(
+        "FINAL_CONVERGENCE_KNOWN={}",
+        yes_no(result.final_convergence_known)
+    );
     println!("FINAL_ACTIONS={}", result.final_actions);
     println!("FINAL_BLOCKED_ACTIONS={}", result.final_blocked_actions);
     println!(

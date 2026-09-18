@@ -52,6 +52,7 @@ pub struct SelectedRootDirectoryAdoption {
 }
 
 pub const SELECTED_ROOT_CONVERGENCE_MAX_ACTIONS: usize = 10_000;
+pub const SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS: usize = 8;
 pub const SUPERVISED_FILE_BATCH_MAX_ACTIONS: usize = 64;
 pub const SUPERVISED_STALE_FILE_PLAN_MAX_ACTIONS: usize = 64;
 pub const SUPERVISED_STALE_DIRECTORY_DELETION_MAX_ACTIONS: usize = 64;
@@ -308,6 +309,54 @@ pub struct SelectedRootReceiveOnlyCycleExecution {
     pub requires_another_invocation: bool,
     pub manual_intervention_required: bool,
     pub stop_reason: SelectedRootReceiveOnlyCycleStopReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootReceiveOnlyRunStopReason {
+    Converged,
+    RoundBudgetExhausted,
+    ManualInterventionRequired,
+}
+
+impl SelectedRootReceiveOnlyRunStopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Converged => "converged",
+            Self::RoundBudgetExhausted => "round_budget_exhausted",
+            Self::ManualInterventionRequired => "manual_intervention_required",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootReceiveOnlyRunExecution {
+    pub max_rounds: usize,
+    pub rounds_executed: usize,
+    pub metadata_rounds: usize,
+    pub convergence_only_rounds: usize,
+    pub bootstrap_rounds: usize,
+    pub collect_change_page_rounds: usize,
+    pub execute_window_rounds: usize,
+    pub convergence_phases_executed: usize,
+    pub directories_created: usize,
+    pub files_materialized: usize,
+    pub files_verified: usize,
+    pub files_replaced: usize,
+    pub files_deleted: usize,
+    pub directories_deleted: usize,
+    pub bytes_downloaded: u64,
+    pub bytes_verified: u64,
+    pub receipts_recorded: usize,
+    pub receipts_deleted: usize,
+    pub final_convergence_known: bool,
+    pub final_actions: usize,
+    pub final_blocked_actions: usize,
+    pub next_metadata_phase: SelectedRootReceiveOnlyCycleMetadataPhase,
+    pub next_convergence_phase: Option<SelectedRootUnifiedConvergencePhase>,
+    pub converged: bool,
+    pub requires_another_invocation: bool,
+    pub manual_intervention_required: bool,
+    pub stop_reason: SelectedRootReceiveOnlyRunStopReason,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,6 +771,260 @@ where
     };
 
     Ok(execution)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedRootReceiveOnlyRunMode {
+    Metadata,
+    Convergence,
+}
+
+fn classify_selected_root_receive_only_run_start(
+    snapshot_complete: bool,
+    catchup_complete: bool,
+    change_window_present: bool,
+    convergence_actions: usize,
+) -> SelectedRootReceiveOnlyRunMode {
+    if snapshot_complete && catchup_complete && !change_window_present && convergence_actions != 0 {
+        SelectedRootReceiveOnlyRunMode::Convergence
+    } else {
+        SelectedRootReceiveOnlyRunMode::Metadata
+    }
+}
+
+fn receive_only_run_add_usize(
+    total: &mut usize,
+    value: usize,
+) -> Result<(), SelectedRootExecutorError> {
+    *total = total
+        .checked_add(value)
+        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+    Ok(())
+}
+
+fn receive_only_run_add_u64(total: &mut u64, value: u64) -> Result<(), SelectedRootExecutorError> {
+    *total = total
+        .checked_add(value)
+        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+    Ok(())
+}
+
+fn accumulate_receive_only_cycle(
+    run: &mut SelectedRootReceiveOnlyRunExecution,
+    cycle: &SelectedRootReceiveOnlyCycleExecution,
+) -> Result<(), SelectedRootExecutorError> {
+    receive_only_run_add_usize(&mut run.metadata_rounds, 1)?;
+
+    match cycle.metadata_phase {
+        SelectedRootReceiveOnlyCycleMetadataPhase::Bootstrap => {
+            receive_only_run_add_usize(&mut run.bootstrap_rounds, 1)?;
+        }
+        SelectedRootReceiveOnlyCycleMetadataPhase::CollectChangePage => {
+            receive_only_run_add_usize(&mut run.collect_change_page_rounds, 1)?;
+        }
+        SelectedRootReceiveOnlyCycleMetadataPhase::ExecuteWindow => {
+            receive_only_run_add_usize(&mut run.execute_window_rounds, 1)?;
+        }
+    }
+
+    if cycle.convergence_phase.is_some() {
+        receive_only_run_add_usize(&mut run.convergence_phases_executed, 1)?;
+    }
+
+    receive_only_run_add_usize(&mut run.directories_created, cycle.directories_created)?;
+    receive_only_run_add_usize(&mut run.files_materialized, cycle.files_materialized)?;
+    receive_only_run_add_usize(&mut run.files_verified, cycle.files_verified)?;
+    receive_only_run_add_usize(&mut run.files_replaced, cycle.files_replaced)?;
+    receive_only_run_add_usize(&mut run.files_deleted, cycle.files_deleted)?;
+    receive_only_run_add_usize(&mut run.directories_deleted, cycle.directories_deleted)?;
+    receive_only_run_add_u64(&mut run.bytes_downloaded, cycle.bytes_downloaded)?;
+    receive_only_run_add_u64(&mut run.bytes_verified, cycle.bytes_verified)?;
+    receive_only_run_add_usize(&mut run.receipts_recorded, cycle.receipts_recorded)?;
+    receive_only_run_add_usize(&mut run.receipts_deleted, cycle.receipts_deleted)?;
+
+    run.next_metadata_phase = cycle.next_metadata_phase;
+
+    if cycle.convergence_executed {
+        run.final_convergence_known = true;
+        run.final_actions = cycle.final_actions;
+        run.final_blocked_actions = cycle.final_blocked_actions;
+        run.next_convergence_phase = cycle.next_convergence_phase;
+    }
+
+    Ok(())
+}
+
+fn accumulate_receive_only_convergence(
+    run: &mut SelectedRootReceiveOnlyRunExecution,
+    convergence: &SelectedRootUnifiedConvergenceExecution,
+) -> Result<(), SelectedRootExecutorError> {
+    receive_only_run_add_usize(&mut run.convergence_only_rounds, 1)?;
+
+    if convergence.phase_executed.is_some() {
+        receive_only_run_add_usize(&mut run.convergence_phases_executed, 1)?;
+    }
+
+    receive_only_run_add_usize(
+        &mut run.directories_created,
+        convergence.directories_created,
+    )?;
+    receive_only_run_add_usize(&mut run.files_materialized, convergence.files_materialized)?;
+    receive_only_run_add_usize(&mut run.files_verified, convergence.files_verified)?;
+    receive_only_run_add_usize(&mut run.files_replaced, convergence.files_replaced)?;
+    receive_only_run_add_usize(&mut run.files_deleted, convergence.files_deleted)?;
+    receive_only_run_add_usize(
+        &mut run.directories_deleted,
+        convergence.directories_deleted,
+    )?;
+    receive_only_run_add_u64(&mut run.bytes_downloaded, convergence.bytes_downloaded)?;
+    receive_only_run_add_u64(&mut run.bytes_verified, convergence.bytes_verified)?;
+    receive_only_run_add_usize(&mut run.receipts_recorded, convergence.receipts_recorded)?;
+    receive_only_run_add_usize(&mut run.receipts_deleted, convergence.receipts_deleted)?;
+
+    run.final_convergence_known = true;
+    run.final_actions = convergence.final_actions;
+    run.final_blocked_actions = convergence.final_blocked_actions;
+    run.next_convergence_phase = convergence.next_phase;
+
+    Ok(())
+}
+
+pub fn execute_selected_root_receive_only_run_to_idle<P>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    observed_at_unix_ms: i64,
+) -> Result<SelectedRootReceiveOnlyRunExecution, SelectedRootExecutorError>
+where
+    P: SelectedRootBootstrapProvider
+        + SelectedRootChangeProvider
+        + SelectedRootProvider
+        + SelectedRootContentProvider,
+{
+    if sync_root.mode != SyncMode::ReceiveOnly {
+        return Err(SelectedRootExecutorError::ReceiveOnlyCycleModeUnsupported);
+    }
+
+    let inventory = storage.sync_root_remote_inventory_state(&sync_root.id)?;
+    let window = storage.sync_root_change_window_state(&sync_root.id)?;
+
+    let convergence_actions =
+        if inventory.snapshot_complete && inventory.catchup_complete && window.is_none() {
+            plan_selected_root_receive_only_convergence(storage, sync_root)?.action_count()
+        } else {
+            0
+        };
+
+    let mut mode = classify_selected_root_receive_only_run_start(
+        inventory.snapshot_complete,
+        inventory.catchup_complete,
+        window.is_some(),
+        convergence_actions,
+    );
+    let mut metadata_observation_started = mode == SelectedRootReceiveOnlyRunMode::Metadata;
+
+    let mut run = SelectedRootReceiveOnlyRunExecution {
+        max_rounds: SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS,
+        rounds_executed: 0,
+        metadata_rounds: 0,
+        convergence_only_rounds: 0,
+        bootstrap_rounds: 0,
+        collect_change_page_rounds: 0,
+        execute_window_rounds: 0,
+        convergence_phases_executed: 0,
+        directories_created: 0,
+        files_materialized: 0,
+        files_verified: 0,
+        files_replaced: 0,
+        files_deleted: 0,
+        directories_deleted: 0,
+        bytes_downloaded: 0,
+        bytes_verified: 0,
+        receipts_recorded: 0,
+        receipts_deleted: 0,
+        final_convergence_known: false,
+        final_actions: 0,
+        final_blocked_actions: 0,
+        next_metadata_phase: plan_selected_root_receive_only_cycle_metadata_phase(
+            storage, sync_root,
+        )?,
+        next_convergence_phase: None,
+        converged: false,
+        requires_another_invocation: true,
+        manual_intervention_required: false,
+        stop_reason: SelectedRootReceiveOnlyRunStopReason::RoundBudgetExhausted,
+    };
+
+    while run.rounds_executed < run.max_rounds {
+        receive_only_run_add_usize(&mut run.rounds_executed, 1)?;
+
+        match mode {
+            SelectedRootReceiveOnlyRunMode::Metadata => {
+                let cycle = execute_selected_root_receive_only_cycle(
+                    provider,
+                    storage,
+                    sync_root,
+                    observed_at_unix_ms,
+                )?;
+
+                accumulate_receive_only_cycle(&mut run, &cycle)?;
+
+                if cycle.manual_intervention_required {
+                    run.manual_intervention_required = true;
+                    run.requires_another_invocation = false;
+                    run.stop_reason =
+                        SelectedRootReceiveOnlyRunStopReason::ManualInterventionRequired;
+                    return Ok(run);
+                }
+
+                if cycle.converged {
+                    run.converged = true;
+                    run.requires_another_invocation = false;
+                    run.stop_reason = SelectedRootReceiveOnlyRunStopReason::Converged;
+                    return Ok(run);
+                }
+
+                if cycle.convergence_executed {
+                    mode = SelectedRootReceiveOnlyRunMode::Convergence;
+                }
+            }
+            SelectedRootReceiveOnlyRunMode::Convergence => {
+                let convergence = execute_selected_root_unified_convergence_step(
+                    Some(provider),
+                    storage,
+                    sync_root,
+                )?;
+
+                accumulate_receive_only_convergence(&mut run, &convergence)?;
+
+                if convergence.manual_intervention_required {
+                    run.manual_intervention_required = true;
+                    run.requires_another_invocation = false;
+                    run.stop_reason =
+                        SelectedRootReceiveOnlyRunStopReason::ManualInterventionRequired;
+                    return Ok(run);
+                }
+
+                if convergence.converged {
+                    if metadata_observation_started {
+                        run.converged = true;
+                        run.requires_another_invocation = false;
+                        run.stop_reason = SelectedRootReceiveOnlyRunStopReason::Converged;
+                        return Ok(run);
+                    }
+
+                    mode = SelectedRootReceiveOnlyRunMode::Metadata;
+                    metadata_observation_started = true;
+                    run.next_metadata_phase =
+                        plan_selected_root_receive_only_cycle_metadata_phase(storage, sync_root)?;
+                }
+            }
+        }
+    }
+
+    run.requires_another_invocation = true;
+    run.stop_reason = SelectedRootReceiveOnlyRunStopReason::RoundBudgetExhausted;
+    Ok(run)
 }
 
 pub fn plan_selected_root_unified_convergence_step(
@@ -8318,6 +8621,60 @@ mod phase5e1_receive_only_cycle_tests {
         assert_eq!(
             SelectedRootReceiveOnlyCycleMetadataPhase::ExecuteWindow.as_str(),
             "execute_window"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase5e2_receive_only_run_tests {
+    use super::*;
+
+    #[test]
+    fn phase5e2_resumes_existing_convergence_before_new_metadata() {
+        assert_eq!(
+            classify_selected_root_receive_only_run_start(true, true, false, 1),
+            SelectedRootReceiveOnlyRunMode::Convergence
+        );
+        assert_eq!(
+            classify_selected_root_receive_only_run_start(true, true, false, 3),
+            SelectedRootReceiveOnlyRunMode::Convergence
+        );
+    }
+
+    #[test]
+    fn phase5e2_metadata_wins_when_remote_state_is_not_stable_or_local_is_idle() {
+        assert_eq!(
+            classify_selected_root_receive_only_run_start(false, false, false, 0),
+            SelectedRootReceiveOnlyRunMode::Metadata
+        );
+        assert_eq!(
+            classify_selected_root_receive_only_run_start(true, false, false, 2),
+            SelectedRootReceiveOnlyRunMode::Metadata
+        );
+        assert_eq!(
+            classify_selected_root_receive_only_run_start(true, true, true, 2),
+            SelectedRootReceiveOnlyRunMode::Metadata
+        );
+        assert_eq!(
+            classify_selected_root_receive_only_run_start(true, true, false, 0),
+            SelectedRootReceiveOnlyRunMode::Metadata
+        );
+    }
+
+    #[test]
+    fn phase5e2_round_budget_and_stop_labels_are_fixed() {
+        assert_eq!(SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS, 8);
+        assert_eq!(
+            SelectedRootReceiveOnlyRunStopReason::Converged.as_str(),
+            "converged"
+        );
+        assert_eq!(
+            SelectedRootReceiveOnlyRunStopReason::RoundBudgetExhausted.as_str(),
+            "round_budget_exhausted"
+        );
+        assert_eq!(
+            SelectedRootReceiveOnlyRunStopReason::ManualInterventionRequired.as_str(),
+            "manual_intervention_required"
         );
     }
 }
