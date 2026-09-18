@@ -3,7 +3,8 @@
 #![forbid(unsafe_code)]
 
 use nubisync_core::{
-    ChangeCursor, ChangePage, ContinuationToken, RemoteChange, RemoteItem, RemoteItemKind, SyncRoot,
+    ChangeCursor, ChangePage, ContinuationToken, RemoteChange, RemoteItem, RemoteItemKind,
+    SyncMode, SyncRoot,
 };
 use nubisync_drive::{
     DriveApiError, DriveBlobFingerprint, DriveFolderRoot, DriveRootMembership, GoogleDriveApi,
@@ -239,6 +240,74 @@ pub struct SelectedRootUnifiedConvergenceExecution {
     pub requires_another_invocation: bool,
     pub manual_intervention_required: bool,
     pub stop_reason: SelectedRootUnifiedConvergenceStopReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootReceiveOnlyCycleMetadataPhase {
+    Bootstrap,
+    CollectChangePage,
+    ExecuteWindow,
+}
+
+impl SelectedRootReceiveOnlyCycleMetadataPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::CollectChangePage => "collect_change_page",
+            Self::ExecuteWindow => "execute_window",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootReceiveOnlyCycleStopReason {
+    MetadataStepCompleted,
+    Converged,
+    ConvergencePhaseCompleted,
+    ManualInterventionRequired,
+}
+
+impl SelectedRootReceiveOnlyCycleStopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MetadataStepCompleted => "metadata_step_completed",
+            Self::Converged => "converged",
+            Self::ConvergencePhaseCompleted => "convergence_phase_completed",
+            Self::ManualInterventionRequired => "manual_intervention_required",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootReceiveOnlyCycleExecution {
+    pub metadata_phase: SelectedRootReceiveOnlyCycleMetadataPhase,
+    pub metadata_authoritative_items: u64,
+    pub metadata_page_count: u64,
+    pub metadata_change_count: u64,
+    pub metadata_catalog_mutations: usize,
+    pub metadata_window_complete: bool,
+    pub initial_catchup_complete: bool,
+    pub convergence_executed: bool,
+    pub convergence_phase: Option<SelectedRootUnifiedConvergencePhase>,
+    pub convergence_actions_executed: usize,
+    pub directories_created: usize,
+    pub files_materialized: usize,
+    pub files_verified: usize,
+    pub files_replaced: usize,
+    pub files_deleted: usize,
+    pub directories_deleted: usize,
+    pub bytes_downloaded: u64,
+    pub bytes_verified: u64,
+    pub receipts_recorded: usize,
+    pub receipts_deleted: usize,
+    pub final_actions: usize,
+    pub final_blocked_actions: usize,
+    pub next_metadata_phase: SelectedRootReceiveOnlyCycleMetadataPhase,
+    pub next_convergence_phase: Option<SelectedRootUnifiedConvergencePhase>,
+    pub converged: bool,
+    pub requires_another_invocation: bool,
+    pub manual_intervention_required: bool,
+    pub stop_reason: SelectedRootReceiveOnlyCycleStopReason,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,6 +562,166 @@ pub fn plan_selected_root_receive_only_convergence(
         SELECTED_ROOT_CONVERGENCE_MAX_ACTIONS,
     )
     .map_err(SelectedRootExecutorError::from)
+}
+
+fn classify_selected_root_receive_only_cycle_metadata_phase(
+    snapshot_complete: bool,
+    window_complete: Option<bool>,
+) -> SelectedRootReceiveOnlyCycleMetadataPhase {
+    if !snapshot_complete {
+        return SelectedRootReceiveOnlyCycleMetadataPhase::Bootstrap;
+    }
+
+    match window_complete {
+        Some(true) => SelectedRootReceiveOnlyCycleMetadataPhase::ExecuteWindow,
+        Some(false) | None => SelectedRootReceiveOnlyCycleMetadataPhase::CollectChangePage,
+    }
+}
+
+pub fn plan_selected_root_receive_only_cycle_metadata_phase(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootReceiveOnlyCycleMetadataPhase, SelectedRootExecutorError> {
+    if sync_root.mode != SyncMode::ReceiveOnly {
+        return Err(SelectedRootExecutorError::ReceiveOnlyCycleModeUnsupported);
+    }
+
+    let inventory = storage.sync_root_remote_inventory_state(&sync_root.id)?;
+    let window = storage.sync_root_change_window_state(&sync_root.id)?;
+
+    Ok(classify_selected_root_receive_only_cycle_metadata_phase(
+        inventory.snapshot_complete,
+        window.as_ref().map(|state| state.is_complete()),
+    ))
+}
+
+pub fn execute_selected_root_receive_only_cycle<P>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    observed_at_unix_ms: i64,
+) -> Result<SelectedRootReceiveOnlyCycleExecution, SelectedRootExecutorError>
+where
+    P: SelectedRootBootstrapProvider
+        + SelectedRootChangeProvider
+        + SelectedRootProvider
+        + SelectedRootContentProvider,
+{
+    let metadata_phase = plan_selected_root_receive_only_cycle_metadata_phase(storage, sync_root)?;
+
+    let mut execution = SelectedRootReceiveOnlyCycleExecution {
+        metadata_phase,
+        metadata_authoritative_items: 0,
+        metadata_page_count: 0,
+        metadata_change_count: 0,
+        metadata_catalog_mutations: 0,
+        metadata_window_complete: false,
+        initial_catchup_complete: false,
+        convergence_executed: false,
+        convergence_phase: None,
+        convergence_actions_executed: 0,
+        directories_created: 0,
+        files_materialized: 0,
+        files_verified: 0,
+        files_replaced: 0,
+        files_deleted: 0,
+        directories_deleted: 0,
+        bytes_downloaded: 0,
+        bytes_verified: 0,
+        receipts_recorded: 0,
+        receipts_deleted: 0,
+        final_actions: 0,
+        final_blocked_actions: 0,
+        next_metadata_phase: metadata_phase,
+        next_convergence_phase: None,
+        converged: false,
+        requires_another_invocation: true,
+        manual_intervention_required: false,
+        stop_reason: SelectedRootReceiveOnlyCycleStopReason::MetadataStepCompleted,
+    };
+
+    match metadata_phase {
+        SelectedRootReceiveOnlyCycleMetadataPhase::Bootstrap => {
+            let result = bootstrap_selected_root_snapshot(
+                provider,
+                storage,
+                sync_root,
+                observed_at_unix_ms,
+            )?;
+            execution.metadata_authoritative_items = result.authoritative_items;
+        }
+        SelectedRootReceiveOnlyCycleMetadataPhase::CollectChangePage => {
+            let result = collect_selected_root_change_window_page(provider, storage, sync_root)?;
+            execution.metadata_page_count = result.page_count;
+            execution.metadata_change_count = result.change_count;
+            execution.metadata_window_complete = result.complete;
+        }
+        SelectedRootReceiveOnlyCycleMetadataPhase::ExecuteWindow => {
+            let result = execute_completed_selected_root_change_window(
+                provider,
+                storage,
+                sync_root,
+                observed_at_unix_ms,
+            )?;
+            execution.metadata_authoritative_items = result.authoritative_items;
+            execution.metadata_change_count = u64::try_from(result.provider_changes)
+                .map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+            execution.metadata_catalog_mutations = result.storage_mutations;
+        }
+    }
+
+    let inventory = storage.sync_root_remote_inventory_state(&sync_root.id)?;
+    let window = storage.sync_root_change_window_state(&sync_root.id)?;
+    execution.initial_catchup_complete = inventory.catchup_complete;
+    execution.metadata_window_complete = window
+        .as_ref()
+        .map(|state| state.is_complete())
+        .unwrap_or(false);
+    execution.next_metadata_phase = classify_selected_root_receive_only_cycle_metadata_phase(
+        inventory.snapshot_complete,
+        window.as_ref().map(|state| state.is_complete()),
+    );
+
+    let metadata_stable =
+        inventory.snapshot_complete && inventory.catchup_complete && window.is_none();
+
+    if metadata_phase != SelectedRootReceiveOnlyCycleMetadataPhase::ExecuteWindow
+        || !metadata_stable
+    {
+        return Ok(execution);
+    }
+
+    let convergence =
+        execute_selected_root_unified_convergence_step(Some(provider), storage, sync_root)?;
+
+    execution.convergence_executed = true;
+    execution.convergence_phase = convergence.phase_executed;
+    execution.convergence_actions_executed = convergence.phase_actions_executed;
+    execution.directories_created = convergence.directories_created;
+    execution.files_materialized = convergence.files_materialized;
+    execution.files_verified = convergence.files_verified;
+    execution.files_replaced = convergence.files_replaced;
+    execution.files_deleted = convergence.files_deleted;
+    execution.directories_deleted = convergence.directories_deleted;
+    execution.bytes_downloaded = convergence.bytes_downloaded;
+    execution.bytes_verified = convergence.bytes_verified;
+    execution.receipts_recorded = convergence.receipts_recorded;
+    execution.receipts_deleted = convergence.receipts_deleted;
+    execution.final_actions = convergence.final_actions;
+    execution.final_blocked_actions = convergence.final_blocked_actions;
+    execution.next_convergence_phase = convergence.next_phase;
+    execution.converged = convergence.converged;
+    execution.requires_another_invocation = convergence.requires_another_invocation;
+    execution.manual_intervention_required = convergence.manual_intervention_required;
+    execution.stop_reason = if convergence.manual_intervention_required {
+        SelectedRootReceiveOnlyCycleStopReason::ManualInterventionRequired
+    } else if convergence.converged {
+        SelectedRootReceiveOnlyCycleStopReason::Converged
+    } else {
+        SelectedRootReceiveOnlyCycleStopReason::ConvergencePhaseCompleted
+    };
+
+    Ok(execution)
 }
 
 pub fn plan_selected_root_unified_convergence_step(
@@ -5137,6 +5366,8 @@ pub enum SelectedRootExecutorError {
     LocalFileRollbackFailed,
     #[error("provider byte count disagreed with the bytes hashed locally")]
     LocalFileProviderByteCountMismatch,
+    #[error("receive-only supervised cycle supports only receive_only roots")]
+    ReceiveOnlyCycleModeUnsupported,
     #[error("unified convergence is blocked by fail-closed planner actions")]
     UnifiedConvergenceBlocked,
     #[error("unified convergence requires a readonly content provider for this phase")]
@@ -8047,5 +8278,46 @@ mod phase5d9_unified_convergence_tests {
         );
 
         fs::remove_dir(local_root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod phase5e1_receive_only_cycle_tests {
+    use super::*;
+
+    #[test]
+    fn phase5e1_metadata_phase_state_machine_is_explicit() {
+        assert_eq!(
+            classify_selected_root_receive_only_cycle_metadata_phase(false, None),
+            SelectedRootReceiveOnlyCycleMetadataPhase::Bootstrap
+        );
+        assert_eq!(
+            classify_selected_root_receive_only_cycle_metadata_phase(true, None),
+            SelectedRootReceiveOnlyCycleMetadataPhase::CollectChangePage
+        );
+        assert_eq!(
+            classify_selected_root_receive_only_cycle_metadata_phase(true, Some(false)),
+            SelectedRootReceiveOnlyCycleMetadataPhase::CollectChangePage
+        );
+        assert_eq!(
+            classify_selected_root_receive_only_cycle_metadata_phase(true, Some(true)),
+            SelectedRootReceiveOnlyCycleMetadataPhase::ExecuteWindow
+        );
+    }
+
+    #[test]
+    fn phase5e1_metadata_phase_names_are_private_aggregate_labels() {
+        assert_eq!(
+            SelectedRootReceiveOnlyCycleMetadataPhase::Bootstrap.as_str(),
+            "bootstrap"
+        );
+        assert_eq!(
+            SelectedRootReceiveOnlyCycleMetadataPhase::CollectChangePage.as_str(),
+            "collect_change_page"
+        );
+        assert_eq!(
+            SelectedRootReceiveOnlyCycleMetadataPhase::ExecuteWindow.as_str(),
+            "execute_window"
+        );
     }
 }

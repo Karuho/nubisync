@@ -15,14 +15,15 @@ use nubisync_daemon::{
     collect_selected_root_change_window_page, delete_selected_root_existing_directory,
     delete_selected_root_existing_file, delete_selected_root_stale_directories,
     delete_selected_root_stale_files, execute_completed_selected_root_change_window,
-    execute_selected_root_unified_convergence_step, materialize_selected_root_directories,
-    materialize_selected_root_missing_file, materialize_selected_root_missing_files,
-    plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
-    plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
-    plan_selected_root_remote_replacement, plan_selected_root_stale_files,
-    plan_selected_root_unified_convergence_step, replace_selected_root_existing_file,
-    replace_selected_root_stale_files, verify_selected_root_existing_file,
-    verify_selected_root_existing_files, verify_selected_root_local_receipts,
+    execute_selected_root_receive_only_cycle, execute_selected_root_unified_convergence_step,
+    materialize_selected_root_directories, materialize_selected_root_missing_file,
+    materialize_selected_root_missing_files, plan_selected_root_local_materialization,
+    plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
+    plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
+    plan_selected_root_stale_files, plan_selected_root_unified_convergence_step,
+    replace_selected_root_existing_file, replace_selected_root_stale_files,
+    verify_selected_root_existing_file, verify_selected_root_existing_files,
+    verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -102,6 +103,11 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_metadata_step()
+        }
+        [sync, roots, cycle, approve]
+            if sync == "sync" && roots == "roots" && cycle == "cycle" && approve == "--approve" =>
+        {
+            sync_roots_cycle()
         }
         [sync, roots, convergence_plan, approve]
             if sync == "sync"
@@ -351,6 +357,7 @@ USAGE:
   nubisync auth google logout
   nubisync sync roots status
   nubisync sync roots metadata-step --approve
+  nubisync sync roots cycle --approve
   nubisync sync roots convergence-plan --approve
   nubisync sync roots converge --approve
   nubisync sync roots stale-files-plan --approve
@@ -733,6 +740,169 @@ fn sync_roots_metadata_step() -> Result<(), CliError> {
     println!("REMOTE_METADATA_PRINTED=no");
     println!("FILE_CONTENT_ACCESSED=no");
     println!("FILESYSTEM_MUTATION=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_cycle() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_RECEIVE_ONLY_CYCLE=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    if root.mode != SyncMode::ReceiveOnly {
+        return Err(CliError::SyncRootMetadataStepModeUnsupported);
+    }
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_RECEIVE_ONLY_CYCLE_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("SYNC_ROOT_RECEIVE_ONLY_CYCLE_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_RECEIVE_ONLY_CYCLE_STAGE=execute_bounded_cycle");
+    let result =
+        execute_selected_root_receive_only_cycle(&api, &mut storage, root, unix_time_ms()?)?;
+
+    let filesystem_mutation = result.directories_created != 0
+        || result.files_materialized != 0
+        || result.files_replaced != 0
+        || result.files_deleted != 0
+        || result.directories_deleted != 0;
+
+    println!("SYNC_ROOT_RECEIVE_ONLY_CYCLE=PASS");
+    println!("MODE=receive_only");
+    println!("BOUNDARY=one_metadata_step_plus_at_most_one_convergence_class");
+    println!("METADATA_PHASE={}", result.metadata_phase.as_str());
+    println!(
+        "METADATA_AUTHORITATIVE_ITEMS={}",
+        result.metadata_authoritative_items
+    );
+    println!("METADATA_PAGE_COUNT={}", result.metadata_page_count);
+    println!("METADATA_CHANGE_COUNT={}", result.metadata_change_count);
+    println!(
+        "METADATA_CATALOG_MUTATIONS={}",
+        result.metadata_catalog_mutations
+    );
+    println!(
+        "METADATA_WINDOW_COMPLETE={}",
+        yes_no(result.metadata_window_complete)
+    );
+    println!(
+        "INITIAL_CATCHUP_COMPLETE={}",
+        yes_no(result.initial_catchup_complete)
+    );
+    println!(
+        "CONVERGENCE_EXECUTED={}",
+        yes_no(result.convergence_executed)
+    );
+    println!(
+        "CONVERGENCE_PHASE={}",
+        result
+            .convergence_phase
+            .map(|phase| phase.as_str())
+            .unwrap_or("none")
+    );
+    println!(
+        "CONVERGENCE_ACTIONS_EXECUTED={}",
+        result.convergence_actions_executed
+    );
+    println!("DIRECTORIES_CREATED={}", result.directories_created);
+    println!("FILES_MATERIALIZED={}", result.files_materialized);
+    println!("FILES_VERIFIED={}", result.files_verified);
+    println!("FILES_REPLACED={}", result.files_replaced);
+    println!("FILES_DELETED={}", result.files_deleted);
+    println!("DIRECTORIES_DELETED={}", result.directories_deleted);
+    println!("BYTES_DOWNLOADED={}", result.bytes_downloaded);
+    println!("BYTES_VERIFIED={}", result.bytes_verified);
+    println!("RECEIPTS_RECORDED={}", result.receipts_recorded);
+    println!("RECEIPTS_DELETED={}", result.receipts_deleted);
+    println!("FINAL_ACTIONS={}", result.final_actions);
+    println!("FINAL_BLOCKED_ACTIONS={}", result.final_blocked_actions);
+    println!(
+        "NEXT_METADATA_PHASE={}",
+        result.next_metadata_phase.as_str()
+    );
+    println!(
+        "NEXT_CONVERGENCE_PHASE={}",
+        result
+            .next_convergence_phase
+            .map(|phase| phase.as_str())
+            .unwrap_or("none")
+    );
+    println!("CONVERGED={}", yes_no(result.converged));
+    println!(
+        "REQUIRES_ANOTHER_INVOCATION={}",
+        yes_no(result.requires_another_invocation)
+    );
+    println!(
+        "MANUAL_INTERVENTION_REQUIRED={}",
+        yes_no(result.manual_intervention_required)
+    );
+    println!("STOP_REASON={}", result.stop_reason.as_str());
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_MUTATION={}", yes_no(filesystem_mutation));
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
