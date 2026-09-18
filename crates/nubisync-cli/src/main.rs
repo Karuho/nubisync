@@ -11,20 +11,20 @@ use nubisync_core::{
 };
 use nubisync_daemon::{
     SUPERVISED_FILE_BATCH_MAX_ACTIONS, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
-    SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS, adopt_selected_root_existing_directory,
-    bootstrap_selected_root_snapshot, collect_selected_root_change_window_page,
-    delete_selected_root_existing_directory, delete_selected_root_existing_file,
-    delete_selected_root_stale_directories, delete_selected_root_stale_files,
-    execute_completed_selected_root_change_window, execute_selected_root_receive_only_cycle,
-    execute_selected_root_receive_only_run_to_idle, execute_selected_root_unified_convergence_step,
-    materialize_selected_root_directories, materialize_selected_root_missing_file,
-    materialize_selected_root_missing_files, plan_selected_root_local_materialization,
-    plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
-    plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
-    plan_selected_root_stale_files, plan_selected_root_unified_convergence_step,
-    replace_selected_root_existing_file, replace_selected_root_stale_files,
-    verify_selected_root_existing_file, verify_selected_root_existing_files,
-    verify_selected_root_local_receipts,
+    SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS, SelectedRootReceiveOnlySingleFlightResult,
+    adopt_selected_root_existing_directory, bootstrap_selected_root_snapshot,
+    collect_selected_root_change_window_page, delete_selected_root_existing_directory,
+    delete_selected_root_existing_file, delete_selected_root_stale_directories,
+    delete_selected_root_stale_files, execute_completed_selected_root_change_window,
+    execute_selected_root_receive_only_cycle, execute_selected_root_receive_only_single_flight,
+    execute_selected_root_unified_convergence_step, materialize_selected_root_directories,
+    materialize_selected_root_missing_file, materialize_selected_root_missing_files,
+    plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
+    plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
+    plan_selected_root_remote_replacement, plan_selected_root_stale_files,
+    plan_selected_root_unified_convergence_step, replace_selected_root_existing_file,
+    replace_selected_root_stale_files, verify_selected_root_existing_file,
+    verify_selected_root_existing_files, verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -987,9 +987,38 @@ fn sync_roots_run_to_idle() -> Result<(), CliError> {
         return Err(CliError::GoogleAccountMismatch);
     }
 
-    println!("SYNC_ROOT_RECEIVE_ONLY_RUN_TO_IDLE_STAGE=execute_bounded_run");
-    let result =
-        execute_selected_root_receive_only_run_to_idle(&api, &mut storage, root, unix_time_ms()?)?;
+    println!("SYNC_ROOT_RECEIVE_ONLY_RUN_TO_IDLE_STAGE=execute_single_flight");
+    let single_flight = execute_selected_root_receive_only_single_flight(
+        &api,
+        &mut storage,
+        root,
+        unix_time_ms()?,
+    )?;
+
+    let result = match single_flight {
+        SelectedRootReceiveOnlySingleFlightResult::Busy => {
+            println!("SYNC_ROOT_RECEIVE_ONLY_RUN_TO_IDLE=BUSY");
+            println!("MODE=receive_only");
+            println!("SINGLE_FLIGHT=busy");
+            println!("SINGLE_FLIGHT_SCOPE=in_process");
+            println!("CROSS_PROCESS_LOCK=no");
+            println!("SYNC_EXECUTION=not_started");
+            println!("REQUIRES_ANOTHER_INVOCATION=yes");
+            println!("MANUAL_INTERVENTION_REQUIRED=no");
+            println!("NETWORK_CHECK=performed");
+            println!("DATABASE_MUTATION=no");
+            println!("FILESYSTEM_MUTATION=no");
+            println!("ROOT_PATH_PRINTED=no");
+            println!("LOCAL_NAMES_PRINTED=no");
+            println!("REMOTE_ROOT_ID_PRINTED=no");
+            println!("REMOTE_METADATA_PRINTED=no");
+            println!("HASH_VALUE_PRINTED=no");
+            println!("TOKEN_VALUES_PRINTED=no");
+            println!("DRIVE_WRITE_ACCESS=no");
+            return Ok(());
+        }
+        SelectedRootReceiveOnlySingleFlightResult::Executed(result) => result,
+    };
 
     let filesystem_mutation = result.directories_created != 0
         || result.files_materialized != 0
@@ -999,6 +1028,9 @@ fn sync_roots_run_to_idle() -> Result<(), CliError> {
 
     println!("SYNC_ROOT_RECEIVE_ONLY_RUN_TO_IDLE=PASS");
     println!("MODE=receive_only");
+    println!("SINGLE_FLIGHT=acquired");
+    println!("SINGLE_FLIGHT_SCOPE=in_process");
+    println!("CROSS_PROCESS_LOCK=no");
     println!("BOUNDARY=bounded_run_to_observed_idle");
     println!("MAX_ROUNDS={}", SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS);
     println!("ROUNDS_EXECUTED={}", result.rounds_executed);

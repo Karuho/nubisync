@@ -30,7 +30,10 @@ use std::{
     io::{Read, Write},
     os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use thiserror::Error;
 
@@ -58,6 +61,7 @@ pub const SUPERVISED_STALE_FILE_PLAN_MAX_ACTIONS: usize = 64;
 pub const SUPERVISED_STALE_DIRECTORY_DELETION_MAX_ACTIONS: usize = 64;
 pub const SUPERVISED_FILE_DOWNLOAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
 static DOWNLOAD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+static RECEIVE_ONLY_SINGLE_FLIGHT_ROOTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectedRootFileBatchMaterialization {
@@ -357,6 +361,82 @@ pub struct SelectedRootReceiveOnlyRunExecution {
     pub requires_another_invocation: bool,
     pub manual_intervention_required: bool,
     pub stop_reason: SelectedRootReceiveOnlyRunStopReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootReceiveOnlySingleFlightStatus {
+    Idle,
+    Busy,
+}
+
+impl SelectedRootReceiveOnlySingleFlightStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Busy => "busy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootReceiveOnlySingleFlightResult {
+    Busy,
+    Executed(SelectedRootReceiveOnlyRunExecution),
+}
+
+impl SelectedRootReceiveOnlySingleFlightResult {
+    pub fn status(self) -> SelectedRootReceiveOnlySingleFlightStatus {
+        match self {
+            Self::Busy => SelectedRootReceiveOnlySingleFlightStatus::Busy,
+            Self::Executed(_) => SelectedRootReceiveOnlySingleFlightStatus::Idle,
+        }
+    }
+}
+
+struct SelectedRootReceiveOnlyRunSlotGuard {
+    sync_root_id: String,
+}
+
+impl Drop for SelectedRootReceiveOnlyRunSlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = receive_only_single_flight_registry().lock() {
+            active.remove(&self.sync_root_id);
+        }
+    }
+}
+
+fn receive_only_single_flight_registry() -> &'static Mutex<HashSet<String>> {
+    RECEIVE_ONLY_SINGLE_FLIGHT_ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn try_acquire_selected_root_receive_only_run_slot(
+    sync_root_id: &str,
+) -> Result<Option<SelectedRootReceiveOnlyRunSlotGuard>, SelectedRootExecutorError> {
+    let mut active = receive_only_single_flight_registry()
+        .lock()
+        .map_err(|_| SelectedRootExecutorError::ReceiveOnlySingleFlightStatePoisoned)?;
+
+    if !active.insert(sync_root_id.to_owned()) {
+        return Ok(None);
+    }
+
+    Ok(Some(SelectedRootReceiveOnlyRunSlotGuard {
+        sync_root_id: sync_root_id.to_owned(),
+    }))
+}
+
+pub fn selected_root_receive_only_single_flight_status(
+    sync_root_id: &str,
+) -> Result<SelectedRootReceiveOnlySingleFlightStatus, SelectedRootExecutorError> {
+    let active = receive_only_single_flight_registry()
+        .lock()
+        .map_err(|_| SelectedRootExecutorError::ReceiveOnlySingleFlightStatePoisoned)?;
+
+    Ok(if active.contains(sync_root_id) {
+        SelectedRootReceiveOnlySingleFlightStatus::Busy
+    } else {
+        SelectedRootReceiveOnlySingleFlightStatus::Idle
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1025,6 +1105,34 @@ where
     run.requires_another_invocation = true;
     run.stop_reason = SelectedRootReceiveOnlyRunStopReason::RoundBudgetExhausted;
     Ok(run)
+}
+
+pub fn execute_selected_root_receive_only_single_flight<P>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    observed_at_unix_ms: i64,
+) -> Result<SelectedRootReceiveOnlySingleFlightResult, SelectedRootExecutorError>
+where
+    P: SelectedRootBootstrapProvider
+        + SelectedRootChangeProvider
+        + SelectedRootProvider
+        + SelectedRootContentProvider,
+{
+    let Some(_slot) = try_acquire_selected_root_receive_only_run_slot(&sync_root.id)? else {
+        return Ok(SelectedRootReceiveOnlySingleFlightResult::Busy);
+    };
+
+    let execution = execute_selected_root_receive_only_run_to_idle(
+        provider,
+        storage,
+        sync_root,
+        observed_at_unix_ms,
+    )?;
+
+    Ok(SelectedRootReceiveOnlySingleFlightResult::Executed(
+        execution,
+    ))
 }
 
 pub fn plan_selected_root_unified_convergence_step(
@@ -5671,6 +5779,8 @@ pub enum SelectedRootExecutorError {
     LocalFileProviderByteCountMismatch,
     #[error("receive-only supervised cycle supports only receive_only roots")]
     ReceiveOnlyCycleModeUnsupported,
+    #[error("receive-only single-flight execution state is unavailable")]
+    ReceiveOnlySingleFlightStatePoisoned,
     #[error("unified convergence is blocked by fail-closed planner actions")]
     UnifiedConvergenceBlocked,
     #[error("unified convergence requires a readonly content provider for this phase")]
@@ -8675,6 +8785,96 @@ mod phase5e2_receive_only_run_tests {
         assert_eq!(
             SelectedRootReceiveOnlyRunStopReason::ManualInterventionRequired.as_str(),
             "manual_intervention_required"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase5e3_single_flight_tests {
+    use super::*;
+
+    fn unique_root_id(label: &str) -> String {
+        format!(
+            "phase5e3-{label}-{}-{}",
+            std::process::id(),
+            DOWNLOAD_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    #[test]
+    fn phase5e3_same_root_is_busy_until_guard_drops() {
+        let root_id = unique_root_id("same-root");
+
+        assert_eq!(
+            selected_root_receive_only_single_flight_status(&root_id).unwrap(),
+            SelectedRootReceiveOnlySingleFlightStatus::Idle
+        );
+
+        let first = try_acquire_selected_root_receive_only_run_slot(&root_id)
+            .unwrap()
+            .expect("first acquisition must succeed");
+
+        assert_eq!(
+            selected_root_receive_only_single_flight_status(&root_id).unwrap(),
+            SelectedRootReceiveOnlySingleFlightStatus::Busy
+        );
+        assert!(
+            try_acquire_selected_root_receive_only_run_slot(&root_id)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(first);
+
+        assert_eq!(
+            selected_root_receive_only_single_flight_status(&root_id).unwrap(),
+            SelectedRootReceiveOnlySingleFlightStatus::Idle
+        );
+
+        let second = try_acquire_selected_root_receive_only_run_slot(&root_id)
+            .unwrap()
+            .expect("slot must be reusable after release");
+        drop(second);
+    }
+
+    #[test]
+    fn phase5e3_different_roots_can_run_independently() {
+        let root_a = unique_root_id("root-a");
+        let root_b = unique_root_id("root-b");
+
+        let guard_a = try_acquire_selected_root_receive_only_run_slot(&root_a)
+            .unwrap()
+            .expect("root A acquisition must succeed");
+        let guard_b = try_acquire_selected_root_receive_only_run_slot(&root_b)
+            .unwrap()
+            .expect("root B acquisition must succeed");
+
+        assert_eq!(
+            selected_root_receive_only_single_flight_status(&root_a).unwrap(),
+            SelectedRootReceiveOnlySingleFlightStatus::Busy
+        );
+        assert_eq!(
+            selected_root_receive_only_single_flight_status(&root_b).unwrap(),
+            SelectedRootReceiveOnlySingleFlightStatus::Busy
+        );
+
+        drop(guard_a);
+        drop(guard_b);
+    }
+
+    #[test]
+    fn phase5e3_status_labels_are_explicit() {
+        assert_eq!(
+            SelectedRootReceiveOnlySingleFlightStatus::Idle.as_str(),
+            "idle"
+        );
+        assert_eq!(
+            SelectedRootReceiveOnlySingleFlightStatus::Busy.as_str(),
+            "busy"
+        );
+        assert_eq!(
+            SelectedRootReceiveOnlySingleFlightResult::Busy.status(),
+            SelectedRootReceiveOnlySingleFlightStatus::Busy
         );
     }
 }
