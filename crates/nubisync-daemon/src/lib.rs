@@ -534,6 +534,25 @@ pub enum SelectedRootReceiveOnlyPeriodicDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootPeriodicLocalObservation {
+    Journaled(SelectedRootLocalJournalResult),
+    BaselineMissing,
+    BaselineInvalidated,
+    DeferredUntilReceiveOnlyConverged,
+}
+
+impl SelectedRootPeriodicLocalObservation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Journaled(_) => "journaled",
+            Self::BaselineMissing => "baseline_missing",
+            Self::BaselineInvalidated => "baseline_invalidated",
+            Self::DeferredUntilReceiveOnlyConverged => "deferred_until_receive_only_converged",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectedRootReceiveOnlyPeriodicTick {
     Waiting {
         delay_ms: i64,
@@ -545,6 +564,7 @@ pub enum SelectedRootReceiveOnlyPeriodicTick {
     },
     Executed {
         execution: SelectedRootReceiveOnlyRunExecution,
+        local_observation: SelectedRootPeriodicLocalObservation,
         next_delay_ms: Option<i64>,
     },
 }
@@ -1348,6 +1368,76 @@ where
     ))
 }
 
+enum SelectedRootReceiveOnlyPeriodicSingleFlightResult {
+    Busy,
+    Executed {
+        execution: SelectedRootReceiveOnlyRunExecution,
+        local_observation: SelectedRootPeriodicLocalObservation,
+    },
+}
+
+fn receive_only_execution_ready_for_local_observation(
+    converged: bool,
+    requires_another_invocation: bool,
+    manual_intervention_required: bool,
+) -> bool {
+    converged && !requires_another_invocation && !manual_intervention_required
+}
+
+fn execute_selected_root_receive_only_periodic_single_flight<P>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    observed_at_unix_ms: i64,
+) -> Result<SelectedRootReceiveOnlyPeriodicSingleFlightResult, SelectedRootExecutorError>
+where
+    P: SelectedRootBootstrapProvider
+        + SelectedRootChangeProvider
+        + SelectedRootProvider
+        + SelectedRootContentProvider,
+{
+    let Some(_slot) = try_acquire_selected_root_receive_only_run_slot(&sync_root.id)? else {
+        return Ok(SelectedRootReceiveOnlyPeriodicSingleFlightResult::Busy);
+    };
+
+    let execution = execute_selected_root_receive_only_run_to_idle(
+        provider,
+        storage,
+        sync_root,
+        observed_at_unix_ms,
+    )?;
+
+    let local_observation = if receive_only_execution_ready_for_local_observation(
+        execution.converged,
+        execution.requires_another_invocation,
+        execution.manual_intervention_required,
+    ) {
+        let baseline = storage.sync_root_local_inventory_state(&sync_root.id)?;
+        if !baseline.snapshot_complete {
+            SelectedRootPeriodicLocalObservation::BaselineMissing
+        } else if !baseline.observation_valid {
+            SelectedRootPeriodicLocalObservation::BaselineInvalidated
+        } else {
+            SelectedRootPeriodicLocalObservation::Journaled(
+                journal_selected_root_local_inventory_diff(
+                    storage,
+                    sync_root,
+                    observed_at_unix_ms,
+                )?,
+            )
+        }
+    } else {
+        SelectedRootPeriodicLocalObservation::DeferredUntilReceiveOnlyConverged
+    };
+
+    Ok(
+        SelectedRootReceiveOnlyPeriodicSingleFlightResult::Executed {
+            execution,
+            local_observation,
+        },
+    )
+}
+
 pub fn execute_selected_root_receive_only_periodic_tick<P>(
     state: &mut SelectedRootReceiveOnlyPeriodicState,
     provider: &P,
@@ -1374,7 +1464,7 @@ where
         SelectedRootReceiveOnlyPeriodicDecision::Due => {}
     }
 
-    let execution = match execute_selected_root_receive_only_single_flight(
+    let execution = match execute_selected_root_receive_only_periodic_single_flight(
         provider,
         storage,
         sync_root,
@@ -1388,23 +1478,28 @@ where
     };
 
     match execution {
-        SelectedRootReceiveOnlySingleFlightResult::Busy => {
+        SelectedRootReceiveOnlyPeriodicSingleFlightResult::Busy => {
             state.schedule_busy_retry(now_unix_ms);
             Ok(SelectedRootReceiveOnlyPeriodicTick::Busy {
                 retry_after_ms: RECEIVE_ONLY_PERIODIC_BUSY_RETRY_MS,
             })
         }
-        SelectedRootReceiveOnlySingleFlightResult::Executed(execution) => {
+        SelectedRootReceiveOnlyPeriodicSingleFlightResult::Executed {
+            execution,
+            local_observation,
+        } => {
             if execution.manual_intervention_required {
                 state.pause_for_manual_intervention();
                 Ok(SelectedRootReceiveOnlyPeriodicTick::Executed {
                     execution,
+                    local_observation,
                     next_delay_ms: None,
                 })
             } else {
                 state.schedule_success(now_unix_ms);
                 Ok(SelectedRootReceiveOnlyPeriodicTick::Executed {
                     execution,
+                    local_observation,
                     next_delay_ms: Some(RECEIVE_ONLY_PERIODIC_POLL_INTERVAL_MS),
                 })
             }
@@ -1707,6 +1802,7 @@ pub fn materialize_selected_root_directories(
     }
 
     let root_path = validated_selected_root_path(sync_root)?;
+    storage.invalidate_sync_root_local_observation_baseline(&sync_root.id)?;
     let outcome = apply_selected_root_directory_targets(&root_path, &targets)?;
 
     let post_result = (|| {
@@ -1915,6 +2011,7 @@ pub fn materialize_selected_root_missing_files<P: SelectedRootContentProvider>(
     }
 
     let root_path = validated_selected_root_path(sync_root)?;
+    storage.invalidate_sync_root_local_observation_baseline(&sync_root.id)?;
     let mut completed = Vec::with_capacity(targets.len());
     let mut total_bytes = 0_u64;
 
@@ -2112,6 +2209,7 @@ pub fn materialize_selected_root_missing_file<P: SelectedRootContentProvider>(
     }
 
     let root_path = validated_selected_root_path(sync_root)?;
+    storage.invalidate_sync_root_local_observation_baseline(&sync_root.id)?;
     let outcome = apply_selected_root_file_target(
         provider,
         &root_path,
@@ -2853,6 +2951,7 @@ pub fn delete_selected_root_existing_directory(
         .ok_or(SelectedRootExecutorError::RemoteDirectoryDeletionPlanStaleReceiptCountMismatch)?;
 
     let root_path = validated_selected_root_path(sync_root)?;
+    storage.invalidate_sync_root_local_observation_baseline(&sync_root.id)?;
     delete_verified_stale_local_directory(&root_path, receipt)?;
 
     let receipt_deleted = storage.delete_sync_root_stale_directory_materialization_receipt(
@@ -2941,6 +3040,7 @@ pub fn delete_selected_root_stale_directories(
     }
 
     let root_path = validated_selected_root_path(sync_root)?;
+    storage.invalidate_sync_root_local_observation_baseline(&sync_root.id)?;
     let mut quarantined = Vec::with_capacity(stale_receipts.len());
 
     for receipt in &stale_receipts {
@@ -3440,6 +3540,7 @@ pub fn delete_selected_root_stale_files(
     }
 
     let root_path = validated_selected_root_path(sync_root)?;
+    storage.invalidate_sync_root_local_observation_baseline(&sync_root.id)?;
     let mut quarantined = Vec::with_capacity(stale_receipts.len());
     let mut total_bytes = 0_u64;
 
@@ -3702,6 +3803,7 @@ pub fn delete_selected_root_existing_file(
         .ok_or(SelectedRootExecutorError::RemoteDeletionPlanStaleReceiptCountMismatch)?;
 
     let root_path = validated_selected_root_path(sync_root)?;
+    storage.invalidate_sync_root_local_observation_baseline(&sync_root.id)?;
     let bytes_verified = delete_verified_stale_local_file(&root_path, receipt)?;
 
     let receipt_deleted = storage
@@ -3935,6 +4037,7 @@ pub fn replace_selected_root_stale_files<P: SelectedRootContentProvider>(
     let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
     let targets = plan_receive_only_existing_file_targets(&remote_items, &local_entries)?;
     let root_path = validated_selected_root_path(sync_root)?;
+    storage.invalidate_sync_root_local_observation_baseline(&sync_root.id)?;
 
     let mut completed = Vec::with_capacity(stale_receipts.len());
     let mut total_bytes = 0_u64;
@@ -4426,6 +4529,7 @@ pub fn replace_selected_root_existing_file<P: SelectedRootContentProvider>(
     }
 
     let root_path = validated_selected_root_path(sync_root)?;
+    storage.invalidate_sync_root_local_observation_baseline(&sync_root.id)?;
     let target_path = root_path.join(target.relative_path());
     if !target_path.starts_with(&root_path) {
         return Err(SelectedRootExecutorError::LocalFileTargetEscapedRoot);
@@ -5089,6 +5193,9 @@ pub fn plan_selected_root_local_inventory_diff(
     if !state.snapshot_complete {
         return Err(SelectedRootExecutorError::LocalDiffBaselineMissing);
     }
+    if !state.observation_valid {
+        return Err(SelectedRootExecutorError::LocalDiffBaselineInvalidated);
+    }
 
     let baseline = storage.list_sync_root_local_items(&sync_root.id)?;
     let baseline_count =
@@ -5302,7 +5409,7 @@ pub fn capture_selected_root_local_baseline(
     }
 
     let existing = storage.sync_root_local_inventory_state(&sync_root.id)?;
-    if existing.snapshot_complete {
+    if existing.snapshot_complete && existing.observation_valid {
         return Err(SelectedRootExecutorError::LocalBaselineAlreadyComplete);
     }
 
@@ -6396,6 +6503,8 @@ pub enum SelectedRootExecutorError {
     LocalDiffModeUnsupported,
     #[error("local inventory diff requires a durable baseline")]
     LocalDiffBaselineMissing,
+    #[error("local inventory baseline was invalidated by a ReceiveOnly filesystem mutation")]
+    LocalDiffBaselineInvalidated,
     #[error("local inventory baseline count mismatched durable state")]
     LocalDiffBaselineCountMismatch,
     #[error("local inventory diff scan changed while planning")]
@@ -9864,6 +9973,43 @@ mod phase5f4_local_journal_tests {
         assert_eq!(
             local_change_event_kind(SelectedRootLocalDiffKind::TypeChanged),
             LocalChangeEventKind::TypeChanged
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase5f5_periodic_local_observation_tests {
+    use super::*;
+
+    #[test]
+    fn phase5f5_local_observation_requires_fully_converged_receive_only_run() {
+        assert!(receive_only_execution_ready_for_local_observation(
+            true, false, false
+        ));
+        assert!(!receive_only_execution_ready_for_local_observation(
+            false, false, false
+        ));
+        assert!(!receive_only_execution_ready_for_local_observation(
+            true, true, false
+        ));
+        assert!(!receive_only_execution_ready_for_local_observation(
+            true, false, true
+        ));
+    }
+
+    #[test]
+    fn phase5f5_periodic_status_distinguishes_invalidated_baseline() {
+        assert_eq!(
+            SelectedRootPeriodicLocalObservation::BaselineMissing.as_str(),
+            "baseline_missing"
+        );
+        assert_eq!(
+            SelectedRootPeriodicLocalObservation::BaselineInvalidated.as_str(),
+            "baseline_invalidated"
+        );
+        assert_eq!(
+            SelectedRootPeriodicLocalObservation::DeferredUntilReceiveOnlyConverged.as_str(),
+            "deferred_until_receive_only_converged"
         );
     }
 }

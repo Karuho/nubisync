@@ -1164,11 +1164,12 @@ fn sync_roots_local_baseline() -> Result<(), CliError> {
     }
 
     let existing = storage.sync_root_local_inventory_state(&root.id)?;
-    if existing.snapshot_complete {
+    if existing.snapshot_complete && existing.observation_valid {
         println!("SYNC_ROOT_LOCAL_BASELINE=ALREADY_CAPTURED");
         println!("MODE=receive_only");
         println!("ITEMS_CAPTURED={}", existing.item_count);
         println!("SNAPSHOT_COMPLETE=yes");
+        println!("OBSERVATION_VALID=yes");
         println!("NETWORK_CHECK=not_performed");
         println!("DATABASE_MUTATION=no");
         println!("FILESYSTEM_READ=not_performed");
@@ -1184,7 +1185,14 @@ fn sync_roots_local_baseline() -> Result<(), CliError> {
         return Ok(());
     }
 
-    println!("SYNC_ROOT_LOCAL_BASELINE_STAGE=capture_metadata_snapshot");
+    println!(
+        "SYNC_ROOT_LOCAL_BASELINE_STAGE={}",
+        if existing.snapshot_complete {
+            "recapture_invalidated_baseline"
+        } else {
+            "capture_metadata_snapshot"
+        }
+    );
     let result = capture_selected_root_local_baseline(&mut storage, root, unix_time_ms()?)?;
 
     println!("SYNC_ROOT_LOCAL_BASELINE=PASS");
@@ -1194,6 +1202,7 @@ fn sync_roots_local_baseline() -> Result<(), CliError> {
     println!("DIRECTORIES_CAPTURED={}", result.directories_captured);
     println!("CONVERGENCE_ACTIONS={}", result.convergence_actions);
     println!("SNAPSHOT_COMPLETE={}", yes_no(result.snapshot_complete));
+    println!("OBSERVATION_VALID=yes");
     println!("NETWORK_CHECK=not_performed");
     println!("DATABASE_MUTATION=yes");
     println!("FILESYSTEM_READ=metadata_only");

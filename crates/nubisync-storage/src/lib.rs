@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
@@ -24,6 +24,7 @@ pub struct LocalInventoryState {
     pub item_count: u64,
     pub snapshot_completed_at_unix_ms: Option<i64>,
     pub generation: u64,
+    pub observation_valid: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +345,9 @@ impl Storage {
                 ),
                 snapshot_completed_at_unix_ms INTEGER,
                 generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+                observation_valid INTEGER NOT NULL DEFAULT 0 CHECK (
+                    observation_valid IN (0, 1)
+                ),
                 FOREIGN KEY (sync_root_id)
                     REFERENCES sync_roots(id)
                     ON DELETE CASCADE
@@ -613,6 +617,15 @@ impl Storage {
                 "UPDATE sync_root_local_inventory_state
                  SET generation = 1
                  WHERE snapshot_complete = 1",
+                [],
+            )?;
+        }
+
+        if current_version == 13 {
+            transaction.execute(
+                "ALTER TABLE sync_root_local_inventory_state
+                 ADD COLUMN observation_valid INTEGER NOT NULL DEFAULT 0
+                 CHECK (observation_valid IN (0, 1))",
                 [],
             )?;
         }
@@ -926,18 +939,28 @@ impl Storage {
         let item_count = i64::try_from(inserted).map_err(|_| StorageError::NumericOverflow)?;
 
         transaction.execute(
+            "UPDATE sync_root_local_change_events
+             SET status = 'superseded'
+             WHERE sync_root_id = ?1
+               AND status = 'pending'",
+            params![sync_root_id],
+        )?;
+
+        transaction.execute(
             "INSERT INTO sync_root_local_inventory_state (
                 sync_root_id,
                 snapshot_complete,
                 item_count,
                 snapshot_completed_at_unix_ms,
-                generation
-             ) VALUES (?1, 1, ?2, ?3, 1)
+                generation,
+                observation_valid
+             ) VALUES (?1, 1, ?2, ?3, 1, 1)
              ON CONFLICT(sync_root_id) DO UPDATE SET
                 snapshot_complete = 1,
                 item_count = excluded.item_count,
                 snapshot_completed_at_unix_ms = excluded.snapshot_completed_at_unix_ms,
-                generation = sync_root_local_inventory_state.generation + 1",
+                generation = sync_root_local_inventory_state.generation + 1,
+                observation_valid = 1",
             params![sync_root_id, item_count, completed_at_unix_ms],
         )?;
 
@@ -954,23 +977,32 @@ impl Storage {
         &self,
         sync_root_id: &str,
     ) -> Result<LocalInventoryState, StorageError> {
-        let row: Option<(i64, i64, Option<i64>, i64)> = self
+        let row: Option<(i64, i64, Option<i64>, i64, i64)> = self
             .connection
             .query_row(
                 "SELECT
                     snapshot_complete,
                     item_count,
                     snapshot_completed_at_unix_ms,
-                    generation
+                    generation,
+                    observation_valid
                  FROM sync_root_local_inventory_state
                  WHERE sync_root_id = ?1",
                 params![sync_root_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
 
         match row {
-            Some((snapshot_complete, item_count, completed_at, generation)) => {
+            Some((snapshot_complete, item_count, completed_at, generation, observation_valid)) => {
                 Ok(LocalInventoryState {
                     snapshot_complete: snapshot_complete != 0,
                     item_count: u64::try_from(item_count)
@@ -978,6 +1010,7 @@ impl Storage {
                     snapshot_completed_at_unix_ms: completed_at,
                     generation: u64::try_from(generation)
                         .map_err(|_| StorageError::NumericOverflow)?,
+                    observation_valid: observation_valid != 0,
                 })
             }
             None => Ok(LocalInventoryState {
@@ -985,8 +1018,24 @@ impl Storage {
                 item_count: 0,
                 snapshot_completed_at_unix_ms: None,
                 generation: 0,
+                observation_valid: false,
             }),
         }
+    }
+
+    pub fn invalidate_sync_root_local_observation_baseline(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<bool, StorageError> {
+        let updated = self.connection.execute(
+            "UPDATE sync_root_local_inventory_state
+             SET observation_valid = 0
+             WHERE sync_root_id = ?1
+               AND snapshot_complete = 1
+               AND observation_valid = 1",
+            params![sync_root_id],
+        )?;
+        Ok(updated != 0)
     }
 
     pub fn reconcile_sync_root_local_change_journal(
@@ -1005,21 +1054,37 @@ impl Storage {
 
         let transaction = self.connection.transaction()?;
 
-        let state: Option<(i64, i64, Option<i64>, i64)> = transaction
+        let state: Option<(i64, i64, Option<i64>, i64, i64)> = transaction
             .query_row(
-                "SELECT snapshot_complete, item_count, snapshot_completed_at_unix_ms, generation
+                "SELECT
+                    snapshot_complete,
+                    item_count,
+                    snapshot_completed_at_unix_ms,
+                    generation,
+                    observation_valid
                  FROM sync_root_local_inventory_state
                  WHERE sync_root_id = ?1",
                 params![sync_root_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
 
-        let Some((snapshot_complete, item_count, completed_at, generation)) = state else {
+        let Some((snapshot_complete, item_count, completed_at, generation, observation_valid)) =
+            state
+        else {
             return Err(StorageError::LocalChangeBaselineMismatch);
         };
 
         if snapshot_complete == 0
+            || observation_valid == 0
             || generation != expected_generation
             || item_count != expected_item_count
             || completed_at != expected_snapshot_completed_at_unix_ms
@@ -6272,9 +6337,9 @@ mod phase5c10_directory_receipt_tests {
     }
 
     #[test]
-    fn schema_v13_contains_directory_receipts() {
+    fn schema_v14_contains_directory_receipts() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 13);
+        assert_eq!(storage.schema_version().unwrap(), 14);
 
         let exists: i64 = storage
             .connection
@@ -6747,6 +6812,7 @@ mod phase5f1_local_inventory_tests {
         assert!(!initial.snapshot_complete);
         assert_eq!(initial.item_count, 0);
         assert_eq!(initial.generation, 0);
+        assert!(!initial.observation_valid);
 
         let items = vec![
             LocalItemSnapshot::new("docs", LocalItemKind::Directory, None, 100, 8, 40).unwrap(),
@@ -6784,6 +6850,7 @@ mod phase5f1_local_inventory_tests {
         assert_eq!(state.item_count, 2);
         assert_eq!(state.snapshot_completed_at_unix_ms, Some(11));
         assert_eq!(state.generation, 1);
+        assert!(state.observation_valid);
 
         let current = storage.list_sync_root_local_items(&root.id).unwrap();
         assert_eq!(current.len(), 2);
@@ -6819,12 +6886,13 @@ mod phase5f1_local_inventory_tests {
         assert_eq!(state.item_count, 1);
         assert_eq!(state.snapshot_completed_at_unix_ms, Some(21));
         assert_eq!(state.generation, 2);
+        assert!(state.observation_valid);
     }
 
     #[test]
-    fn phase5f1_schema_is_v13() {
+    fn phase5f1_schema_is_v14() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 13);
+        assert_eq!(storage.schema_version().unwrap(), 14);
     }
 }
 
@@ -6970,8 +7038,121 @@ mod phase5f4_local_journal_tests {
     }
 
     #[test]
-    fn phase5f4_schema_is_v13() {
+    fn phase5f4_schema_is_v14() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 13);
+        assert_eq!(storage.schema_version().unwrap(), 14);
+    }
+}
+
+#[cfg(test)]
+mod phase5f5_observation_fence_tests {
+    use super::*;
+
+    fn fixture() -> (Storage, SyncRoot) {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5f5-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5f5-root",
+            provider,
+            account.subject,
+            "/tmp/phase5f5-root",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let items = vec![
+            LocalItemSnapshot::new("docs", LocalItemKind::Directory, None, 100, 8, 40).unwrap(),
+            LocalItemSnapshot::new("docs/file.txt", LocalItemKind::File, Some(5), 101, 8, 41)
+                .unwrap(),
+        ];
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_local_inventory_items(&root.id, &items, 10)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 11)
+            .unwrap();
+
+        (storage, root)
+    }
+
+    #[test]
+    fn phase5f5_remote_mutation_fence_invalidates_until_supervised_rebaseline() {
+        let (mut storage, root) = fixture();
+
+        let before = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        assert!(before.observation_valid);
+        assert_eq!(before.generation, 1);
+
+        assert!(
+            storage
+                .invalidate_sync_root_local_observation_baseline(&root.id)
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .sync_root_local_inventory_state(&root.id)
+                .unwrap()
+                .observation_valid
+        );
+        assert!(
+            !storage
+                .invalidate_sync_root_local_observation_baseline(&root.id)
+                .unwrap()
+        );
+
+        let event = LocalChangeEventInput::new(
+            "created.txt",
+            LocalChangeEventKind::Created,
+            None,
+            Some(LocalItemKind::File),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            storage.reconcile_sync_root_local_change_journal(
+                &root.id,
+                before.generation,
+                before.item_count,
+                before.snapshot_completed_at_unix_ms,
+                &[event],
+                20,
+            ),
+            Err(StorageError::LocalChangeBaselineMismatch)
+        ));
+
+        let replacement = vec![
+            LocalItemSnapshot::new("docs", LocalItemKind::Directory, None, 200, 8, 40).unwrap(),
+            LocalItemSnapshot::new("docs/file.txt", LocalItemKind::File, Some(5), 201, 8, 41)
+                .unwrap(),
+        ];
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_local_inventory_items(&root.id, &replacement, 30)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 31)
+            .unwrap();
+
+        let after = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        assert_eq!(after.generation, 2);
+        assert!(after.observation_valid);
+    }
+
+    #[test]
+    fn phase5f5_schema_is_v14() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert_eq!(storage.schema_version().unwrap(), 14);
     }
 }

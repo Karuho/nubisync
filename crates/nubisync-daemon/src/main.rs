@@ -5,8 +5,9 @@
 use nubisync_auth::{KeyringSecretStore, SecretKey, SecretStore, SecretValue};
 use nubisync_core::{ProviderAccount, ProviderId, SyncMode, SyncRoot};
 use nubisync_daemon::{
-    SelectedRootReceiveOnlyPeriodicDecision, SelectedRootReceiveOnlyPeriodicState,
-    SelectedRootReceiveOnlyPeriodicTick, execute_selected_root_receive_only_periodic_tick,
+    SelectedRootPeriodicLocalObservation, SelectedRootReceiveOnlyPeriodicDecision,
+    SelectedRootReceiveOnlyPeriodicState, SelectedRootReceiveOnlyPeriodicTick,
+    execute_selected_root_receive_only_periodic_tick,
 };
 use nubisync_drive::{GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveApi, GoogleOAuthConfig, OAuthError};
 use nubisync_storage::Storage;
@@ -217,6 +218,7 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
         ) {
             Ok(SelectedRootReceiveOnlyPeriodicTick::Executed {
                 execution,
+                local_observation,
                 next_delay_ms,
             }) => {
                 executed_ticks = executed_ticks
@@ -253,6 +255,54 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "none".to_owned())
                 );
+
+                match local_observation {
+                    SelectedRootPeriodicLocalObservation::Journaled(observation) => {
+                        println!("LOCAL_OBSERVATION=PASS");
+                        println!("LOCAL_OBSERVATION_STATUS=journaled");
+                        println!("LOCAL_BASELINE_READY=yes");
+                        println!(
+                            "LOCAL_BASELINE_GENERATION={}",
+                            observation.baseline_generation
+                        );
+                        println!("LOCAL_CHANGES_TOTAL={}", observation.changes_total);
+                        println!("LOCAL_CREATED={}", observation.created);
+                        println!("LOCAL_DELETED={}", observation.deleted);
+                        println!("LOCAL_MODIFIED={}", observation.modified);
+                        println!("LOCAL_TYPE_CHANGED={}", observation.type_changed);
+                        println!("LOCAL_PENDING_EVENTS={}", observation.pending_events);
+                        println!("LOCAL_SUPERSEDED_EVENTS={}", observation.superseded_events);
+                        println!("LOCAL_DATABASE_MUTATION=yes");
+                        println!("LOCAL_FILESYSTEM_READ=metadata_only");
+                        println!("LOCAL_BASELINE_MUTATED=no");
+                    }
+                    SelectedRootPeriodicLocalObservation::BaselineMissing => {
+                        println!("LOCAL_OBSERVATION=SKIPPED");
+                        println!("LOCAL_OBSERVATION_STATUS=baseline_missing");
+                        println!("LOCAL_BASELINE_READY=no");
+                        println!("LOCAL_DATABASE_MUTATION=no");
+                        println!("LOCAL_FILESYSTEM_READ=not_performed");
+                        println!("LOCAL_BASELINE_MUTATED=no");
+                    }
+                    SelectedRootPeriodicLocalObservation::BaselineInvalidated => {
+                        println!("LOCAL_OBSERVATION=SKIPPED");
+                        println!("LOCAL_OBSERVATION_STATUS=baseline_invalidated");
+                        println!("LOCAL_BASELINE_READY=no");
+                        println!("LOCAL_REBASELINE_REQUIRED=yes");
+                        println!("LOCAL_DATABASE_MUTATION=no");
+                        println!("LOCAL_FILESYSTEM_READ=not_performed");
+                        println!("LOCAL_BASELINE_MUTATED=no");
+                    }
+                    SelectedRootPeriodicLocalObservation::DeferredUntilReceiveOnlyConverged => {
+                        println!("LOCAL_OBSERVATION=SKIPPED");
+                        println!("LOCAL_OBSERVATION_STATUS=deferred_until_receive_only_converged");
+                        println!("LOCAL_BASELINE_READY=unknown");
+                        println!("LOCAL_DATABASE_MUTATION=no");
+                        println!("LOCAL_FILESYSTEM_READ=not_performed");
+                        println!("LOCAL_BASELINE_MUTATED=no");
+                    }
+                }
+
                 println!("ROOT_PATH_PRINTED=no");
                 println!("LOCAL_NAMES_PRINTED=no");
                 println!("REMOTE_ROOT_ID_PRINTED=no");
