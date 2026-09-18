@@ -13,9 +13,9 @@ use nubisync_storage::{
     SyncRootDirectoryMaterializationReceipt, SyncRootFileMaterializationReceipt,
 };
 use nubisync_sync::{
-    LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyConvergencePlan,
-    ReceiveOnlyConvergencePlanError, ReceiveOnlyDirectoryTarget, ReceiveOnlyFileTarget,
-    ReceiveOnlyMaterializationPlan, ReceiveOnlyMaterializationPlanError,
+    LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyConvergenceActionKind,
+    ReceiveOnlyConvergencePlan, ReceiveOnlyConvergencePlanError, ReceiveOnlyDirectoryTarget,
+    ReceiveOnlyFileTarget, ReceiveOnlyMaterializationPlan, ReceiveOnlyMaterializationPlanError,
     ReceiveOnlyOwnershipReceipt, ReceiveOnlyReceiptState, RootCatalogMutationPlan,
     RootCatalogProjection, RootCatalogProjectionError, RootCatalogResolution, RootChangeMembership,
     plan_receive_only_directory_targets, plan_receive_only_existing_file_targets,
@@ -131,6 +131,17 @@ pub struct SelectedRootFileVerification {
     pub bytes_verified: u64,
     pub hash_match: bool,
     pub receipt_recorded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootFileBatchVerification {
+    pub planned_verification_actions: usize,
+    pub batch_action_limit: usize,
+    pub files_verified: usize,
+    pub bytes_verified: u64,
+    pub max_file_bytes: u64,
+    pub remote_content_hashes_verified: usize,
+    pub receipts_recorded: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3468,6 +3479,237 @@ fn inspect_receipt_target(
     Err(SelectedRootExecutorError::LocalReceiptPathInvalid)
 }
 
+pub fn verify_selected_root_existing_files<P: SelectedRootContentProvider>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootFileBatchVerification, SelectedRootExecutorError> {
+    let convergence = plan_selected_root_receive_only_convergence(storage, sync_root)?;
+
+    if convergence.blocked()
+        || convergence.verify_existing_files == 0
+        || convergence.verify_existing_files > SUPERVISED_FILE_BATCH_MAX_ACTIONS
+        || convergence.create_directories != 0
+        || convergence.materialize_missing_files != 0
+        || convergence.revalidate_stale_file_replacements != 0
+        || convergence.revalidate_stale_file_deletions != 0
+        || convergence.delete_owned_empty_directories != 0
+    {
+        return Err(SelectedRootExecutorError::LocalFileVerificationBatchNotReady);
+    }
+
+    let (remote_items, local_entries) = selected_root_materialization_inputs(storage, sync_root)?;
+    let materialization = plan_receive_only_materialization(&remote_items, &local_entries)?;
+
+    let expected_existing_files = convergence
+        .current_owned_files
+        .checked_add(convergence.verify_existing_files)
+        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+
+    if !materialization.ready_for_directory_phase()
+        || materialization.missing_directories != 0
+        || materialization.missing_files != 0
+        || materialization.matching_directories != materialization.remote_directories
+        || materialization.local_only_entries != 0
+        || materialization.type_conflicts != 0
+        || materialization.existing_files_unverified != expected_existing_files
+        || materialization.remote_files != expected_existing_files
+    {
+        return Err(SelectedRootExecutorError::LocalFileVerificationBatchNotReady);
+    }
+
+    let current_receipts_before = storage.sync_root_materialization_receipt_count(&sync_root.id)?;
+    if usize::try_from(current_receipts_before)
+        .map_err(|_| SelectedRootExecutorError::CountOverflow)?
+        != convergence.current_owned_files
+        || storage.sync_root_stale_materialization_receipt_count(&sync_root.id)? != 0
+    {
+        return Err(SelectedRootExecutorError::LocalFileVerificationBatchTargetMismatch);
+    }
+
+    let all_targets = plan_receive_only_existing_file_targets(&remote_items, &local_entries)?;
+    if all_targets.len() != expected_existing_files {
+        return Err(SelectedRootExecutorError::LocalFileVerificationBatchTargetMismatch);
+    }
+
+    let mut verification_targets = Vec::with_capacity(convergence.verify_existing_files);
+    let mut seen_remote_ids = HashSet::with_capacity(convergence.verify_existing_files);
+
+    for action in convergence
+        .actions()
+        .iter()
+        .filter(|action| action.kind() == ReceiveOnlyConvergenceActionKind::VerifyExistingFile)
+    {
+        let remote_id = action
+            .remote_id()
+            .ok_or(SelectedRootExecutorError::LocalFileVerificationBatchTargetMismatch)?;
+
+        if !seen_remote_ids.insert(remote_id.to_owned()) {
+            return Err(SelectedRootExecutorError::LocalFileVerificationBatchTargetMismatch);
+        }
+
+        let target = all_targets.iter().find(|target| {
+            target.remote_id() == remote_id && target.relative_path() == action.relative_path()
+        });
+
+        let Some(target) = target else {
+            return Err(SelectedRootExecutorError::LocalFileVerificationBatchTargetMismatch);
+        };
+
+        verification_targets.push(target.clone());
+    }
+
+    if verification_targets.len() != convergence.verify_existing_files
+        || verification_targets.len() > SUPERVISED_FILE_BATCH_MAX_ACTIONS
+    {
+        return Err(SelectedRootExecutorError::LocalFileVerificationBatchTargetMismatch);
+    }
+
+    let root_path = validated_selected_root_path(sync_root)?;
+    let mut receipt_rows = Vec::with_capacity(verification_targets.len());
+    let mut total_bytes = 0_u64;
+
+    for target in &verification_targets {
+        let (bytes_verified, sha256_hex) =
+            verify_existing_file_target_against_provider(provider, &root_path, target)?;
+
+        total_bytes = total_bytes
+            .checked_add(bytes_verified)
+            .ok_or(SelectedRootExecutorError::CountOverflow)?;
+
+        receipt_rows.push((
+            target.remote_id().to_owned(),
+            target.relative_path().to_owned(),
+            bytes_verified,
+            sha256_hex,
+        ));
+    }
+
+    let recorded = storage.record_sync_root_file_materializations(
+        &sync_root.id,
+        &receipt_rows,
+        current_unix_time_ms()?,
+    )?;
+
+    if recorded != receipt_rows.len() {
+        return Err(SelectedRootExecutorError::LocalFileVerificationBatchPostconditionFailed);
+    }
+
+    let expected_current_receipts = current_receipts_before
+        .checked_add(u64::try_from(recorded).map_err(|_| SelectedRootExecutorError::CountOverflow)?)
+        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+
+    if storage.sync_root_materialization_receipt_count(&sync_root.id)? != expected_current_receipts
+        || storage.sync_root_stale_materialization_receipt_count(&sync_root.id)? != 0
+    {
+        return Err(SelectedRootExecutorError::LocalFileVerificationBatchPostconditionFailed);
+    }
+
+    let post = plan_selected_root_receive_only_convergence(storage, sync_root)?;
+    if post.blocked()
+        || post.create_directories != 0
+        || post.materialize_missing_files != 0
+        || post.verify_existing_files != 0
+        || post.revalidate_stale_file_replacements != 0
+        || post.revalidate_stale_file_deletions != 0
+        || post.delete_owned_empty_directories != 0
+    {
+        return Err(SelectedRootExecutorError::LocalFileVerificationBatchPostconditionFailed);
+    }
+
+    Ok(SelectedRootFileBatchVerification {
+        planned_verification_actions: verification_targets.len(),
+        batch_action_limit: SUPERVISED_FILE_BATCH_MAX_ACTIONS,
+        files_verified: verification_targets.len(),
+        bytes_verified: total_bytes,
+        max_file_bytes: SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
+        remote_content_hashes_verified: verification_targets.len(),
+        receipts_recorded: recorded,
+    })
+}
+
+fn verify_existing_file_target_against_provider<P: SelectedRootContentProvider>(
+    provider: &P,
+    root_path: &Path,
+    target: &ReceiveOnlyFileTarget,
+) -> Result<(u64, String), SelectedRootExecutorError> {
+    let expected_size = target
+        .size_bytes()
+        .ok_or(SelectedRootExecutorError::LocalFileSizeUnknown)?;
+    if expected_size > SUPERVISED_FILE_DOWNLOAD_MAX_BYTES {
+        return Err(SelectedRootExecutorError::LocalFileTooLarge);
+    }
+
+    let target_path = root_path.join(target.relative_path());
+    if !target_path.starts_with(root_path) {
+        return Err(SelectedRootExecutorError::LocalFileTargetEscapedRoot);
+    }
+
+    let parent = target_path
+        .parent()
+        .ok_or(SelectedRootExecutorError::LocalFileParentInvalid)?;
+    let parent_meta = fs::symlink_metadata(parent)
+        .map_err(|_| SelectedRootExecutorError::LocalFileParentInvalid)?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+        return Err(SelectedRootExecutorError::LocalFileParentInvalid);
+    }
+
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|_| SelectedRootExecutorError::LocalFileParentInvalid)?;
+    if !canonical_parent.starts_with(root_path) {
+        return Err(SelectedRootExecutorError::LocalFileParentInvalid);
+    }
+
+    let metadata_before = fs::symlink_metadata(&target_path)
+        .map_err(|_| SelectedRootExecutorError::LocalFileVerifyFailed)?;
+    if metadata_before.file_type().is_symlink()
+        || !metadata_before.is_file()
+        || metadata_before.len() != expected_size
+    {
+        return Err(SelectedRootExecutorError::LocalFileVerifyFailed);
+    }
+
+    let (local_bytes, local_sha256) =
+        hash_local_file(&target_path, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES)?;
+    if local_bytes != expected_size {
+        return Err(SelectedRootExecutorError::LocalFileDownloadSizeMismatch);
+    }
+
+    let metadata_after_local = fs::symlink_metadata(&target_path)
+        .map_err(|_| SelectedRootExecutorError::LocalFileVerificationTargetRace)?;
+    if !same_local_file_state(&metadata_before, &metadata_after_local) {
+        return Err(SelectedRootExecutorError::LocalFileVerificationTargetRace);
+    }
+
+    let mut remote_sink = HashingWriter::new(std::io::sink());
+    let provider_bytes = provider.download_file_content(
+        target.remote_id(),
+        SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
+        &mut remote_sink,
+    )?;
+    let hashed_bytes = remote_sink.bytes_written();
+    let remote_sha256 = remote_sink.finish_hex();
+
+    if provider_bytes != hashed_bytes {
+        return Err(SelectedRootExecutorError::LocalFileProviderByteCountMismatch);
+    }
+    if provider_bytes != expected_size {
+        return Err(SelectedRootExecutorError::LocalFileDownloadSizeMismatch);
+    }
+
+    let metadata_after_remote = fs::symlink_metadata(&target_path)
+        .map_err(|_| SelectedRootExecutorError::LocalFileVerificationTargetRace)?;
+    if !same_local_file_state(&metadata_after_local, &metadata_after_remote) {
+        return Err(SelectedRootExecutorError::LocalFileVerificationTargetRace);
+    }
+
+    if local_sha256 != remote_sha256 {
+        return Err(SelectedRootExecutorError::LocalFileHashMismatch);
+    }
+
+    Ok((local_bytes, local_sha256))
+}
+
 pub fn verify_selected_root_existing_file<P: SelectedRootContentProvider>(
     provider: &P,
     storage: &mut Storage,
@@ -4535,6 +4777,14 @@ pub enum SelectedRootExecutorError {
     LocalFileProviderByteCountMismatch,
     #[error("local file verification is blocked by the current receive-only state")]
     LocalFileVerificationPhaseBlocked,
+    #[error("bounded existing-file verification is not ready for supervised execution")]
+    LocalFileVerificationBatchNotReady,
+    #[error("bounded existing-file verification targets do not match convergence authority")]
+    LocalFileVerificationBatchTargetMismatch,
+    #[error("existing local verification target changed during supervised verification")]
+    LocalFileVerificationTargetRace,
+    #[error("bounded existing-file verification failed its durable postcondition")]
+    LocalFileVerificationBatchPostconditionFailed,
     #[error("local file verification failed")]
     LocalFileVerifyFailed,
     #[error("local file SHA-256 does not match current remote content")]
@@ -6818,6 +7068,290 @@ mod phase5d7_directory_batch_tests {
         fs::remove_file(local_root.join("dir-b/blocker.txt")).unwrap();
         fs::remove_dir(local_root.join("dir-a")).unwrap();
         fs::remove_dir(local_root.join("dir-b")).unwrap();
+        fs::remove_dir(local_root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod phase5d8_file_batch_verification_tests {
+    use super::*;
+    use nubisync_core::{ProviderAccount, ProviderId, SyncMode};
+    use std::collections::HashMap;
+
+    struct Phase5d8RootProvider;
+
+    impl SelectedRootProvider for Phase5d8RootProvider {
+        type RootIdentity = String;
+
+        fn resolve_root(
+            &self,
+            _remote_root_id: &str,
+        ) -> Result<Self::RootIdentity, SelectedRootExecutorError> {
+            Ok("canonical-root".into())
+        }
+
+        fn canonical_root_id<'a>(&self, root: &'a Self::RootIdentity) -> &'a str {
+            root.as_str()
+        }
+
+        fn resolve_membership(
+            &self,
+            item: &RemoteItem,
+            root: &Self::RootIdentity,
+        ) -> Result<RootChangeMembership, SelectedRootExecutorError> {
+            if item.remote_id == *root {
+                Ok(RootChangeMembership::Root)
+            } else if item.parent_remote_id.as_deref() == Some(root.as_str()) {
+                Ok(RootChangeMembership::Descendant)
+            } else {
+                Ok(RootChangeMembership::Outside)
+            }
+        }
+
+        fn hydrate_folder(
+            &self,
+            item: &RemoteItem,
+        ) -> Result<Vec<RemoteItem>, SelectedRootExecutorError> {
+            Ok(vec![item.clone()])
+        }
+    }
+
+    struct Phase5d8ContentProvider {
+        blobs: HashMap<String, Vec<u8>>,
+        fail_on: Option<String>,
+    }
+
+    impl SelectedRootContentProvider for Phase5d8ContentProvider {
+        fn content_fingerprint(
+            &self,
+            remote_id: &str,
+        ) -> Result<SelectedRootContentFingerprint, SelectedRootExecutorError> {
+            let bytes = self
+                .blobs
+                .get(remote_id)
+                .ok_or(SelectedRootExecutorError::ProviderOperationFailed)?;
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+
+            Ok(SelectedRootContentFingerprint {
+                size_bytes: u64::try_from(bytes.len())
+                    .map_err(|_| SelectedRootExecutorError::CountOverflow)?,
+                sha256_hex: digest_to_hex(hasher.finalize().as_slice()),
+            })
+        }
+
+        fn download_file_content(
+            &self,
+            remote_id: &str,
+            max_bytes: u64,
+            writer: &mut dyn Write,
+        ) -> Result<u64, SelectedRootExecutorError> {
+            if self.fail_on.as_deref() == Some(remote_id) {
+                return Err(SelectedRootExecutorError::ProviderOperationFailed);
+            }
+
+            let bytes = self
+                .blobs
+                .get(remote_id)
+                .ok_or(SelectedRootExecutorError::ProviderOperationFailed)?;
+            let len =
+                u64::try_from(bytes.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+            if len > max_bytes {
+                return Err(SelectedRootExecutorError::LocalFileTooLarge);
+            }
+
+            writer
+                .write_all(bytes)
+                .map_err(|_| SelectedRootExecutorError::ProviderOperationFailed)?;
+            Ok(len)
+        }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nubisync-phase5d8-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn remote_file(remote_id: &str, name: &str, size: usize) -> RemoteItem {
+        RemoteItem {
+            remote_id: remote_id.into(),
+            parent_remote_id: Some("canonical-root".into()),
+            name: name.into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(u64::try_from(size).unwrap()),
+            modified_unix_ms: None,
+            trashed: false,
+        }
+    }
+
+    fn fixture(label: &str) -> (Storage, SyncRoot, PathBuf, HashMap<String, Vec<u8>>) {
+        let local_root = temp_root(label);
+        fs::create_dir(&local_root).unwrap();
+        let local_root = fs::canonicalize(local_root).unwrap();
+
+        let a = b"phase-5d8-a".to_vec();
+        let b = b"phase-5d8-bb".to_vec();
+        fs::write(local_root.join("a.txt"), &a).unwrap();
+        fs::write(local_root.join("b.txt"), &b).unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider_id = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider_id.clone(), "phase5d8-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5d8-root",
+            provider_id,
+            account.subject,
+            local_root.to_str().unwrap(),
+            Some("canonical-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let remote_items = vec![
+            remote_file("file-a", "a.txt", a.len()),
+            remote_file("file-b", "b.txt", b.len()),
+        ];
+
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(&root.id, &remote_items, 3)
+            .unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(
+                &root.id,
+                &ChangeCursor::new("phase5d8-fence").unwrap(),
+                4,
+            )
+            .unwrap();
+
+        let root_provider = Phase5d8RootProvider;
+        execute_selected_root_change_batch(
+            &root_provider,
+            &mut storage,
+            &root,
+            &ChangeCursor::new("phase5d8-fence").unwrap(),
+            &[],
+            &ChangeCursor::new("phase5d8-ready").unwrap(),
+            5,
+        )
+        .unwrap();
+
+        let blobs = HashMap::from([("file-a".to_string(), a), ("file-b".to_string(), b)]);
+
+        (storage, root, local_root, blobs)
+    }
+
+    #[test]
+    fn phase5d8_bounded_verification_records_two_receipts_and_converges() {
+        let (mut storage, root, local_root, blobs) = fixture("success");
+
+        let pre = plan_selected_root_receive_only_convergence(&storage, &root).unwrap();
+        assert!(!pre.blocked());
+        assert_eq!(pre.verify_existing_files, 2);
+        assert_eq!(pre.current_owned_files, 0);
+        assert_eq!(pre.action_count(), 2);
+
+        let provider = Phase5d8ContentProvider {
+            blobs: blobs.clone(),
+            fail_on: None,
+        };
+
+        let result = verify_selected_root_existing_files(&provider, &mut storage, &root).unwrap();
+
+        assert_eq!(result.planned_verification_actions, 2);
+        assert_eq!(result.batch_action_limit, SUPERVISED_FILE_BATCH_MAX_ACTIONS);
+        assert_eq!(result.files_verified, 2);
+        assert_eq!(
+            result.bytes_verified,
+            u64::try_from(blobs["file-a"].len() + blobs["file-b"].len()).unwrap()
+        );
+        assert_eq!(result.max_file_bytes, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES);
+        assert_eq!(result.remote_content_hashes_verified, 2);
+        assert_eq!(result.receipts_recorded, 2);
+
+        assert_eq!(fs::read(local_root.join("a.txt")).unwrap(), blobs["file-a"]);
+        assert_eq!(fs::read(local_root.join("b.txt")).unwrap(), blobs["file-b"]);
+        assert_eq!(
+            storage
+                .sync_root_materialization_receipt_count(&root.id)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+
+        let post = plan_selected_root_receive_only_convergence(&storage, &root).unwrap();
+        assert!(!post.blocked());
+        assert_eq!(post.create_directories, 0);
+        assert_eq!(post.materialize_missing_files, 0);
+        assert_eq!(post.verify_existing_files, 0);
+        assert_eq!(post.revalidate_stale_file_replacements, 0);
+        assert_eq!(post.revalidate_stale_file_deletions, 0);
+        assert_eq!(post.delete_owned_empty_directories, 0);
+        assert_eq!(post.current_owned_files, 2);
+        assert_eq!(post.action_count(), 0);
+
+        fs::remove_file(local_root.join("a.txt")).unwrap();
+        fs::remove_file(local_root.join("b.txt")).unwrap();
+        fs::remove_dir(local_root).unwrap();
+    }
+
+    #[test]
+    fn phase5d8_provider_failure_records_no_partial_receipts() {
+        let (mut storage, root, local_root, blobs) = fixture("provider-failure");
+
+        let provider = Phase5d8ContentProvider {
+            blobs: blobs.clone(),
+            fail_on: Some("file-b".into()),
+        };
+
+        let error =
+            verify_selected_root_existing_files(&provider, &mut storage, &root).unwrap_err();
+        assert!(matches!(
+            error,
+            SelectedRootExecutorError::ProviderOperationFailed
+        ));
+
+        assert_eq!(
+            storage
+                .sync_root_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_stale_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+
+        let convergence = plan_selected_root_receive_only_convergence(&storage, &root).unwrap();
+        assert!(!convergence.blocked());
+        assert_eq!(convergence.verify_existing_files, 2);
+        assert_eq!(convergence.action_count(), 2);
+
+        assert_eq!(fs::read(local_root.join("a.txt")).unwrap(), blobs["file-a"]);
+        assert_eq!(fs::read(local_root.join("b.txt")).unwrap(), blobs["file-b"]);
+
+        fs::remove_file(local_root.join("a.txt")).unwrap();
+        fs::remove_file(local_root.join("b.txt")).unwrap();
         fs::remove_dir(local_root).unwrap();
     }
 }
