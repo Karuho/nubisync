@@ -15,11 +15,12 @@ use nubisync_daemon::{
     collect_selected_root_change_window_page, delete_selected_root_existing_directory,
     delete_selected_root_existing_file, delete_selected_root_stale_directories,
     delete_selected_root_stale_files, execute_completed_selected_root_change_window,
-    materialize_selected_root_directories, materialize_selected_root_missing_file,
-    materialize_selected_root_missing_files, plan_selected_root_local_materialization,
-    plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
-    plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
-    plan_selected_root_stale_files, replace_selected_root_existing_file,
+    execute_selected_root_unified_convergence_step, materialize_selected_root_directories,
+    materialize_selected_root_missing_file, materialize_selected_root_missing_files,
+    plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
+    plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
+    plan_selected_root_remote_replacement, plan_selected_root_stale_files,
+    plan_selected_root_unified_convergence_step, replace_selected_root_existing_file,
     replace_selected_root_stale_files, verify_selected_root_existing_file,
     verify_selected_root_existing_files, verify_selected_root_local_receipts,
 };
@@ -109,6 +110,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_convergence_plan()
+        }
+        [sync, roots, converge, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && converge == "converge"
+                && approve == "--approve" =>
+        {
+            sync_roots_converge()
         }
         [sync, roots, stale_files_plan, approve]
             if sync == "sync"
@@ -343,6 +352,7 @@ USAGE:
   nubisync sync roots status
   nubisync sync roots metadata-step --approve
   nubisync sync roots convergence-plan --approve
+  nubisync sync roots converge --approve
   nubisync sync roots stale-files-plan --approve
   nubisync sync roots replace-stale-files --approve
   nubisync sync roots delete-stale-files --approve
@@ -804,6 +814,152 @@ fn sync_roots_convergence_plan() -> Result<(), CliError> {
     println!("FILESYSTEM_READ=metadata_only");
     println!("FILESYSTEM_MUTATION=no");
     println!("FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_converge() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_UNIFIED_CONVERGENCE=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    let decision = plan_selected_root_unified_convergence_step(&storage, root)?;
+    let provider_required = decision.requires_content_provider();
+
+    let result = if provider_required {
+        ensure_keyring_available()?;
+        let keyring = KeyringSecretStore::default();
+        let refresh_key = refresh_token_key(&account.subject)?;
+        let refresh_token = required_secret_utf8(
+            keyring.get(&refresh_key)?,
+            CliError::MissingStoredRefreshToken,
+        )?;
+        let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+        println!("SYNC_ROOT_UNIFIED_CONVERGENCE_STAGE=refresh_access_token");
+        let oauth = GoogleOAuthConfig::new(client_id)?;
+        let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+        if let Some(scope) = tokens.scope()
+            && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+        {
+            return Err(CliError::GoogleReadonlyScopeNotGranted);
+        }
+        if let Some(rotated_refresh_token) = tokens.refresh_token() {
+            keyring.put(
+                &refresh_key,
+                SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+            )?;
+        }
+
+        println!("SYNC_ROOT_UNIFIED_CONVERGENCE_STAGE=verify_account");
+        let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+        let user = api.user_info()?;
+        if user.sub != account.subject {
+            return Err(CliError::GoogleAccountMismatch);
+        }
+
+        println!("SYNC_ROOT_UNIFIED_CONVERGENCE_STAGE=execute_one_phase");
+        execute_selected_root_unified_convergence_step(Some(&api), &mut storage, root)?
+    } else {
+        println!("SYNC_ROOT_UNIFIED_CONVERGENCE_STAGE=execute_one_phase");
+        execute_selected_root_unified_convergence_step::<GoogleDriveApi>(None, &mut storage, root)?
+    };
+
+    let filesystem_mutation = result.directories_created != 0
+        || result.files_materialized != 0
+        || result.files_replaced != 0
+        || result.files_deleted != 0
+        || result.directories_deleted != 0;
+
+    println!("SYNC_ROOT_UNIFIED_CONVERGENCE=PASS");
+    println!("MODE=receive_only");
+    println!("DISPATCH_POLICY=one_action_class_per_approval");
+    println!("INITIAL_ACTIONS={}", result.initial_actions);
+    println!(
+        "PHASE_EXECUTED={}",
+        result
+            .phase_executed
+            .map(|phase| phase.as_str())
+            .unwrap_or("none")
+    );
+    println!("PHASE_ACTIONS_PLANNED={}", result.phase_actions_planned);
+    println!("PHASE_ACTIONS_EXECUTED={}", result.phase_actions_executed);
+    println!("DIRECTORIES_CREATED={}", result.directories_created);
+    println!("FILES_MATERIALIZED={}", result.files_materialized);
+    println!("FILES_VERIFIED={}", result.files_verified);
+    println!("FILES_REPLACED={}", result.files_replaced);
+    println!("FILES_DELETED={}", result.files_deleted);
+    println!("DIRECTORIES_DELETED={}", result.directories_deleted);
+    println!("BYTES_DOWNLOADED={}", result.bytes_downloaded);
+    println!("BYTES_VERIFIED={}", result.bytes_verified);
+    println!("RECEIPTS_RECORDED={}", result.receipts_recorded);
+    println!("RECEIPTS_DELETED={}", result.receipts_deleted);
+    println!("FINAL_ACTIONS={}", result.final_actions);
+    println!("FINAL_BLOCKED_ACTIONS={}", result.final_blocked_actions);
+    println!(
+        "NEXT_PHASE={}",
+        result
+            .next_phase
+            .map(|phase| phase.as_str())
+            .unwrap_or("none")
+    );
+    println!("CONVERGED={}", yes_no(result.converged));
+    println!(
+        "REQUIRES_ANOTHER_INVOCATION={}",
+        yes_no(result.requires_another_invocation)
+    );
+    println!(
+        "MANUAL_INTERVENTION_REQUIRED={}",
+        yes_no(result.manual_intervention_required)
+    );
+    println!("STOP_REASON={}", result.stop_reason.as_str());
+    println!(
+        "NETWORK_CHECK={}",
+        if provider_required {
+            "performed"
+        } else {
+            "not_performed"
+        }
+    );
+    println!(
+        "DATABASE_MUTATION={}",
+        yes_no(result.receipts_recorded != 0 || result.receipts_deleted != 0)
+    );
+    println!("FILESYSTEM_MUTATION={}", yes_no(filesystem_mutation));
     println!("ROOT_PATH_PRINTED=no");
     println!("LOCAL_NAMES_PRINTED=no");
     println!("REMOTE_ROOT_ID_PRINTED=no");

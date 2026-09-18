@@ -145,6 +145,103 @@ pub struct SelectedRootFileBatchVerification {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootUnifiedConvergencePhase {
+    CreateDirectories,
+    MaterializeMissingFiles,
+    VerifyExistingFiles,
+    ReplaceStaleFiles,
+    DeleteStaleFiles,
+    DeleteStaleDirectories,
+}
+
+impl SelectedRootUnifiedConvergencePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateDirectories => "create_directories",
+            Self::MaterializeMissingFiles => "materialize_missing_files",
+            Self::VerifyExistingFiles => "verify_existing_files",
+            Self::ReplaceStaleFiles => "replace_stale_files",
+            Self::DeleteStaleFiles => "delete_stale_files",
+            Self::DeleteStaleDirectories => "delete_stale_directories",
+        }
+    }
+
+    pub fn requires_content_provider(self) -> bool {
+        matches!(
+            self,
+            Self::MaterializeMissingFiles | Self::VerifyExistingFiles | Self::ReplaceStaleFiles
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootUnifiedConvergenceStopReason {
+    Converged,
+    PhaseCompleted,
+    MixedActionClasses,
+    BatchActionLimitExceeded,
+    BlockedAfterPhase,
+}
+
+impl SelectedRootUnifiedConvergenceStopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Converged => "converged",
+            Self::PhaseCompleted => "phase_completed",
+            Self::MixedActionClasses => "mixed_action_classes",
+            Self::BatchActionLimitExceeded => "batch_action_limit_exceeded",
+            Self::BlockedAfterPhase => "blocked_after_phase",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootUnifiedConvergenceDecision {
+    Converged,
+    Dispatch {
+        phase: SelectedRootUnifiedConvergencePhase,
+        planned_actions: usize,
+    },
+    SafeStop {
+        reason: SelectedRootUnifiedConvergenceStopReason,
+    },
+}
+
+impl SelectedRootUnifiedConvergenceDecision {
+    pub fn requires_content_provider(self) -> bool {
+        match self {
+            Self::Dispatch { phase, .. } => phase.requires_content_provider(),
+            Self::Converged | Self::SafeStop { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootUnifiedConvergenceExecution {
+    pub initial_actions: usize,
+    pub phase_executed: Option<SelectedRootUnifiedConvergencePhase>,
+    pub phase_actions_planned: usize,
+    pub phase_actions_executed: usize,
+    pub directories_created: usize,
+    pub files_materialized: usize,
+    pub files_verified: usize,
+    pub files_replaced: usize,
+    pub files_deleted: usize,
+    pub directories_deleted: usize,
+    pub bytes_downloaded: u64,
+    pub bytes_verified: u64,
+    pub receipts_recorded: usize,
+    pub receipts_deleted: usize,
+    pub final_actions: usize,
+    pub final_blocked_actions: usize,
+    pub next_phase: Option<SelectedRootUnifiedConvergencePhase>,
+    pub converged: bool,
+    pub requires_another_invocation: bool,
+    pub manual_intervention_required: bool,
+    pub stop_reason: SelectedRootUnifiedConvergenceStopReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectedRootLocalReceiptVerification {
     pub receipts_total: usize,
     pub files_matching_receipt: usize,
@@ -396,6 +493,271 @@ pub fn plan_selected_root_receive_only_convergence(
         SELECTED_ROOT_CONVERGENCE_MAX_ACTIONS,
     )
     .map_err(SelectedRootExecutorError::from)
+}
+
+pub fn plan_selected_root_unified_convergence_step(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootUnifiedConvergenceDecision, SelectedRootExecutorError> {
+    let plan = plan_selected_root_receive_only_convergence(storage, sync_root)?;
+    decide_selected_root_unified_convergence_step(&plan)
+}
+
+fn decide_selected_root_unified_convergence_step(
+    plan: &ReceiveOnlyConvergencePlan,
+) -> Result<SelectedRootUnifiedConvergenceDecision, SelectedRootExecutorError> {
+    if plan.blocked() {
+        return Err(SelectedRootExecutorError::UnifiedConvergenceBlocked);
+    }
+
+    if plan.action_count() == 0 {
+        return Ok(SelectedRootUnifiedConvergenceDecision::Converged);
+    }
+
+    if plan.create_directories != 0 {
+        return Ok(SelectedRootUnifiedConvergenceDecision::Dispatch {
+            phase: SelectedRootUnifiedConvergencePhase::CreateDirectories,
+            planned_actions: plan.create_directories,
+        });
+    }
+
+    let active_classes = [
+        plan.materialize_missing_files != 0,
+        plan.verify_existing_files != 0,
+        plan.revalidate_stale_file_replacements != 0,
+        plan.revalidate_stale_file_deletions != 0,
+        plan.delete_owned_empty_directories != 0,
+    ]
+    .into_iter()
+    .filter(|active| *active)
+    .count();
+
+    if active_classes != 1 {
+        return Ok(SelectedRootUnifiedConvergenceDecision::SafeStop {
+            reason: SelectedRootUnifiedConvergenceStopReason::MixedActionClasses,
+        });
+    }
+
+    let (phase, planned_actions, max_actions) = if plan.materialize_missing_files != 0 {
+        (
+            SelectedRootUnifiedConvergencePhase::MaterializeMissingFiles,
+            plan.materialize_missing_files,
+            SUPERVISED_FILE_BATCH_MAX_ACTIONS,
+        )
+    } else if plan.verify_existing_files != 0 {
+        (
+            SelectedRootUnifiedConvergencePhase::VerifyExistingFiles,
+            plan.verify_existing_files,
+            SUPERVISED_FILE_BATCH_MAX_ACTIONS,
+        )
+    } else if plan.revalidate_stale_file_replacements != 0 {
+        (
+            SelectedRootUnifiedConvergencePhase::ReplaceStaleFiles,
+            plan.revalidate_stale_file_replacements,
+            SUPERVISED_STALE_FILE_PLAN_MAX_ACTIONS,
+        )
+    } else if plan.revalidate_stale_file_deletions != 0 {
+        (
+            SelectedRootUnifiedConvergencePhase::DeleteStaleFiles,
+            plan.revalidate_stale_file_deletions,
+            SUPERVISED_STALE_FILE_PLAN_MAX_ACTIONS,
+        )
+    } else {
+        (
+            SelectedRootUnifiedConvergencePhase::DeleteStaleDirectories,
+            plan.delete_owned_empty_directories,
+            SUPERVISED_STALE_DIRECTORY_DELETION_MAX_ACTIONS,
+        )
+    };
+
+    if planned_actions > max_actions {
+        return Ok(SelectedRootUnifiedConvergenceDecision::SafeStop {
+            reason: SelectedRootUnifiedConvergenceStopReason::BatchActionLimitExceeded,
+        });
+    }
+
+    Ok(SelectedRootUnifiedConvergenceDecision::Dispatch {
+        phase,
+        planned_actions,
+    })
+}
+
+pub fn execute_selected_root_unified_convergence_step<P: SelectedRootContentProvider>(
+    provider: Option<&P>,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+) -> Result<SelectedRootUnifiedConvergenceExecution, SelectedRootExecutorError> {
+    let initial_plan = plan_selected_root_receive_only_convergence(storage, sync_root)?;
+    let initial_actions = initial_plan.action_count();
+    let decision = decide_selected_root_unified_convergence_step(&initial_plan)?;
+
+    match decision {
+        SelectedRootUnifiedConvergenceDecision::Converged => {
+            return Ok(SelectedRootUnifiedConvergenceExecution {
+                initial_actions,
+                phase_executed: None,
+                phase_actions_planned: 0,
+                phase_actions_executed: 0,
+                directories_created: 0,
+                files_materialized: 0,
+                files_verified: 0,
+                files_replaced: 0,
+                files_deleted: 0,
+                directories_deleted: 0,
+                bytes_downloaded: 0,
+                bytes_verified: 0,
+                receipts_recorded: 0,
+                receipts_deleted: 0,
+                final_actions: 0,
+                final_blocked_actions: 0,
+                next_phase: None,
+                converged: true,
+                requires_another_invocation: false,
+                manual_intervention_required: false,
+                stop_reason: SelectedRootUnifiedConvergenceStopReason::Converged,
+            });
+        }
+        SelectedRootUnifiedConvergenceDecision::SafeStop { reason } => {
+            return Ok(SelectedRootUnifiedConvergenceExecution {
+                initial_actions,
+                phase_executed: None,
+                phase_actions_planned: 0,
+                phase_actions_executed: 0,
+                directories_created: 0,
+                files_materialized: 0,
+                files_verified: 0,
+                files_replaced: 0,
+                files_deleted: 0,
+                directories_deleted: 0,
+                bytes_downloaded: 0,
+                bytes_verified: 0,
+                receipts_recorded: 0,
+                receipts_deleted: 0,
+                final_actions: initial_actions,
+                final_blocked_actions: initial_plan.blocked_actions,
+                next_phase: None,
+                converged: false,
+                requires_another_invocation: false,
+                manual_intervention_required: true,
+                stop_reason: reason,
+            });
+        }
+        SelectedRootUnifiedConvergenceDecision::Dispatch {
+            phase,
+            planned_actions,
+        } => {
+            if phase.requires_content_provider() && provider.is_none() {
+                return Err(SelectedRootExecutorError::UnifiedConvergenceProviderRequired);
+            }
+
+            let mut execution = SelectedRootUnifiedConvergenceExecution {
+                initial_actions,
+                phase_executed: Some(phase),
+                phase_actions_planned: planned_actions,
+                phase_actions_executed: 0,
+                directories_created: 0,
+                files_materialized: 0,
+                files_verified: 0,
+                files_replaced: 0,
+                files_deleted: 0,
+                directories_deleted: 0,
+                bytes_downloaded: 0,
+                bytes_verified: 0,
+                receipts_recorded: 0,
+                receipts_deleted: 0,
+                final_actions: initial_actions,
+                final_blocked_actions: initial_plan.blocked_actions,
+                next_phase: None,
+                converged: false,
+                requires_another_invocation: false,
+                manual_intervention_required: false,
+                stop_reason: SelectedRootUnifiedConvergenceStopReason::PhaseCompleted,
+            };
+
+            match phase {
+                SelectedRootUnifiedConvergencePhase::CreateDirectories => {
+                    let result = materialize_selected_root_directories(storage, sync_root)?;
+                    execution.phase_actions_executed = result.created_directories;
+                    execution.directories_created = result.created_directories;
+                    execution.receipts_recorded = result.created_directories;
+                }
+                SelectedRootUnifiedConvergencePhase::MaterializeMissingFiles => {
+                    let provider = provider
+                        .ok_or(SelectedRootExecutorError::UnifiedConvergenceProviderRequired)?;
+                    let result =
+                        materialize_selected_root_missing_files(provider, storage, sync_root)?;
+                    execution.phase_actions_executed = result.files_downloaded;
+                    execution.files_materialized = result.files_downloaded;
+                    execution.bytes_downloaded = result.bytes_downloaded;
+                    execution.receipts_recorded = result.receipts_recorded;
+                }
+                SelectedRootUnifiedConvergencePhase::VerifyExistingFiles => {
+                    let provider = provider
+                        .ok_or(SelectedRootExecutorError::UnifiedConvergenceProviderRequired)?;
+                    let result = verify_selected_root_existing_files(provider, storage, sync_root)?;
+                    execution.phase_actions_executed = result.files_verified;
+                    execution.files_verified = result.files_verified;
+                    execution.bytes_verified = result.bytes_verified;
+                    execution.receipts_recorded = result.receipts_recorded;
+                }
+                SelectedRootUnifiedConvergencePhase::ReplaceStaleFiles => {
+                    let provider = provider
+                        .ok_or(SelectedRootExecutorError::UnifiedConvergenceProviderRequired)?;
+                    let result = replace_selected_root_stale_files(provider, storage, sync_root)?;
+                    execution.phase_actions_executed = result.files_replaced;
+                    execution.files_replaced = result.files_replaced;
+                    execution.bytes_downloaded = result.bytes_downloaded;
+                    execution.receipts_recorded = result.receipts_recorded;
+                }
+                SelectedRootUnifiedConvergencePhase::DeleteStaleFiles => {
+                    let result = delete_selected_root_stale_files(storage, sync_root)?;
+                    execution.phase_actions_executed = result.files_deleted;
+                    execution.files_deleted = result.files_deleted;
+                    execution.bytes_verified = result.bytes_verified;
+                    execution.receipts_deleted = result.receipts_deleted;
+                }
+                SelectedRootUnifiedConvergencePhase::DeleteStaleDirectories => {
+                    let result = delete_selected_root_stale_directories(storage, sync_root)?;
+                    execution.phase_actions_executed = result.directories_deleted;
+                    execution.directories_deleted = result.directories_deleted;
+                    execution.receipts_deleted = result.receipts_deleted;
+                }
+            }
+
+            if execution.phase_actions_executed != planned_actions {
+                return Err(SelectedRootExecutorError::UnifiedConvergencePhaseCountMismatch);
+            }
+
+            let final_plan = plan_selected_root_receive_only_convergence(storage, sync_root)?;
+            execution.final_actions = final_plan.action_count();
+            execution.final_blocked_actions = final_plan.blocked_actions;
+
+            if final_plan.blocked() {
+                execution.stop_reason = SelectedRootUnifiedConvergenceStopReason::BlockedAfterPhase;
+                execution.manual_intervention_required = true;
+                return Ok(execution);
+            }
+
+            match decide_selected_root_unified_convergence_step(&final_plan)? {
+                SelectedRootUnifiedConvergenceDecision::Converged => {
+                    execution.converged = true;
+                    execution.stop_reason = SelectedRootUnifiedConvergenceStopReason::Converged;
+                }
+                SelectedRootUnifiedConvergenceDecision::Dispatch { phase, .. } => {
+                    execution.next_phase = Some(phase);
+                    execution.requires_another_invocation = true;
+                    execution.stop_reason =
+                        SelectedRootUnifiedConvergenceStopReason::PhaseCompleted;
+                }
+                SelectedRootUnifiedConvergenceDecision::SafeStop { reason } => {
+                    execution.stop_reason = reason;
+                    execution.manual_intervention_required = true;
+                }
+            }
+
+            Ok(execution)
+        }
+    }
 }
 
 pub fn materialize_selected_root_directories(
@@ -4775,6 +5137,12 @@ pub enum SelectedRootExecutorError {
     LocalFileRollbackFailed,
     #[error("provider byte count disagreed with the bytes hashed locally")]
     LocalFileProviderByteCountMismatch,
+    #[error("unified convergence is blocked by fail-closed planner actions")]
+    UnifiedConvergenceBlocked,
+    #[error("unified convergence requires a readonly content provider for this phase")]
+    UnifiedConvergenceProviderRequired,
+    #[error("unified convergence delegated phase count did not match the planner")]
+    UnifiedConvergencePhaseCountMismatch,
     #[error("local file verification is blocked by the current receive-only state")]
     LocalFileVerificationPhaseBlocked,
     #[error("bounded existing-file verification is not ready for supervised execution")]
@@ -7352,6 +7720,332 @@ mod phase5d8_file_batch_verification_tests {
 
         fs::remove_file(local_root.join("a.txt")).unwrap();
         fs::remove_file(local_root.join("b.txt")).unwrap();
+        fs::remove_dir(local_root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod phase5d9_unified_convergence_tests {
+    use super::*;
+    use nubisync_core::{ProviderAccount, ProviderId, SyncMode};
+    use std::collections::HashMap;
+
+    struct Phase5d9RootProvider;
+
+    impl SelectedRootProvider for Phase5d9RootProvider {
+        type RootIdentity = String;
+
+        fn resolve_root(
+            &self,
+            _remote_root_id: &str,
+        ) -> Result<Self::RootIdentity, SelectedRootExecutorError> {
+            Ok("canonical-root".into())
+        }
+
+        fn canonical_root_id<'a>(&self, root: &'a Self::RootIdentity) -> &'a str {
+            root.as_str()
+        }
+
+        fn resolve_membership(
+            &self,
+            item: &RemoteItem,
+            root: &Self::RootIdentity,
+        ) -> Result<RootChangeMembership, SelectedRootExecutorError> {
+            if item.remote_id == *root {
+                Ok(RootChangeMembership::Root)
+            } else {
+                Ok(RootChangeMembership::Descendant)
+            }
+        }
+
+        fn hydrate_folder(
+            &self,
+            item: &RemoteItem,
+        ) -> Result<Vec<RemoteItem>, SelectedRootExecutorError> {
+            Ok(vec![item.clone()])
+        }
+    }
+
+    struct Phase5d9ContentProvider {
+        blobs: HashMap<String, Vec<u8>>,
+    }
+
+    impl SelectedRootContentProvider for Phase5d9ContentProvider {
+        fn content_fingerprint(
+            &self,
+            remote_id: &str,
+        ) -> Result<SelectedRootContentFingerprint, SelectedRootExecutorError> {
+            let bytes = self
+                .blobs
+                .get(remote_id)
+                .ok_or(SelectedRootExecutorError::ProviderOperationFailed)?;
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+
+            Ok(SelectedRootContentFingerprint {
+                size_bytes: u64::try_from(bytes.len())
+                    .map_err(|_| SelectedRootExecutorError::CountOverflow)?,
+                sha256_hex: digest_to_hex(hasher.finalize().as_slice()),
+            })
+        }
+
+        fn download_file_content(
+            &self,
+            remote_id: &str,
+            max_bytes: u64,
+            writer: &mut dyn Write,
+        ) -> Result<u64, SelectedRootExecutorError> {
+            let bytes = self
+                .blobs
+                .get(remote_id)
+                .ok_or(SelectedRootExecutorError::ProviderOperationFailed)?;
+            let len =
+                u64::try_from(bytes.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+            if len > max_bytes {
+                return Err(SelectedRootExecutorError::LocalFileTooLarge);
+            }
+
+            writer
+                .write_all(bytes)
+                .map_err(|_| SelectedRootExecutorError::ProviderOperationFailed)?;
+            Ok(len)
+        }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nubisync-phase5d9-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn base_storage(label: &str) -> (Storage, SyncRoot, PathBuf) {
+        let local_root = temp_root(label);
+        fs::create_dir(&local_root).unwrap();
+        let local_root = fs::canonicalize(local_root).unwrap();
+
+        let storage = Storage::open_in_memory().unwrap();
+        let provider_id = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider_id.clone(), "phase5d9-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            format!("phase5d9-{label}"),
+            provider_id,
+            account.subject,
+            local_root.to_str().unwrap(),
+            Some("canonical-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        (storage, root, local_root)
+    }
+
+    fn finalize_snapshot(storage: &mut Storage, root: &SyncRoot, items: &[RemoteItem]) {
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(&root.id, items, 3)
+            .unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(
+                &root.id,
+                &ChangeCursor::new("phase5d9-fence").unwrap(),
+                4,
+            )
+            .unwrap();
+
+        execute_selected_root_change_batch(
+            &Phase5d9RootProvider,
+            storage,
+            root,
+            &ChangeCursor::new("phase5d9-fence").unwrap(),
+            &[],
+            &ChangeCursor::new("phase5d9-ready").unwrap(),
+            5,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn phase5d9_dispatches_directory_then_file_across_supervised_invocations() {
+        let (mut storage, root, local_root) = base_storage("directory-file");
+        let bytes = b"phase-5d9-content".to_vec();
+
+        let folder = RemoteItem {
+            remote_id: "folder-a".into(),
+            parent_remote_id: Some("canonical-root".into()),
+            name: "folder-a".into(),
+            kind: RemoteItemKind::Folder,
+            size_bytes: None,
+            modified_unix_ms: None,
+            trashed: false,
+        };
+        let file = RemoteItem {
+            remote_id: "file-a".into(),
+            parent_remote_id: Some("folder-a".into()),
+            name: "file-a.txt".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(u64::try_from(bytes.len()).unwrap()),
+            modified_unix_ms: None,
+            trashed: false,
+        };
+
+        finalize_snapshot(&mut storage, &root, &[folder, file]);
+
+        let initial = plan_selected_root_receive_only_convergence(&storage, &root).unwrap();
+        assert_eq!(initial.create_directories, 1);
+        assert_eq!(initial.materialize_missing_files, 1);
+        assert_eq!(initial.action_count(), 2);
+
+        let first = execute_selected_root_unified_convergence_step::<Phase5d9ContentProvider>(
+            None,
+            &mut storage,
+            &root,
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.phase_executed,
+            Some(SelectedRootUnifiedConvergencePhase::CreateDirectories)
+        );
+        assert_eq!(first.directories_created, 1);
+        assert_eq!(first.phase_actions_executed, 1);
+        assert!(!first.converged);
+        assert!(first.requires_another_invocation);
+        assert_eq!(
+            first.next_phase,
+            Some(SelectedRootUnifiedConvergencePhase::MaterializeMissingFiles)
+        );
+        assert_eq!(
+            first.stop_reason,
+            SelectedRootUnifiedConvergenceStopReason::PhaseCompleted
+        );
+
+        let provider = Phase5d9ContentProvider {
+            blobs: HashMap::from([("file-a".to_string(), bytes.clone())]),
+        };
+
+        let second =
+            execute_selected_root_unified_convergence_step(Some(&provider), &mut storage, &root)
+                .unwrap();
+
+        assert_eq!(
+            second.phase_executed,
+            Some(SelectedRootUnifiedConvergencePhase::MaterializeMissingFiles)
+        );
+        assert_eq!(second.files_materialized, 1);
+        assert_eq!(second.receipts_recorded, 1);
+        assert!(second.converged);
+        assert!(!second.requires_another_invocation);
+        assert_eq!(
+            second.stop_reason,
+            SelectedRootUnifiedConvergenceStopReason::Converged
+        );
+
+        let final_plan = plan_selected_root_receive_only_convergence(&storage, &root).unwrap();
+        assert_eq!(final_plan.action_count(), 0);
+        assert_eq!(final_plan.current_owned_files, 1);
+        assert_eq!(final_plan.current_owned_directories, 1);
+
+        fs::remove_file(local_root.join("folder-a").join("file-a.txt")).unwrap();
+        fs::remove_dir(local_root.join("folder-a")).unwrap();
+        fs::remove_dir(local_root).unwrap();
+    }
+
+    #[test]
+    fn phase5d9_mixed_file_classes_safe_stop_without_mutation() {
+        let (mut storage, root, local_root) = base_storage("mixed");
+        let a = b"existing-content".to_vec();
+        let b = b"missing-content".to_vec();
+
+        fs::write(local_root.join("existing.txt"), &a).unwrap();
+
+        let first = RemoteItem {
+            remote_id: "existing".into(),
+            parent_remote_id: Some("canonical-root".into()),
+            name: "existing.txt".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(u64::try_from(a.len()).unwrap()),
+            modified_unix_ms: None,
+            trashed: false,
+        };
+        let second = RemoteItem {
+            remote_id: "missing".into(),
+            parent_remote_id: Some("canonical-root".into()),
+            name: "missing.txt".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(u64::try_from(b.len()).unwrap()),
+            modified_unix_ms: None,
+            trashed: false,
+        };
+
+        finalize_snapshot(&mut storage, &root, &[first, second]);
+
+        let pre = plan_selected_root_receive_only_convergence(&storage, &root).unwrap();
+        assert_eq!(pre.verify_existing_files, 1);
+        assert_eq!(pre.materialize_missing_files, 1);
+        assert_eq!(pre.action_count(), 2);
+
+        let result = execute_selected_root_unified_convergence_step::<Phase5d9ContentProvider>(
+            None,
+            &mut storage,
+            &root,
+        )
+        .unwrap();
+
+        assert_eq!(result.phase_executed, None);
+        assert_eq!(result.phase_actions_executed, 0);
+        assert_eq!(
+            result.stop_reason,
+            SelectedRootUnifiedConvergenceStopReason::MixedActionClasses
+        );
+        assert!(result.manual_intervention_required);
+        assert!(!result.requires_another_invocation);
+        assert_eq!(result.final_actions, 2);
+        assert_eq!(
+            storage
+                .sync_root_materialization_receipt_count(&root.id)
+                .unwrap(),
+            0
+        );
+        assert!(!local_root.join("missing.txt").exists());
+        assert_eq!(fs::read(local_root.join("existing.txt")).unwrap(), a);
+
+        fs::remove_file(local_root.join("existing.txt")).unwrap();
+        fs::remove_dir(local_root).unwrap();
+    }
+
+    #[test]
+    fn phase5d9_converged_state_is_a_noop() {
+        let (mut storage, root, local_root) = base_storage("noop");
+        finalize_snapshot(&mut storage, &root, &[]);
+
+        let result = execute_selected_root_unified_convergence_step::<Phase5d9ContentProvider>(
+            None,
+            &mut storage,
+            &root,
+        )
+        .unwrap();
+
+        assert_eq!(result.initial_actions, 0);
+        assert_eq!(result.phase_executed, None);
+        assert_eq!(result.final_actions, 0);
+        assert!(result.converged);
+        assert_eq!(
+            result.stop_reason,
+            SelectedRootUnifiedConvergenceStopReason::Converged
+        );
+
         fs::remove_dir(local_root).unwrap();
     }
 }
