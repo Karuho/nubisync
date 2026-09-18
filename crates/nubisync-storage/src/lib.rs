@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
@@ -23,6 +23,106 @@ pub struct LocalInventoryState {
     pub snapshot_complete: bool,
     pub item_count: u64,
     pub snapshot_completed_at_unix_ms: Option<i64>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalChangeEventKind {
+    Created,
+    Deleted,
+    Modified,
+    TypeChanged,
+}
+
+impl LocalChangeEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Deleted => "deleted",
+            Self::Modified => "modified",
+            Self::TypeChanged => "type_changed",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalChangeEventInput {
+    relative_path: String,
+    pub kind: LocalChangeEventKind,
+    pub baseline_kind: Option<LocalItemKind>,
+    pub current_kind: Option<LocalItemKind>,
+}
+
+impl LocalChangeEventInput {
+    pub fn new(
+        relative_path: impl Into<String>,
+        kind: LocalChangeEventKind,
+        baseline_kind: Option<LocalItemKind>,
+        current_kind: Option<LocalItemKind>,
+    ) -> Result<Self, StorageError> {
+        let relative_path = relative_path.into();
+        if !is_safe_local_event_relative_path(&relative_path) {
+            return Err(StorageError::InvalidLocalChangePath);
+        }
+
+        match kind {
+            LocalChangeEventKind::Created if baseline_kind.is_some() || current_kind.is_none() => {
+                return Err(StorageError::InvalidLocalChangeShape);
+            }
+            LocalChangeEventKind::Deleted if baseline_kind.is_none() || current_kind.is_some() => {
+                return Err(StorageError::InvalidLocalChangeShape);
+            }
+            LocalChangeEventKind::Modified
+                if baseline_kind.is_none()
+                    || current_kind.is_none()
+                    || baseline_kind != current_kind =>
+            {
+                return Err(StorageError::InvalidLocalChangeShape);
+            }
+            LocalChangeEventKind::TypeChanged
+                if baseline_kind.is_none()
+                    || current_kind.is_none()
+                    || baseline_kind == current_kind =>
+            {
+                return Err(StorageError::InvalidLocalChangeShape);
+            }
+            LocalChangeEventKind::Created
+            | LocalChangeEventKind::Deleted
+            | LocalChangeEventKind::Modified
+            | LocalChangeEventKind::TypeChanged => {}
+        }
+
+        Ok(Self {
+            relative_path,
+            kind,
+            baseline_kind,
+            current_kind,
+        })
+    }
+
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+}
+
+impl std::fmt::Debug for LocalChangeEventInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalChangeEventInput")
+            .field("relative_path", &"[redacted]")
+            .field("kind", &self.kind)
+            .field("baseline_kind", &self.baseline_kind)
+            .field("current_kind", &self.current_kind)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalChangeJournalCommit {
+    pub baseline_generation: u64,
+    pub pending_events: u64,
+    pub superseded_events: u64,
+    pub current_diff_events: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,10 +343,40 @@ impl Storage {
                     item_count >= 0
                 ),
                 snapshot_completed_at_unix_ms INTEGER,
+                generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
                 FOREIGN KEY (sync_root_id)
                     REFERENCES sync_roots(id)
                     ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS sync_root_local_change_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sync_root_id TEXT NOT NULL,
+                baseline_generation INTEGER NOT NULL CHECK (baseline_generation > 0),
+                baseline_item_count INTEGER NOT NULL CHECK (baseline_item_count >= 0),
+                baseline_snapshot_completed_at_unix_ms INTEGER,
+                event_kind TEXT NOT NULL CHECK (
+                    event_kind IN ('created', 'deleted', 'modified', 'type_changed')
+                ),
+                relative_path TEXT NOT NULL,
+                baseline_kind TEXT CHECK (
+                    baseline_kind IS NULL OR baseline_kind IN ('file', 'directory')
+                ),
+                current_kind TEXT CHECK (
+                    current_kind IS NULL OR current_kind IN ('file', 'directory')
+                ),
+                observed_at_unix_ms INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('pending', 'applied', 'superseded', 'failed')
+                ),
+                UNIQUE (sync_root_id, baseline_generation, relative_path),
+                FOREIGN KEY (sync_root_id)
+                    REFERENCES sync_roots(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS sync_root_local_change_events_pending_idx
+            ON sync_root_local_change_events(sync_root_id, baseline_generation, status, id);
 
             CREATE TABLE IF NOT EXISTS local_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -469,6 +599,20 @@ impl Storage {
         if current_version == 6 {
             transaction.execute(
                 "ALTER TABLE sync_root_remote_inventory_state ADD COLUMN change_cursor TEXT",
+                [],
+            )?;
+        }
+
+        if current_version == 12 {
+            transaction.execute(
+                "ALTER TABLE sync_root_local_inventory_state
+                 ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            transaction.execute(
+                "UPDATE sync_root_local_inventory_state
+                 SET generation = 1
+                 WHERE snapshot_complete = 1",
                 [],
             )?;
         }
@@ -786,12 +930,14 @@ impl Storage {
                 sync_root_id,
                 snapshot_complete,
                 item_count,
-                snapshot_completed_at_unix_ms
-             ) VALUES (?1, 1, ?2, ?3)
+                snapshot_completed_at_unix_ms,
+                generation
+             ) VALUES (?1, 1, ?2, ?3, 1)
              ON CONFLICT(sync_root_id) DO UPDATE SET
                 snapshot_complete = 1,
                 item_count = excluded.item_count,
-                snapshot_completed_at_unix_ms = excluded.snapshot_completed_at_unix_ms",
+                snapshot_completed_at_unix_ms = excluded.snapshot_completed_at_unix_ms,
+                generation = sync_root_local_inventory_state.generation + 1",
             params![sync_root_id, item_count, completed_at_unix_ms],
         )?;
 
@@ -808,32 +954,173 @@ impl Storage {
         &self,
         sync_root_id: &str,
     ) -> Result<LocalInventoryState, StorageError> {
-        let row: Option<(i64, i64, Option<i64>)> = self
+        let row: Option<(i64, i64, Option<i64>, i64)> = self
             .connection
             .query_row(
                 "SELECT
                     snapshot_complete,
                     item_count,
-                    snapshot_completed_at_unix_ms
+                    snapshot_completed_at_unix_ms,
+                    generation
                  FROM sync_root_local_inventory_state
                  WHERE sync_root_id = ?1",
                 params![sync_root_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
 
         match row {
-            Some((snapshot_complete, item_count, completed_at)) => Ok(LocalInventoryState {
-                snapshot_complete: snapshot_complete != 0,
-                item_count: u64::try_from(item_count).map_err(|_| StorageError::NumericOverflow)?,
-                snapshot_completed_at_unix_ms: completed_at,
-            }),
+            Some((snapshot_complete, item_count, completed_at, generation)) => {
+                Ok(LocalInventoryState {
+                    snapshot_complete: snapshot_complete != 0,
+                    item_count: u64::try_from(item_count)
+                        .map_err(|_| StorageError::NumericOverflow)?,
+                    snapshot_completed_at_unix_ms: completed_at,
+                    generation: u64::try_from(generation)
+                        .map_err(|_| StorageError::NumericOverflow)?,
+                })
+            }
             None => Ok(LocalInventoryState {
                 snapshot_complete: false,
                 item_count: 0,
                 snapshot_completed_at_unix_ms: None,
+                generation: 0,
             }),
         }
+    }
+
+    pub fn reconcile_sync_root_local_change_journal(
+        &mut self,
+        sync_root_id: &str,
+        expected_generation: u64,
+        expected_item_count: u64,
+        expected_snapshot_completed_at_unix_ms: Option<i64>,
+        events: &[LocalChangeEventInput],
+        observed_at_unix_ms: i64,
+    ) -> Result<LocalChangeJournalCommit, StorageError> {
+        let expected_generation =
+            i64::try_from(expected_generation).map_err(|_| StorageError::NumericOverflow)?;
+        let expected_item_count =
+            i64::try_from(expected_item_count).map_err(|_| StorageError::NumericOverflow)?;
+
+        let transaction = self.connection.transaction()?;
+
+        let state: Option<(i64, i64, Option<i64>, i64)> = transaction
+            .query_row(
+                "SELECT snapshot_complete, item_count, snapshot_completed_at_unix_ms, generation
+                 FROM sync_root_local_inventory_state
+                 WHERE sync_root_id = ?1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+
+        let Some((snapshot_complete, item_count, completed_at, generation)) = state else {
+            return Err(StorageError::LocalChangeBaselineMismatch);
+        };
+
+        if snapshot_complete == 0
+            || generation != expected_generation
+            || item_count != expected_item_count
+            || completed_at != expected_snapshot_completed_at_unix_ms
+        {
+            return Err(StorageError::LocalChangeBaselineMismatch);
+        }
+
+        let superseded = transaction.execute(
+            "UPDATE sync_root_local_change_events
+             SET status = 'superseded'
+             WHERE sync_root_id = ?1
+               AND baseline_generation = ?2
+               AND status = 'pending'",
+            params![sync_root_id, expected_generation],
+        )?;
+
+        for event in events {
+            transaction.execute(
+                "INSERT INTO sync_root_local_change_events (
+                    sync_root_id,
+                    baseline_generation,
+                    baseline_item_count,
+                    baseline_snapshot_completed_at_unix_ms,
+                    event_kind,
+                    relative_path,
+                    baseline_kind,
+                    current_kind,
+                    observed_at_unix_ms,
+                    status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')
+                 ON CONFLICT(sync_root_id, baseline_generation, relative_path)
+                 DO UPDATE SET
+                    baseline_item_count = excluded.baseline_item_count,
+                    baseline_snapshot_completed_at_unix_ms =
+                        excluded.baseline_snapshot_completed_at_unix_ms,
+                    event_kind = excluded.event_kind,
+                    baseline_kind = excluded.baseline_kind,
+                    current_kind = excluded.current_kind,
+                    observed_at_unix_ms = excluded.observed_at_unix_ms,
+                    status = 'pending'",
+                params![
+                    sync_root_id,
+                    expected_generation,
+                    expected_item_count,
+                    expected_snapshot_completed_at_unix_ms,
+                    event.kind.as_str(),
+                    event.relative_path(),
+                    event.baseline_kind.map(LocalItemKind::as_str),
+                    event.current_kind.map(LocalItemKind::as_str),
+                    observed_at_unix_ms
+                ],
+            )?;
+        }
+
+        let pending: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_local_change_events
+             WHERE sync_root_id = ?1
+               AND baseline_generation = ?2
+               AND status = 'pending'",
+            params![sync_root_id, expected_generation],
+            |row| row.get(0),
+        )?;
+
+        let expected_pending =
+            i64::try_from(events.len()).map_err(|_| StorageError::NumericOverflow)?;
+        if pending != expected_pending {
+            return Err(StorageError::LocalChangeJournalCountMismatch);
+        }
+
+        transaction.commit()?;
+
+        Ok(LocalChangeJournalCommit {
+            baseline_generation: u64::try_from(expected_generation)
+                .map_err(|_| StorageError::NumericOverflow)?,
+            pending_events: u64::try_from(pending).map_err(|_| StorageError::NumericOverflow)?,
+            superseded_events: u64::try_from(superseded)
+                .map_err(|_| StorageError::NumericOverflow)?,
+            current_diff_events: u64::try_from(events.len())
+                .map_err(|_| StorageError::NumericOverflow)?,
+        })
+    }
+
+    pub fn pending_sync_root_local_change_event_count(
+        &self,
+        sync_root_id: &str,
+        baseline_generation: u64,
+    ) -> Result<u64, StorageError> {
+        let baseline_generation =
+            i64::try_from(baseline_generation).map_err(|_| StorageError::NumericOverflow)?;
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_local_change_events
+             WHERE sync_root_id = ?1
+               AND baseline_generation = ?2
+               AND status = 'pending'",
+            params![sync_root_id, baseline_generation],
+            |row| row.get(0),
+        )?;
+
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
     }
 
     pub fn list_sync_root_local_items(
@@ -3134,6 +3421,20 @@ fn refresh_sync_root_catalog_count(
     Ok(())
 }
 
+fn is_safe_local_event_relative_path(relative_path: &str) -> bool {
+    if relative_path.is_empty()
+        || relative_path.starts_with('/')
+        || relative_path.ends_with('/')
+        || relative_path.contains('\0')
+    {
+        return false;
+    }
+
+    relative_path
+        .split('/')
+        .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
+}
+
 fn insert_sync_root_local_inventory_item(
     transaction: &Transaction<'_>,
     sync_root_id: &str,
@@ -3485,6 +3786,14 @@ pub enum StorageError {
     InvalidStoredLocalItemKind,
     #[error("stored local inventory identity is invalid")]
     InvalidStoredLocalIdentity,
+    #[error("local change relative path is invalid")]
+    InvalidLocalChangePath,
+    #[error("local change event shape is invalid")]
+    InvalidLocalChangeShape,
+    #[error("local change journal baseline does not match durable state")]
+    LocalChangeBaselineMismatch,
+    #[error("local change journal pending count did not match the supplied diff")]
+    LocalChangeJournalCountMismatch,
     #[error("SQLite schema version {found} is newer than supported version {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     #[error("remote catalog does not have a complete authoritative snapshot")]
@@ -5963,9 +6272,9 @@ mod phase5c10_directory_receipt_tests {
     }
 
     #[test]
-    fn schema_v12_contains_directory_receipts() {
+    fn schema_v13_contains_directory_receipts() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 12);
+        assert_eq!(storage.schema_version().unwrap(), 13);
 
         let exists: i64 = storage
             .connection
@@ -6437,6 +6746,7 @@ mod phase5f1_local_inventory_tests {
         let initial = storage.sync_root_local_inventory_state(&root.id).unwrap();
         assert!(!initial.snapshot_complete);
         assert_eq!(initial.item_count, 0);
+        assert_eq!(initial.generation, 0);
 
         let items = vec![
             LocalItemSnapshot::new("docs", LocalItemKind::Directory, None, 100, 8, 40).unwrap(),
@@ -6473,6 +6783,7 @@ mod phase5f1_local_inventory_tests {
         assert!(state.snapshot_complete);
         assert_eq!(state.item_count, 2);
         assert_eq!(state.snapshot_completed_at_unix_ms, Some(11));
+        assert_eq!(state.generation, 1);
 
         let current = storage.list_sync_root_local_items(&root.id).unwrap();
         assert_eq!(current.len(), 2);
@@ -6507,11 +6818,160 @@ mod phase5f1_local_inventory_tests {
         let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
         assert_eq!(state.item_count, 1);
         assert_eq!(state.snapshot_completed_at_unix_ms, Some(21));
+        assert_eq!(state.generation, 2);
     }
 
     #[test]
-    fn phase5f1_schema_is_v12() {
+    fn phase5f1_schema_is_v13() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 12);
+        assert_eq!(storage.schema_version().unwrap(), 13);
+    }
+}
+
+#[cfg(test)]
+mod phase5f4_local_journal_tests {
+    use super::*;
+
+    fn fixture() -> (Storage, SyncRoot) {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5f4-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5f4-root",
+            provider,
+            account.subject,
+            "/tmp/phase5f4-root",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let items = vec![
+            LocalItemSnapshot::new("docs", LocalItemKind::Directory, None, 100, 8, 40).unwrap(),
+            LocalItemSnapshot::new("docs/file.txt", LocalItemKind::File, Some(5), 101, 8, 41)
+                .unwrap(),
+        ];
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_local_inventory_items(&root.id, &items, 10)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 11)
+            .unwrap();
+
+        (storage, root)
+    }
+
+    #[test]
+    fn phase5f4_journal_is_bound_to_generation_and_idempotently_reconciled() {
+        let (mut storage, root) = fixture();
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        assert_eq!(state.generation, 1);
+
+        let events = vec![
+            LocalChangeEventInput::new(
+                "created.txt",
+                LocalChangeEventKind::Created,
+                None,
+                Some(LocalItemKind::File),
+            )
+            .unwrap(),
+            LocalChangeEventInput::new(
+                "docs/file.txt",
+                LocalChangeEventKind::Modified,
+                Some(LocalItemKind::File),
+                Some(LocalItemKind::File),
+            )
+            .unwrap(),
+        ];
+
+        let first = storage
+            .reconcile_sync_root_local_change_journal(
+                &root.id,
+                state.generation,
+                state.item_count,
+                state.snapshot_completed_at_unix_ms,
+                &events,
+                20,
+            )
+            .unwrap();
+        assert_eq!(first.pending_events, 2);
+
+        let second = storage
+            .reconcile_sync_root_local_change_journal(
+                &root.id,
+                state.generation,
+                state.item_count,
+                state.snapshot_completed_at_unix_ms,
+                &events,
+                21,
+            )
+            .unwrap();
+        assert_eq!(second.pending_events, 2);
+        assert_eq!(
+            storage
+                .pending_sync_root_local_change_event_count(&root.id, state.generation)
+                .unwrap(),
+            2
+        );
+
+        let clean = storage
+            .reconcile_sync_root_local_change_journal(
+                &root.id,
+                state.generation,
+                state.item_count,
+                state.snapshot_completed_at_unix_ms,
+                &[],
+                22,
+            )
+            .unwrap();
+        assert_eq!(clean.pending_events, 0);
+        assert_eq!(clean.superseded_events, 2);
+    }
+
+    #[test]
+    fn phase5f4_journal_rejects_stale_baseline_generation_without_mutation() {
+        let (mut storage, root) = fixture();
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+
+        let event = LocalChangeEventInput::new(
+            "created.txt",
+            LocalChangeEventKind::Created,
+            None,
+            Some(LocalItemKind::File),
+        )
+        .unwrap();
+
+        let error = storage
+            .reconcile_sync_root_local_change_journal(
+                &root.id,
+                state.generation + 1,
+                state.item_count,
+                state.snapshot_completed_at_unix_ms,
+                &[event],
+                20,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::LocalChangeBaselineMismatch));
+        assert_eq!(
+            storage
+                .pending_sync_root_local_change_event_count(&root.id, state.generation)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn phase5f4_schema_is_v13() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert_eq!(storage.schema_version().unwrap(), 13);
     }
 }

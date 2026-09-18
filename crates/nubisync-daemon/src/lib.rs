@@ -10,8 +10,9 @@ use nubisync_drive::{
     DriveApiError, DriveBlobFingerprint, DriveFolderRoot, DriveRootMembership, GoogleDriveApi,
 };
 use nubisync_storage::{
-    Storage, StorageError, SyncRootCatalogBatchCommit, SyncRootCatalogMutation,
-    SyncRootDirectoryMaterializationReceipt, SyncRootFileMaterializationReceipt,
+    LocalChangeEventInput, LocalChangeEventKind, LocalChangeJournalCommit, Storage, StorageError,
+    SyncRootCatalogBatchCommit, SyncRootCatalogMutation, SyncRootDirectoryMaterializationReceipt,
+    SyncRootFileMaterializationReceipt,
 };
 use nubisync_sync::{
     LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyConvergenceActionKind,
@@ -85,6 +86,8 @@ impl fmt::Debug for SelectedRootLocalDiffEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedRootLocalInventoryDiff {
     pub baseline_items: usize,
+    pub baseline_generation: u64,
+    pub baseline_snapshot_completed_at_unix_ms: Option<i64>,
     pub observed_items: usize,
     pub created: usize,
     pub deleted: usize,
@@ -5100,12 +5103,19 @@ pub fn plan_selected_root_local_inventory_diff(
         return Err(SelectedRootExecutorError::LocalDiffScanRace);
     }
 
-    build_selected_root_local_inventory_diff(&baseline, &first)
+    build_selected_root_local_inventory_diff(
+        &baseline,
+        &first,
+        state.generation,
+        state.snapshot_completed_at_unix_ms,
+    )
 }
 
 fn build_selected_root_local_inventory_diff(
     baseline: &[LocalItemSnapshot],
     current: &[LocalItemSnapshot],
+    baseline_generation: u64,
+    baseline_snapshot_completed_at_unix_ms: Option<i64>,
 ) -> Result<SelectedRootLocalInventoryDiff, SelectedRootExecutorError> {
     let baseline_by_path = baseline
         .iter()
@@ -5192,6 +5202,8 @@ fn build_selected_root_local_inventory_diff(
 
     Ok(SelectedRootLocalInventoryDiff {
         baseline_items: baseline.len(),
+        baseline_generation,
+        baseline_snapshot_completed_at_unix_ms,
         observed_items: current.len(),
         created,
         deleted,
@@ -5215,6 +5227,68 @@ fn local_snapshot_metadata_changed(
         LocalItemKind::Directory => {
             baseline.device_id() != current.device_id() || baseline.inode() != current.inode()
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootLocalJournalResult {
+    pub changes_total: usize,
+    pub created: usize,
+    pub deleted: usize,
+    pub modified: usize,
+    pub type_changed: usize,
+    pub baseline_generation: u64,
+    pub pending_events: u64,
+    pub superseded_events: u64,
+}
+
+pub fn journal_selected_root_local_inventory_diff(
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    observed_at_unix_ms: i64,
+) -> Result<SelectedRootLocalJournalResult, SelectedRootExecutorError> {
+    let diff = plan_selected_root_local_inventory_diff(storage, sync_root)?;
+
+    let mut events = Vec::with_capacity(diff.entries().len());
+    for entry in diff.entries() {
+        events.push(LocalChangeEventInput::new(
+            entry.relative_path(),
+            local_change_event_kind(entry.kind),
+            entry.baseline_kind,
+            entry.current_kind,
+        )?);
+    }
+
+    let baseline_item_count =
+        u64::try_from(diff.baseline_items).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+
+    let commit: LocalChangeJournalCommit = storage.reconcile_sync_root_local_change_journal(
+        &sync_root.id,
+        diff.baseline_generation,
+        baseline_item_count,
+        diff.baseline_snapshot_completed_at_unix_ms,
+        &events,
+        observed_at_unix_ms,
+    )?;
+
+    Ok(SelectedRootLocalJournalResult {
+        changes_total: diff.action_count(),
+        created: diff.created,
+        deleted: diff.deleted,
+        modified: diff.modified,
+        type_changed: diff.type_changed,
+        baseline_generation: commit.baseline_generation,
+        pending_events: commit.pending_events,
+        superseded_events: commit.superseded_events,
+    })
+}
+
+fn local_change_event_kind(kind: SelectedRootLocalDiffKind) -> LocalChangeEventKind {
+    match kind {
+        SelectedRootLocalDiffKind::Created => LocalChangeEventKind::Created,
+        SelectedRootLocalDiffKind::Deleted => LocalChangeEventKind::Deleted,
+        SelectedRootLocalDiffKind::Modified => LocalChangeEventKind::Modified,
+        SelectedRootLocalDiffKind::TypeChanged => LocalChangeEventKind::TypeChanged,
     }
 }
 
@@ -9711,7 +9785,8 @@ mod phase5f3_local_diff_tests {
             file("new-name.txt", 8, 10, 1, 99),
         ];
 
-        let diff = build_selected_root_local_inventory_diff(&baseline, &current).unwrap();
+        let diff =
+            build_selected_root_local_inventory_diff(&baseline, &current, 1, Some(10)).unwrap();
 
         assert_eq!(diff.created, 2);
         assert_eq!(diff.deleted, 2);
@@ -9756,7 +9831,8 @@ mod phase5f3_local_diff_tests {
         ];
         let current = baseline.clone();
 
-        let diff = build_selected_root_local_inventory_diff(&baseline, &current).unwrap();
+        let diff =
+            build_selected_root_local_inventory_diff(&baseline, &current, 1, Some(10)).unwrap();
 
         assert!(diff.clean());
         assert_eq!(diff.action_count(), 0);
@@ -9764,5 +9840,30 @@ mod phase5f3_local_diff_tests {
         assert_eq!(diff.deleted, 0);
         assert_eq!(diff.modified, 0);
         assert_eq!(diff.type_changed, 0);
+    }
+}
+
+#[cfg(test)]
+mod phase5f4_local_journal_tests {
+    use super::*;
+
+    #[test]
+    fn phase5f4_diff_kind_maps_to_durable_event_kind() {
+        assert_eq!(
+            local_change_event_kind(SelectedRootLocalDiffKind::Created),
+            LocalChangeEventKind::Created
+        );
+        assert_eq!(
+            local_change_event_kind(SelectedRootLocalDiffKind::Deleted),
+            LocalChangeEventKind::Deleted
+        );
+        assert_eq!(
+            local_change_event_kind(SelectedRootLocalDiffKind::Modified),
+            LocalChangeEventKind::Modified
+        );
+        assert_eq!(
+            local_change_event_kind(SelectedRootLocalDiffKind::TypeChanged),
+            LocalChangeEventKind::TypeChanged
+        );
     }
 }

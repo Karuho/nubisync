@@ -18,15 +18,15 @@ use nubisync_daemon::{
     delete_selected_root_stale_directories, delete_selected_root_stale_files,
     execute_completed_selected_root_change_window, execute_selected_root_receive_only_cycle,
     execute_selected_root_receive_only_single_flight,
-    execute_selected_root_unified_convergence_step, materialize_selected_root_directories,
-    materialize_selected_root_missing_file, materialize_selected_root_missing_files,
-    plan_selected_root_local_inventory_diff, plan_selected_root_local_materialization,
-    plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
-    plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
-    plan_selected_root_stale_files, plan_selected_root_unified_convergence_step,
-    replace_selected_root_existing_file, replace_selected_root_stale_files,
-    verify_selected_root_existing_file, verify_selected_root_existing_files,
-    verify_selected_root_local_receipts,
+    execute_selected_root_unified_convergence_step, journal_selected_root_local_inventory_diff,
+    materialize_selected_root_directories, materialize_selected_root_missing_file,
+    materialize_selected_root_missing_files, plan_selected_root_local_inventory_diff,
+    plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
+    plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
+    plan_selected_root_remote_replacement, plan_selected_root_stale_files,
+    plan_selected_root_unified_convergence_step, replace_selected_root_existing_file,
+    replace_selected_root_stale_files, verify_selected_root_existing_file,
+    verify_selected_root_existing_files, verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -135,6 +135,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_local_diff()
+        }
+        [sync, roots, local_journal, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && local_journal == "local-journal"
+                && approve == "--approve" =>
+        {
+            sync_roots_local_journal()
         }
         [sync, roots, convergence_plan, approve]
             if sync == "sync"
@@ -388,6 +396,7 @@ USAGE:
   nubisync sync roots run-to-idle --approve
   nubisync sync roots local-baseline --approve
   nubisync sync roots local-diff --approve
+  nubisync sync roots local-journal --approve
   nubisync sync roots convergence-plan --approve
   nubisync sync roots converge --approve
   nubisync sync roots stale-files-plan --approve
@@ -1254,6 +1263,73 @@ fn sync_roots_local_diff() -> Result<(), CliError> {
     println!("RENAME_COALESCING=no");
     println!("NETWORK_CHECK=not_performed");
     println!("DATABASE_MUTATION=no");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_ROOT_ID_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_local_journal() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        println!("SYNC_ROOT_LOCAL_JOURNAL=SKIPPED");
+        println!(
+            "REASON={}",
+            if roots.is_empty() {
+                "no_configured_root"
+            } else {
+                "multiple_roots_require_selector"
+            }
+        );
+        println!("NETWORK_CHECK=not_performed");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+
+    let root = roots
+        .first()
+        .ok_or(CliError::SyncRootReconcilePlanSelectionFailed)?;
+
+    if root.mode != SyncMode::ReceiveOnly {
+        return Err(CliError::SyncRootMetadataStepModeUnsupported);
+    }
+
+    println!("SYNC_ROOT_LOCAL_JOURNAL_STAGE=reconcile_durable_events");
+    let result = journal_selected_root_local_inventory_diff(&mut storage, root, unix_time_ms()?)?;
+
+    println!("SYNC_ROOT_LOCAL_JOURNAL=PASS");
+    println!("MODE=receive_only");
+    println!("CHANGES_TOTAL={}", result.changes_total);
+    println!("CREATED={}", result.created);
+    println!("DELETED={}", result.deleted);
+    println!("MODIFIED={}", result.modified);
+    println!("TYPE_CHANGED={}", result.type_changed);
+    println!("BASELINE_GENERATION={}", result.baseline_generation);
+    println!("PENDING_EVENTS={}", result.pending_events);
+    println!("SUPERSEDED_EVENTS={}", result.superseded_events);
+    println!("RENAME_COALESCING=no");
+    println!("BASELINE_MUTATED=no");
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=yes");
     println!("FILESYSTEM_READ=metadata_only");
     println!("FILESYSTEM_MUTATION=no");
     println!("FILE_CONTENT_ACCESSED=no");
