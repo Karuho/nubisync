@@ -26,6 +26,10 @@ const GOOGLE_DRIVE_CHANGES_FIELDS: &str = concat!(
     "changes(changeType,fileId,removed,",
     "file(id,name,mimeType,parents,size,trashed))"
 );
+const GOOGLE_DRIVE_WRITE_AUTHORITY_FIELDS: &str = concat!(
+    "id,mimeType,trashed,version,md5Checksum,",
+    "capabilities(canEdit,canTrash,canAddChildren)"
+);
 
 pub struct GoogleDriveApi {
     client: Client,
@@ -117,6 +121,25 @@ impl GoogleDriveApi {
             .json()?;
 
         ChangeCursor::new(response.start_page_token).map_err(DriveApiError::from)
+    }
+
+    /// Observes metadata-only remote authority for later write planning.
+    pub fn observe_write_authority(
+        &self,
+        remote_id: &str,
+    ) -> Result<DriveWriteAuthorityObservation, DriveApiError> {
+        validate_drive_file_id(remote_id)?;
+
+        let metadata: DriveWriteAuthorityResponse = self
+            .client
+            .get(format!("{GOOGLE_DRIVE_FILES_ENDPOINT}/{remote_id}"))
+            .bearer_auth(self.access_token.as_str())
+            .query(&[("fields", GOOGLE_DRIVE_WRITE_AUTHORITY_FIELDS)])
+            .send()?
+            .error_for_status()?
+            .json()?;
+
+        validate_write_authority_response(remote_id, metadata)
     }
 
     /// Validates one candidate My Drive sync root using metadata only.
@@ -491,6 +514,67 @@ impl fmt::Debug for DriveBlobFingerprint {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct DriveWriteAuthorityObservation {
+    remote_id: String,
+    pub remote_version: u64,
+    md5_checksum: Option<String>,
+    pub can_edit: bool,
+    pub can_trash: bool,
+    pub can_add_children: bool,
+}
+
+impl DriveWriteAuthorityObservation {
+    pub fn remote_id(&self) -> &str {
+        &self.remote_id
+    }
+
+    pub fn md5_checksum(&self) -> Option<&str> {
+        self.md5_checksum.as_deref()
+    }
+}
+
+impl fmt::Debug for DriveWriteAuthorityObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriveWriteAuthorityObservation")
+            .field("remote_id", &"[redacted]")
+            .field("remote_version", &self.remote_version)
+            .field(
+                "md5_checksum",
+                &self.md5_checksum.as_deref().map(|_| "[redacted]"),
+            )
+            .field("can_edit", &self.can_edit)
+            .field("can_trash", &self.can_trash)
+            .field("can_add_children", &self.can_add_children)
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DriveWriteAuthorityResponse {
+    id: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    #[serde(default)]
+    trashed: bool,
+    version: Option<String>,
+    #[serde(rename = "md5Checksum")]
+    md5_checksum: Option<String>,
+    #[serde(default)]
+    capabilities: DriveWriteCapabilitiesResponse,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DriveWriteCapabilitiesResponse {
+    #[serde(rename = "canEdit", default)]
+    can_edit: bool,
+    #[serde(rename = "canTrash", default)]
+    can_trash: bool,
+    #[serde(rename = "canAddChildren", default)]
+    can_add_children: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct DriveBlobFingerprintResponse {
     id: String,
@@ -856,6 +940,61 @@ struct GoogleFile {
     trashed: bool,
 }
 
+fn validate_write_authority_response(
+    expected_remote_id: &str,
+    metadata: DriveWriteAuthorityResponse,
+) -> Result<DriveWriteAuthorityObservation, DriveApiError> {
+    if metadata.id != expected_remote_id {
+        return Err(DriveApiError::WriteAuthorityMetadataIdMismatch);
+    }
+
+    if metadata.trashed {
+        return Err(DriveApiError::WriteAuthorityItemTrashed);
+    }
+
+    if metadata.mime_type != GOOGLE_DRIVE_FOLDER_MIME_TYPE
+        && metadata
+            .mime_type
+            .starts_with("application/vnd.google-apps.")
+    {
+        return Err(DriveApiError::WriteAuthorityProviderNativeUnsupported);
+    }
+
+    let remote_version = metadata
+        .version
+        .as_deref()
+        .ok_or(DriveApiError::WriteAuthorityVersionMissing)?
+        .parse::<u64>()
+        .map_err(|_| DriveApiError::WriteAuthorityVersionInvalid)?;
+
+    if remote_version == 0 {
+        return Err(DriveApiError::WriteAuthorityVersionInvalid);
+    }
+
+    let md5_checksum = metadata
+        .md5_checksum
+        .map(|value| {
+            if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(DriveApiError::WriteAuthorityMd5Invalid);
+            }
+            Ok(value.to_ascii_lowercase())
+        })
+        .transpose()?;
+
+    if metadata.mime_type == GOOGLE_DRIVE_FOLDER_MIME_TYPE && md5_checksum.is_some() {
+        return Err(DriveApiError::WriteAuthorityMd5Invalid);
+    }
+
+    Ok(DriveWriteAuthorityObservation {
+        remote_id: metadata.id,
+        remote_version,
+        md5_checksum,
+        can_edit: metadata.capabilities.can_edit,
+        can_trash: metadata.capabilities.can_trash,
+        can_add_children: metadata.capabilities.can_add_children,
+    })
+}
+
 fn validate_blob_fingerprint_response(
     expected_remote_id: &str,
     metadata: DriveBlobFingerprintResponse,
@@ -1090,6 +1229,18 @@ pub enum DriveApiError {
     DownloadSafetyLimitExceeded,
     #[error("Google Drive file download stream I/O failed")]
     ContentIo(#[from] std::io::Error),
+    #[error("Google Drive write-authority metadata ID does not match the requested item")]
+    WriteAuthorityMetadataIdMismatch,
+    #[error("Google Drive write-authority target is trashed")]
+    WriteAuthorityItemTrashed,
+    #[error("Google Drive write-authority target is a provider-native item")]
+    WriteAuthorityProviderNativeUnsupported,
+    #[error("Google Drive write-authority version is missing")]
+    WriteAuthorityVersionMissing,
+    #[error("Google Drive write-authority version is invalid")]
+    WriteAuthorityVersionInvalid,
+    #[error("Google Drive write-authority MD5 metadata is invalid")]
+    WriteAuthorityMd5Invalid,
     #[error("Google Drive blob fingerprint metadata is invalid")]
     InvalidBlobFingerprintMetadata,
     #[error("Google Drive blob fingerprint target is not a supported ordinary file")]
@@ -1137,6 +1288,81 @@ pub enum DriveApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase5h2_write_authority_parses_version_capabilities_and_redacts_metadata() {
+        let observation = validate_write_authority_response(
+            "file-id",
+            DriveWriteAuthorityResponse {
+                id: "file-id".into(),
+                mime_type: "text/plain".into(),
+                trashed: false,
+                version: Some("42".into()),
+                md5_checksum: Some("ABCDEFABCDEFABCDEFABCDEFABCDEFAB".into()),
+                capabilities: DriveWriteCapabilitiesResponse {
+                    can_edit: true,
+                    can_trash: true,
+                    can_add_children: false,
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(observation.remote_version, 42);
+        assert_eq!(
+            observation.md5_checksum(),
+            Some("abcdefabcdefabcdefabcdefabcdefab")
+        );
+        assert!(observation.can_edit);
+        assert!(observation.can_trash);
+        assert!(!observation.can_add_children);
+
+        let debug = format!("{observation:?}");
+        assert!(!debug.contains("file-id"));
+        assert!(!debug.contains("abcdefabcdefabcdefabcdefabcdefab"));
+    }
+
+    #[test]
+    fn phase5h2_write_authority_rejects_native_trashed_and_invalid_version() {
+        let native = DriveWriteAuthorityResponse {
+            id: "native".into(),
+            mime_type: "application/vnd.google-apps.document".into(),
+            trashed: false,
+            version: Some("1".into()),
+            md5_checksum: None,
+            capabilities: DriveWriteCapabilitiesResponse::default(),
+        };
+        assert!(matches!(
+            validate_write_authority_response("native", native),
+            Err(DriveApiError::WriteAuthorityProviderNativeUnsupported)
+        ));
+
+        let trashed = DriveWriteAuthorityResponse {
+            id: "trashed".into(),
+            mime_type: "text/plain".into(),
+            trashed: true,
+            version: Some("2".into()),
+            md5_checksum: None,
+            capabilities: DriveWriteCapabilitiesResponse::default(),
+        };
+        assert!(matches!(
+            validate_write_authority_response("trashed", trashed),
+            Err(DriveApiError::WriteAuthorityItemTrashed)
+        ));
+
+        let invalid_version = DriveWriteAuthorityResponse {
+            id: "bad-version".into(),
+            mime_type: "text/plain".into(),
+            trashed: false,
+            version: Some("0".into()),
+            md5_checksum: None,
+            capabilities: DriveWriteCapabilitiesResponse::default(),
+        };
+        assert!(matches!(
+            validate_write_authority_response("bad-version", invalid_version),
+            Err(DriveApiError::WriteAuthorityVersionInvalid)
+        ));
+    }
 
     #[test]
     fn bounded_download_copy_enforces_limit() {

@@ -1664,6 +1664,57 @@ impl Storage {
         query_remote_write_authority(&self.connection, sync_root_id, remote_id)
     }
 
+    pub fn replace_sync_root_remote_write_authority_snapshot(
+        &mut self,
+        sync_root_id: &str,
+        authorities: &[RemoteWriteAuthoritySnapshot],
+    ) -> Result<usize, StorageError> {
+        let transaction = self.connection.transaction()?;
+
+        transaction.execute(
+            "DELETE FROM sync_root_remote_write_authority WHERE sync_root_id = ?1",
+            params![sync_root_id],
+        )?;
+
+        for authority in authorities {
+            transaction.execute(
+                "INSERT INTO sync_root_remote_write_authority (
+                    sync_root_id, remote_id, remote_version,
+                    checksum_algorithm, content_checksum,
+                    can_edit, can_trash, can_add_children, observed_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    sync_root_id,
+                    authority.remote_id(),
+                    authority.remote_version.to_string(),
+                    authority.checksum_algorithm(),
+                    authority.content_checksum(),
+                    i64::from(authority.can_edit),
+                    i64::from(authority.can_trash),
+                    i64::from(authority.can_add_children),
+                    authority.observed_at_unix_ms,
+                ],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(authorities.len())
+    }
+
+    pub fn sync_root_remote_write_authority_count(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_remote_write_authority
+             WHERE sync_root_id = ?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
     pub fn create_sync_root_remote_write_intent(
         &mut self,
         sync_root_id: &str,
@@ -8407,5 +8458,120 @@ mod phase5h1_remote_write_intent_foundation_tests {
             storage.create_sync_root_remote_write_intent(&root.id, &input),
             Err(StorageError::RemoteWriteIntentRootNotWriteCapable)
         ));
+    }
+}
+
+#[cfg(test)]
+mod phase5h2_remote_write_authority_observation_tests {
+    use super::*;
+
+    fn fixture(label: &str) -> (Storage, SyncRoot) {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), format!("{label}-subject"), None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+        let root = SyncRoot::new(
+            format!("{label}-root"),
+            provider,
+            account.subject,
+            format!("/tmp/{label}-root"),
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+        (storage, root)
+    }
+
+    #[test]
+    fn phase5h2_authority_snapshot_replacement_is_atomic_and_exact() {
+        let (mut storage, root) = fixture("phase5h2");
+        let first = vec![
+            RemoteWriteAuthoritySnapshot::new("remote-root", 10, None, None, true, true, true, 20)
+                .unwrap(),
+            RemoteWriteAuthoritySnapshot::new(
+                "file-1",
+                11,
+                Some("md5".into()),
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                true,
+                true,
+                false,
+                20,
+            )
+            .unwrap(),
+        ];
+
+        assert_eq!(
+            storage
+                .replace_sync_root_remote_write_authority_snapshot(&root.id, &first)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_write_authority_count(&root.id)
+                .unwrap(),
+            2
+        );
+
+        let replacement = vec![
+            RemoteWriteAuthoritySnapshot::new("remote-root", 12, None, None, true, true, true, 30)
+                .unwrap(),
+        ];
+        storage
+            .replace_sync_root_remote_write_authority_snapshot(&root.id, &replacement)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .sync_root_remote_write_authority_count(&root.id)
+                .unwrap(),
+            1
+        );
+        assert!(
+            storage
+                .sync_root_remote_write_authority(&root.id, "file-1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn phase5h2_duplicate_authority_rolls_back_replacement() {
+        let (mut storage, root) = fixture("phase5h2-rollback");
+        let original =
+            RemoteWriteAuthoritySnapshot::new("original", 5, None, None, true, true, false, 10)
+                .unwrap();
+        storage
+            .replace_sync_root_remote_write_authority_snapshot(&root.id, &[original])
+            .unwrap();
+
+        let duplicate =
+            RemoteWriteAuthoritySnapshot::new("duplicate", 6, None, None, true, true, false, 11)
+                .unwrap();
+
+        assert!(
+            storage
+                .replace_sync_root_remote_write_authority_snapshot(
+                    &root.id,
+                    &[duplicate.clone(), duplicate],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_write_authority_count(&root.id)
+                .unwrap(),
+            1
+        );
+        assert!(
+            storage
+                .sync_root_remote_write_authority(&root.id, "original")
+                .unwrap()
+                .is_some()
+        );
     }
 }

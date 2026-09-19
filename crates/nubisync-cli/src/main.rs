@@ -32,7 +32,7 @@ use nubisync_daemon::{
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
 };
-use nubisync_storage::Storage;
+use nubisync_storage::{RemoteWriteAuthoritySnapshot, Storage};
 use std::{
     collections::{HashSet, VecDeque},
     env, fs,
@@ -171,6 +171,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_local_journal()
+        }
+        [sync, roots, observe_write_authority, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && observe_write_authority == "observe-write-authority"
+                && approve == "--approve" =>
+        {
+            sync_roots_observe_write_authority()
         }
         [sync, roots, convergence_plan, approve]
             if sync == "sync"
@@ -425,6 +433,7 @@ USAGE:
   nubisync sync roots local-baseline --approve
   nubisync sync roots local-diff --approve
   nubisync sync roots local-journal --approve
+  nubisync sync roots observe-write-authority --approve
   nubisync sync roots convergence-plan --approve
   nubisync sync roots converge --approve
   nubisync sync roots stale-files-plan --approve
@@ -807,6 +816,199 @@ fn sync_roots_metadata_step() -> Result<(), CliError> {
     println!("REMOTE_METADATA_PRINTED=no");
     println!("FILE_CONTENT_ACCESSED=no");
     println!("FILESYSTEM_MUTATION=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_observe_write_authority() -> Result<(), CliError> {
+    const MAX_OBSERVED_ITEMS: usize = 10_000;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootWriteAuthoritySelectionFailed);
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootWriteAuthoritySelectionFailed)?;
+    let remote_root_id = root
+        .remote_root_id
+        .as_deref()
+        .ok_or(CliError::SyncRootInventoryRemoteRootMissing)?;
+
+    let state = storage.sync_root_remote_inventory_state(&root.id)?;
+    let durable_cursor = storage
+        .sync_root_change_cursor(&root.id)?
+        .ok_or(CliError::SyncRootWriteAuthorityCatalogNotReady)?;
+
+    if !state.ready_for_reconciliation()
+        || storage.sync_root_change_window_state(&root.id)?.is_some()
+    {
+        return Err(CliError::SyncRootWriteAuthorityCatalogNotReady);
+    }
+
+    let items = storage.list_sync_root_remote_items(&root.id)?;
+    let expected_item_count =
+        usize::try_from(state.item_count).map_err(|_| CliError::NumericOverflow)?;
+    if items.len() != expected_item_count {
+        return Err(CliError::SyncRootWriteAuthorityCatalogNotReady);
+    }
+
+    let observation_count = items
+        .len()
+        .checked_add(1)
+        .ok_or(CliError::NumericOverflow)?;
+    if observation_count > MAX_OBSERVED_ITEMS {
+        return Err(CliError::SyncRootWriteAuthorityObservationLimitExceeded);
+    }
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_WRITE_AUTHORITY_STAGE=refresh_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("SYNC_ROOT_WRITE_AUTHORITY_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_WRITE_AUTHORITY_STAGE=establish_remote_fence");
+    let before_cursor = api.current_change_cursor()?;
+    if before_cursor != durable_cursor {
+        return Err(CliError::SyncRootWriteAuthorityCatalogNotCurrent);
+    }
+
+    let observed_at_unix_ms = unix_time_ms()?;
+    let mut authorities = Vec::with_capacity(observation_count);
+
+    println!("SYNC_ROOT_WRITE_AUTHORITY_STAGE=observe_metadata");
+    let root_observation = api.observe_write_authority(remote_root_id)?;
+    authorities.push(RemoteWriteAuthoritySnapshot::new(
+        root_observation.remote_id(),
+        root_observation.remote_version,
+        root_observation.md5_checksum().map(|_| "md5".to_owned()),
+        root_observation.md5_checksum().map(str::to_owned),
+        root_observation.can_edit,
+        root_observation.can_trash,
+        root_observation.can_add_children,
+        observed_at_unix_ms,
+    )?);
+
+    let mut seen = HashSet::from([remote_root_id.to_owned()]);
+    for item in &items {
+        if !seen.insert(item.remote_id.clone()) {
+            return Err(CliError::SyncRootWriteAuthorityDuplicateRemoteId);
+        }
+
+        let observation = api.observe_write_authority(&item.remote_id)?;
+        authorities.push(RemoteWriteAuthoritySnapshot::new(
+            observation.remote_id(),
+            observation.remote_version,
+            observation.md5_checksum().map(|_| "md5".to_owned()),
+            observation.md5_checksum().map(str::to_owned),
+            observation.can_edit,
+            observation.can_trash,
+            observation.can_add_children,
+            observed_at_unix_ms,
+        )?);
+    }
+
+    let after_cursor = api.current_change_cursor()?;
+    if after_cursor != before_cursor {
+        return Err(CliError::SyncRootWriteAuthorityRemoteChangedDuringObservation);
+    }
+
+    if storage.sync_root_change_cursor(&root.id)?.as_ref() != Some(&durable_cursor)
+        || storage.sync_root_change_window_state(&root.id)?.is_some()
+    {
+        return Err(CliError::SyncRootWriteAuthorityCatalogNotReady);
+    }
+
+    println!("SYNC_ROOT_WRITE_AUTHORITY_STAGE=commit_snapshot");
+    let persisted =
+        storage.replace_sync_root_remote_write_authority_snapshot(&root.id, &authorities)?;
+    let durable_count = storage.sync_root_remote_write_authority_count(&root.id)?;
+
+    if persisted != authorities.len()
+        || durable_count
+            != u64::try_from(authorities.len()).map_err(|_| CliError::NumericOverflow)?
+    {
+        return Err(CliError::SyncRootWriteAuthorityPersistenceMismatch);
+    }
+
+    let checksummed = authorities
+        .iter()
+        .filter(|authority| authority.content_checksum().is_some())
+        .count();
+    let editable = authorities
+        .iter()
+        .filter(|authority| authority.can_edit)
+        .count();
+    let trashable = authorities
+        .iter()
+        .filter(|authority| authority.can_trash)
+        .count();
+    let add_children = authorities
+        .iter()
+        .filter(|authority| authority.can_add_children)
+        .count();
+
+    println!("SYNC_ROOT_WRITE_AUTHORITY=PASS");
+    println!("MODE={}", root.mode.as_str());
+    println!("CATALOG_ITEMS={}", items.len());
+    println!("ROOT_AUTHORITY_OBSERVED=yes");
+    println!("AUTHORITIES_PERSISTED={persisted}");
+    println!("MD5_PRESENT={checksummed}");
+    println!("CAN_EDIT={editable}");
+    println!("CAN_TRASH={trashable}");
+    println!("CAN_ADD_CHILDREN={add_children}");
+    println!("REMOTE_CURSOR_STABLE=yes");
+    println!("CATALOG_CURSOR_MATCH=yes");
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUES_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("OAUTH_FULLSYNC_ACTIVATED=no");
     println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
@@ -4784,6 +4986,7 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "local-baseline"
                 | "local-diff"
                 | "local-journal"
+                | "observe-write-authority"
                 | "convergence-plan"
                 | "converge"
                 | "stale-files-plan"
@@ -4881,6 +5084,15 @@ mod sync_root_cli_tests {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(!cli_requires_cross_process_execution_lock(&args));
         }
+    }
+
+    #[test]
+    fn phase5h2_execution_lock_policy_covers_write_authority_observation() {
+        let args = ["sync", "roots", "observe-write-authority", "--approve"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(cli_requires_cross_process_execution_lock(&args));
     }
 
     #[test]
@@ -5112,6 +5324,20 @@ enum CliError {
     SyncRootInventorySelectionFailed,
     #[error("sync root metadata-step selection failed")]
     SyncRootMetadataStepSelectionFailed,
+    #[error("sync root write-authority observation selection failed")]
+    SyncRootWriteAuthoritySelectionFailed,
+    #[error("sync root catalog is not ready for write-authority observation")]
+    SyncRootWriteAuthorityCatalogNotReady,
+    #[error("sync root catalog is not current with the provider change boundary")]
+    SyncRootWriteAuthorityCatalogNotCurrent,
+    #[error("sync root write-authority observation exceeded the safety item limit")]
+    SyncRootWriteAuthorityObservationLimitExceeded,
+    #[error("sync root write-authority observation found a duplicate remote identifier")]
+    SyncRootWriteAuthorityDuplicateRemoteId,
+    #[error("Google Drive changed during write-authority observation")]
+    SyncRootWriteAuthorityRemoteChangedDuringObservation,
+    #[error("sync root write-authority snapshot persistence did not match observation")]
+    SyncRootWriteAuthorityPersistenceMismatch,
     #[error("sync root reconciliation-plan selection failed")]
     SyncRootReconcilePlanSelectionFailed,
     #[error("selected receive-only file is not ready for safe replacement")]
