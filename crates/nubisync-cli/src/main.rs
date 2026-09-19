@@ -1151,7 +1151,7 @@ fn sync_roots_activate_two_way() -> Result<(), CliError> {
         return Err(CliError::NoLocalGoogleAccount);
     }
 
-    let mut storage = Storage::open(&db_path)?;
+    let storage = Storage::open(&db_path)?;
     let provider = ProviderId::new("google-drive")?;
     let account = single_google_account(storage.list_accounts(&provider)?)?;
     let roots = storage.list_sync_roots(&provider, &account.subject)?;
