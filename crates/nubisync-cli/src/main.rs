@@ -30,7 +30,8 @@ use nubisync_daemon::{
     verify_selected_root_existing_files, verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
-    GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
+    GOOGLE_DRIVE_FULL_SCOPE, GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi,
+    GoogleOAuthConfig,
 };
 use nubisync_storage::{RemoteWriteAuthoritySnapshot, Storage};
 use std::{
@@ -45,6 +46,7 @@ use tiny_http::{Method, Response, Server};
 use url::Url;
 
 const REFRESH_TOKEN_PURPOSE: &str = "refresh-token";
+const FULLSYNC_REFRESH_TOKEN_PURPOSE: &str = "full-sync-refresh-token";
 const OAUTH_CLIENT_SUBJECT: &str = "oauth-desktop-client";
 const OAUTH_CLIENT_ID_PURPOSE: &str = "client-id";
 const OAUTH_CLIENT_SECRET_PURPOSE: &str = "client-secret";
@@ -109,6 +111,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             google_upgrade_readonly()
+        }
+        [auth, google, upgrade_full_sync, approve]
+            if auth == "auth"
+                && google == "google"
+                && upgrade_full_sync == "upgrade-full-sync"
+                && approve == "--approve" =>
+        {
+            google_upgrade_full_sync()
         }
         [auth, google, configure]
             if auth == "auth" && google == "google" && configure == "configure" =>
@@ -430,6 +440,7 @@ USAGE:
   nubisync auth keyring check
   nubisync auth google login
   nubisync auth google upgrade-readonly --approve
+  nubisync auth google upgrade-full-sync --approve
   nubisync auth google configure
   nubisync auth google status
   nubisync auth google refresh
@@ -557,6 +568,9 @@ fn google_status() -> Result<(), CliError> {
     let refresh_present = keyring
         .get(&refresh_token_key(&account.subject)?)?
         .is_some();
+    let fullsync_refresh_present = keyring
+        .get(&fullsync_refresh_token_key(&account.subject)?)?
+        .is_some();
     let (client_id_key, client_secret_key) = google_client_config_keys()?;
     let client_id_present = keyring.get(&client_id_key)?.is_some();
     let client_secret_present = keyring.get(&client_secret_key)?.is_some();
@@ -574,6 +588,10 @@ fn google_status() -> Result<(), CliError> {
         account.email.as_deref().unwrap_or("(not returned)")
     );
     println!("REFRESH_TOKEN_PRESENT={}", yes_no(refresh_present));
+    println!(
+        "FULLSYNC_REFRESH_TOKEN_PRESENT={}",
+        yes_no(fullsync_refresh_present)
+    );
     println!("CLIENT_CONFIG_PRESENT={}", yes_no(client_config_present));
     println!("DATABASE_PRESENT=yes");
     println!("NETWORK_CHECK=not_performed");
@@ -653,9 +671,11 @@ fn google_logout() -> Result<(), CliError> {
     let account = single_google_account(accounts)?;
     let keyring = KeyringSecretStore::default();
     keyring.delete(&refresh_token_key(&account.subject)?)?;
+    keyring.delete(&fullsync_refresh_token_key(&account.subject)?)?;
 
     println!("GOOGLE_LOGOUT=PASS");
     println!("REFRESH_TOKEN_REMOVED=yes");
+    println!("FULLSYNC_REFRESH_TOKEN_REMOVED=yes");
     println!("CLIENT_CONFIG_RETAINED=yes");
     println!("LOCAL_METADATA_RETAINED=yes");
 
@@ -4822,6 +4842,167 @@ fn google_upgrade_readonly() -> Result<(), CliError> {
     Ok(())
 }
 
+fn google_upgrade_full_sync() -> Result<(), CliError> {
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+
+    let keyring = KeyringSecretStore::default();
+    let readonly_key = refresh_token_key(&account.subject)?;
+    let fullsync_key = fullsync_refresh_token_key(&account.subject)?;
+
+    let readonly_before = keyring
+        .get(&readonly_key)?
+        .ok_or(CliError::MissingStoredRefreshToken)?;
+    let previous_fullsync = keyring.get(&fullsync_key)?;
+
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    validate_client_secret_text(&client_secret)?;
+
+    let server = Server::http("127.0.0.1:0").map_err(|_| CliError::LoopbackBindFailed)?;
+    let listen_addr = server
+        .server_addr()
+        .to_ip()
+        .ok_or(CliError::LoopbackBindFailed)?;
+
+    if !listen_addr.ip().is_loopback() {
+        return Err(CliError::LoopbackBindFailed);
+    }
+
+    let authorization =
+        oauth.begin_authorization(listen_addr.port(), GoogleDriveAccess::FullSync)?;
+
+    println!("GOOGLE_FULLSYNC_UPGRADE_STAGE=authorize");
+    println!("REQUESTED_DRIVE_ACCESS=full_sync");
+    println!("REQUESTED_SCOPE=drive");
+    println!("LOOPBACK_PORT={}", listen_addr.port());
+    println!("READONLY_REFRESH_TOKEN_PRESENT=yes");
+    println!("Opening Google authorization in your default browser...");
+
+    webbrowser::open(authorization.authorization_url().as_str())
+        .map_err(|_| CliError::BrowserOpenFailed)?;
+
+    let request = server
+        .recv_timeout(Duration::from_secs(180))
+        .map_err(|_| CliError::CallbackReceiveFailed)?
+        .ok_or(CliError::CallbackTimeout)?;
+
+    if request.method() != &Method::Get {
+        let _ = request.respond(
+            Response::from_string("NubiSync rejected this callback method.").with_status_code(405),
+        );
+        return Err(CliError::InvalidCallbackMethod);
+    }
+
+    let callback = Url::parse(&format!(
+        "http://127.0.0.1:{}{}",
+        listen_addr.port(),
+        request.url()
+    ))?;
+
+    let code = match authorization.accept_callback(&callback) {
+        Ok(code) => {
+            let _ = request.respond(Response::from_string(
+                "NubiSync received the Google FullSync authorization. You can close this tab.",
+            ));
+            code
+        }
+        Err(error) => {
+            let _ = request.respond(
+                Response::from_string(
+                    "NubiSync rejected the OAuth callback. Return to the terminal.",
+                )
+                .with_status_code(400),
+            );
+            return Err(error.into());
+        }
+    };
+
+    println!("GOOGLE_FULLSYNC_UPGRADE_STAGE=exchange_code");
+    let tokens = oauth.exchange_code(&authorization, &code, &client_secret)?;
+
+    if !oauth_scope_contains(tokens.scope(), GOOGLE_DRIVE_FULL_SCOPE) {
+        return Err(CliError::GoogleFullSyncScopeNotGranted);
+    }
+
+    println!("GOOGLE_FULLSYNC_UPGRADE_STAGE=verify_account");
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    let fresh_refresh_token = tokens
+        .refresh_token()
+        .ok_or(CliError::GoogleFullSyncRefreshTokenMissing)?;
+
+    // The existing ReceiveOnly credential is an independent authority lane.
+    // It must still be byte-for-byte unchanged before promotion.
+    let readonly_pre_promotion = keyring
+        .get(&readonly_key)?
+        .ok_or(CliError::MissingStoredRefreshToken)?;
+    if readonly_pre_promotion != readonly_before {
+        return Err(CliError::GoogleReadonlyCredentialChangedDuringFullSyncUpgrade);
+    }
+
+    println!("GOOGLE_FULLSYNC_UPGRADE_STAGE=promote_separate_credential");
+    keyring.put(
+        &fullsync_key,
+        SecretValue::new(fresh_refresh_token.as_bytes().to_vec())?,
+    )?;
+
+    let stored_fullsync = keyring
+        .get(&fullsync_key)?
+        .ok_or(CliError::GoogleFullSyncPromotionFailed)?;
+
+    let readonly_after = keyring
+        .get(&readonly_key)?
+        .ok_or(CliError::MissingStoredRefreshToken)?;
+
+    if stored_fullsync.expose_bytes() != fresh_refresh_token.as_bytes()
+        || readonly_after != readonly_before
+    {
+        match previous_fullsync {
+            Some(previous) => keyring.put(&fullsync_key, previous)?,
+            None => keyring.delete(&fullsync_key)?,
+        }
+
+        if readonly_after != readonly_before {
+            return Err(CliError::GoogleReadonlyCredentialChangedDuringFullSyncUpgrade);
+        }
+        return Err(CliError::GoogleFullSyncPromotionFailed);
+    }
+
+    println!("GOOGLE_FULLSYNC_UPGRADE=PASS");
+    println!("ACCOUNT_SUBJECT_MATCH=yes");
+    println!("REQUESTED_SCOPE=drive");
+    println!("GRANTED_SCOPE_VERIFIED=yes");
+    println!("FRESH_REFRESH_TOKEN_REQUIRED=yes");
+    println!("FULLSYNC_REFRESH_TOKEN_STORAGE=OS_KEYRING");
+    println!("FULLSYNC_KEY_PURPOSE=separate");
+    println!("READONLY_REFRESH_TOKEN_UNCHANGED=yes");
+    println!("ACCESS_TOKEN_STORAGE=memory_only");
+    println!("ROOT_MODE_CHANGED=no");
+    println!("DATABASE_MUTATION=no");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("DRIVE_FILE_CONTENT_ACCESSED=no");
+    println!("PROVIDER_WRITE_METHOD_CALLED=no");
+    println!("REMOTE_WRITE_INTENT_PERSISTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_CREDENTIAL_PRESENT=yes");
+    println!("DRIVE_WRITE_EXECUTION_ENABLED=no");
+
+    Ok(())
+}
+
 fn google_login() -> Result<(), CliError> {
     ensure_keyring_available()?;
 
@@ -5045,6 +5226,14 @@ fn refresh_token_key(account_subject: &str) -> Result<SecretKey, CliError> {
     )?)
 }
 
+fn fullsync_refresh_token_key(account_subject: &str) -> Result<SecretKey, CliError> {
+    Ok(SecretKey::new(
+        "google-drive",
+        account_subject,
+        FULLSYNC_REFRESH_TOKEN_PURPOSE,
+    )?)
+}
+
 fn required_secret_utf8(
     secret: Option<SecretValue>,
     missing_error: CliError,
@@ -5099,6 +5288,11 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "delete-file"
                 | "add"
         );
+    }
+
+    if args.len() >= 3 && args[0] == "auth" && args[1] == "google" && args[2] == "upgrade-full-sync"
+    {
+        return true;
     }
 
     args.len() >= 3 && args[0] == "drive" && args[1] == "catalog" && args[2] == "catchup"
@@ -5174,6 +5368,41 @@ mod sync_root_cli_tests {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(!cli_requires_cross_process_execution_lock(&args));
         }
+    }
+
+    #[test]
+    fn phase5h4_fullsync_scope_matching_is_exact_and_fail_closed() {
+        assert!(oauth_scope_contains(
+            Some("openid email https://www.googleapis.com/auth/drive profile"),
+            GOOGLE_DRIVE_FULL_SCOPE,
+        ));
+        assert!(!oauth_scope_contains(
+            Some("openid email https://www.googleapis.com/auth/drive.readonly profile"),
+            GOOGLE_DRIVE_FULL_SCOPE,
+        ));
+        assert!(!oauth_scope_contains(
+            Some("https://www.googleapis.com/auth/drive.file"),
+            GOOGLE_DRIVE_FULL_SCOPE,
+        ));
+        assert!(!oauth_scope_contains(None, GOOGLE_DRIVE_FULL_SCOPE));
+    }
+
+    #[test]
+    fn phase5h4_fullsync_refresh_key_is_distinct_from_receive_only_key() {
+        let readonly = refresh_token_key("subject").unwrap();
+        let fullsync = fullsync_refresh_token_key("subject").unwrap();
+        assert_ne!(readonly, fullsync);
+        assert_eq!(readonly.purpose, REFRESH_TOKEN_PURPOSE);
+        assert_eq!(fullsync.purpose, FULLSYNC_REFRESH_TOKEN_PURPOSE);
+    }
+
+    #[test]
+    fn phase5h4_execution_lock_covers_fullsync_upgrade() {
+        let args = ["auth", "google", "upgrade-full-sync", "--approve"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(cli_requires_cross_process_execution_lock(&args));
     }
 
     #[test]
@@ -5345,6 +5574,14 @@ enum CliError {
     GoogleReadonlyScopeNotGranted,
     #[error("Google did not return a new refresh token for the Drive read-only upgrade")]
     GoogleReadonlyRefreshTokenMissing,
+    #[error("Google did not grant the exact Drive FullSync scope")]
+    GoogleFullSyncScopeNotGranted,
+    #[error("Google did not return a fresh refresh token for the FullSync upgrade")]
+    GoogleFullSyncRefreshTokenMissing,
+    #[error("the ReceiveOnly refresh credential changed during FullSync upgrade")]
+    GoogleReadonlyCredentialChangedDuringFullSyncUpgrade,
+    #[error("the FullSync refresh credential failed its keyring promotion postcondition")]
+    GoogleFullSyncPromotionFailed,
     #[error("failed to bind the OAuth callback to loopback")]
     LoopbackBindFailed,
     #[error("failed to open the system browser")]
