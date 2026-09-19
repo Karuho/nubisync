@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 pub const REMOTE_WRITE_INTENT_BATCH_MAX: usize = 64;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
@@ -571,6 +571,122 @@ impl std::fmt::Debug for RemoteWriteIntentInput {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct RemoteWriteFolderCreateSettlementInput {
+    pub intent_id: i64,
+    pub source_local_event_id: i64,
+    pub expected_intent_execution_generation: u64,
+    pub expected_from_generation: u64,
+    pub expected_item_count: u64,
+    pub expected_snapshot_completed_at_unix_ms: Option<i64>,
+    promoted_directory: LocalItemSnapshot,
+    residual_events: Vec<LocalChangeEventInput>,
+    predetermined_remote_id: String,
+    expected_parent_remote_id: String,
+    pub settled_at_unix_ms: i64,
+}
+
+impl RemoteWriteFolderCreateSettlementInput {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        intent_id: i64,
+        source_local_event_id: i64,
+        expected_intent_execution_generation: u64,
+        expected_from_generation: u64,
+        expected_item_count: u64,
+        expected_snapshot_completed_at_unix_ms: Option<i64>,
+        promoted_directory: LocalItemSnapshot,
+        residual_events: Vec<LocalChangeEventInput>,
+        predetermined_remote_id: impl Into<String>,
+        expected_parent_remote_id: impl Into<String>,
+        settled_at_unix_ms: i64,
+    ) -> Result<Self, StorageError> {
+        let predetermined_remote_id = predetermined_remote_id.into();
+        let expected_parent_remote_id = expected_parent_remote_id.into();
+        if intent_id <= 0
+            || source_local_event_id <= 0
+            || expected_from_generation == 0
+            || settled_at_unix_ms <= 0
+            || promoted_directory.kind() != LocalItemKind::Directory
+            || promoted_directory.size_bytes().is_some()
+            || !is_safe_local_event_relative_path(promoted_directory.relative_path())
+        {
+            return Err(StorageError::InvalidRemoteWriteSettlement);
+        }
+        validate_remote_write_identifier(&predetermined_remote_id)?;
+        validate_remote_write_identifier(&expected_parent_remote_id)?;
+        if residual_events
+            .iter()
+            .any(|event| event.relative_path() == promoted_directory.relative_path())
+        {
+            return Err(StorageError::InvalidRemoteWriteSettlement);
+        }
+        Ok(Self {
+            intent_id,
+            source_local_event_id,
+            expected_intent_execution_generation,
+            expected_from_generation,
+            expected_item_count,
+            expected_snapshot_completed_at_unix_ms,
+            promoted_directory,
+            residual_events,
+            predetermined_remote_id,
+            expected_parent_remote_id,
+            settled_at_unix_ms,
+        })
+    }
+
+    pub fn promoted_directory(&self) -> &LocalItemSnapshot {
+        &self.promoted_directory
+    }
+    pub fn residual_events(&self) -> &[LocalChangeEventInput] {
+        &self.residual_events
+    }
+    pub fn predetermined_remote_id(&self) -> &str {
+        &self.predetermined_remote_id
+    }
+    pub fn expected_parent_remote_id(&self) -> &str {
+        &self.expected_parent_remote_id
+    }
+}
+
+impl std::fmt::Debug for RemoteWriteFolderCreateSettlementInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteWriteFolderCreateSettlementInput")
+            .field("intent_id", &self.intent_id)
+            .field("source_local_event_id", &self.source_local_event_id)
+            .field(
+                "expected_intent_execution_generation",
+                &self.expected_intent_execution_generation,
+            )
+            .field("expected_from_generation", &self.expected_from_generation)
+            .field("expected_item_count", &self.expected_item_count)
+            .field(
+                "expected_snapshot_completed_at_unix_ms",
+                &self.expected_snapshot_completed_at_unix_ms,
+            )
+            .field("promoted_directory", &"[redacted]")
+            .field("residual_event_count", &self.residual_events.len())
+            .field("predetermined_remote_id", &"[redacted]")
+            .field("expected_parent_remote_id", &"[redacted]")
+            .field("settled_at_unix_ms", &self.settled_at_unix_ms)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteWriteFolderCreateSettlementResult {
+    pub settled_from_generation: u64,
+    pub settled_to_generation: u64,
+    pub baseline_item_count: u64,
+    pub residual_pending_events: u64,
+    pub superseded_old_events: u64,
+    pub source_event_applied: bool,
+    pub ownership_receipt_created: bool,
+    pub settlement_recorded: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct RemoteWriteFolderCreateCandidate {
     pub intent_id: i64,
     pub source_local_event_id: i64,
@@ -1023,6 +1139,27 @@ impl Storage {
                 sync_root_remote_write_intents_predetermined_id_idx
             ON sync_root_remote_write_intents(sync_root_id, predetermined_remote_id)
             WHERE predetermined_remote_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS sync_root_remote_write_settlements (
+                intent_id INTEGER PRIMARY KEY,
+                sync_root_id TEXT NOT NULL,
+                source_local_event_id INTEGER NOT NULL,
+                settled_from_generation INTEGER NOT NULL CHECK (settled_from_generation > 0),
+                settled_to_generation INTEGER NOT NULL CHECK (
+                    settled_to_generation = settled_from_generation + 1
+                ),
+                settled_at_unix_ms INTEGER NOT NULL,
+                UNIQUE (sync_root_id, source_local_event_id),
+                FOREIGN KEY (intent_id)
+                    REFERENCES sync_root_remote_write_intents(id) ON DELETE CASCADE,
+                FOREIGN KEY (sync_root_id)
+                    REFERENCES sync_roots(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_local_event_id)
+                    REFERENCES sync_root_local_change_events(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS sync_root_remote_write_settlements_root_idx
+            ON sync_root_remote_write_settlements(sync_root_id, settled_at_unix_ms);
 
             CREATE TABLE IF NOT EXISTS local_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2203,6 +2340,390 @@ impl Storage {
             relative_path,
             status: RemoteWriteIntentStatus::parse(&status)?,
         }))
+    }
+
+    pub fn sync_root_remote_write_settlement_exists(
+        &self,
+        intent_id: i64,
+    ) -> Result<bool, StorageError> {
+        if intent_id <= 0 {
+            return Err(StorageError::InvalidRemoteWriteSettlement);
+        }
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM sync_root_remote_write_settlements WHERE intent_id=?1",
+            params![intent_id],
+            |row| row.get(0),
+        )?;
+        Ok(count == 1)
+    }
+
+    pub fn sync_root_remote_write_settlement_count(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM sync_root_remote_write_settlements WHERE sync_root_id=?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn settle_confirmed_sync_root_folder_create(
+        &mut self,
+        sync_root_id: &str,
+        input: &RemoteWriteFolderCreateSettlementInput,
+    ) -> Result<RemoteWriteFolderCreateSettlementResult, StorageError> {
+        let expected_generation = i64::try_from(input.expected_from_generation)
+            .map_err(|_| StorageError::NumericOverflow)?;
+        let expected_item_count =
+            i64::try_from(input.expected_item_count).map_err(|_| StorageError::NumericOverflow)?;
+        let expected_execution_generation =
+            i64::try_from(input.expected_intent_execution_generation)
+                .map_err(|_| StorageError::NumericOverflow)?;
+        let next_generation = expected_generation
+            .checked_add(1)
+            .ok_or(StorageError::NumericOverflow)?;
+        let next_item_count = expected_item_count
+            .checked_add(1)
+            .ok_or(StorageError::NumericOverflow)?;
+
+        let transaction = self.connection.transaction()?;
+
+        let already_settled: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_remote_write_settlements WHERE intent_id=?1",
+            params![input.intent_id],
+            |row| row.get(0),
+        )?;
+        if already_settled != 0 {
+            return Err(StorageError::RemoteWriteSettlementAlreadyExists);
+        }
+
+        let mode: Option<String> = transaction
+            .query_row(
+                "SELECT mode FROM sync_roots WHERE id=?1",
+                params![sync_root_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(mode) = mode else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+        if SyncMode::parse(&mode)? != SyncMode::TwoWay {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let state: Option<(i64, i64, Option<i64>, i64, i64)> = transaction
+            .query_row(
+                "SELECT snapshot_complete, item_count, snapshot_completed_at_unix_ms,
+                    generation, observation_valid
+             FROM sync_root_local_inventory_state WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((snapshot_complete, item_count, completed_at, generation, observation_valid)) =
+            state
+        else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+        if snapshot_complete == 0
+            || observation_valid == 0
+            || item_count != expected_item_count
+            || generation != expected_generation
+            || completed_at != input.expected_snapshot_completed_at_unix_ms
+        {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let intent: Option<(
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        )> = transaction
+            .query_row(
+                "SELECT source_local_event_id, baseline_generation, operation_kind, status,
+                    relative_path, local_kind, local_device_id, local_inode,
+                    predetermined_remote_id, expected_parent_remote_id, execution_generation
+             FROM sync_root_remote_write_intents WHERE id=?1 AND sync_root_id=?2",
+                params![input.intent_id, sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            source_local_event_id,
+            baseline_generation,
+            operation_kind,
+            status,
+            relative_path,
+            local_kind,
+            local_device_id,
+            local_inode,
+            predetermined_remote_id,
+            expected_parent_remote_id,
+            execution_generation,
+        )) = intent
+        else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+
+        let promoted = input.promoted_directory();
+        let expected_device_id = local_device_id
+            .as_deref()
+            .ok_or(StorageError::RemoteWriteSettlementPreconditionFailed)?
+            .parse::<u64>()
+            .map_err(|_| StorageError::RemoteWriteSettlementPreconditionFailed)?;
+        let expected_inode = local_inode
+            .as_deref()
+            .ok_or(StorageError::RemoteWriteSettlementPreconditionFailed)?
+            .parse::<u64>()
+            .map_err(|_| StorageError::RemoteWriteSettlementPreconditionFailed)?;
+
+        if source_local_event_id != input.source_local_event_id
+            || baseline_generation != expected_generation
+            || operation_kind != "create_folder"
+            || status != "confirmed"
+            || relative_path != promoted.relative_path()
+            || local_kind != "directory"
+            || expected_device_id != promoted.device_id()
+            || expected_inode != promoted.inode()
+            || predetermined_remote_id.as_deref() != Some(input.predetermined_remote_id())
+            || expected_parent_remote_id.as_deref() != Some(input.expected_parent_remote_id())
+            || execution_generation != expected_execution_generation
+        {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let source_event: Option<(String, String, Option<String>, String, i64)> = transaction
+            .query_row(
+                "SELECT event_kind, relative_path, current_kind, status, baseline_generation
+             FROM sync_root_local_change_events WHERE id=?1 AND sync_root_id=?2",
+                params![input.source_local_event_id, sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((event_kind, event_path, current_kind, event_status, event_generation)) =
+            source_event
+        else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+        if event_kind != "created"
+            || event_path != promoted.relative_path()
+            || current_kind.as_deref() != Some("directory")
+            || event_status != "pending"
+            || event_generation != expected_generation
+        {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let expected_name = promoted
+            .relative_path()
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .ok_or(StorageError::RemoteWriteSettlementPreconditionFailed)?;
+        let remote: Option<(Option<String>, String, String, i64)> = transaction
+            .query_row(
+                "SELECT parent_remote_id, name, item_kind, trashed
+             FROM sync_root_remote_items WHERE sync_root_id=?1 AND remote_id=?2",
+                params![sync_root_id, input.predetermined_remote_id()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((remote_parent, remote_name, remote_kind, remote_trashed)) = remote else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+        if remote_parent.as_deref() != Some(input.expected_parent_remote_id())
+            || remote_name != expected_name
+            || remote_kind != "folder"
+            || remote_trashed != 0
+        {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let existing_baseline: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_local_items WHERE sync_root_id=?1 AND relative_path=?2",
+            params![sync_root_id, promoted.relative_path()],
+            |row| row.get(0),
+        )?;
+        if existing_baseline != 0 {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        transaction.execute(
+            "INSERT INTO sync_root_local_items (
+                sync_root_id, relative_path, item_kind, size_bytes, modified_unix_ns,
+                device_id, inode, observed_at_unix_ms
+             ) VALUES (?1,?2,'directory',NULL,?3,?4,?5,?6)",
+            params![
+                sync_root_id,
+                promoted.relative_path(),
+                promoted.modified_unix_ns(),
+                promoted.device_id().to_string(),
+                promoted.inode().to_string(),
+                input.settled_at_unix_ms
+            ],
+        )?;
+
+        let updated_state = transaction.execute(
+            "UPDATE sync_root_local_inventory_state
+             SET item_count=?2, snapshot_completed_at_unix_ms=?3, generation=?4, observation_valid=1
+             WHERE sync_root_id=?1 AND snapshot_complete=1 AND item_count=?5
+               AND generation=?6 AND observation_valid=1",
+            params![
+                sync_root_id,
+                next_item_count,
+                input.settled_at_unix_ms,
+                next_generation,
+                expected_item_count,
+                expected_generation
+            ],
+        )?;
+        if updated_state != 1 {
+            return Err(StorageError::RemoteWriteSettlementCompareAndSetFailed);
+        }
+
+        let source_applied = transaction.execute(
+            "UPDATE sync_root_local_change_events SET status='applied'
+             WHERE id=?1 AND sync_root_id=?2 AND baseline_generation=?3 AND status='pending'",
+            params![
+                input.source_local_event_id,
+                sync_root_id,
+                expected_generation
+            ],
+        )?;
+        if source_applied != 1 {
+            return Err(StorageError::RemoteWriteSettlementCompareAndSetFailed);
+        }
+
+        let superseded = transaction.execute(
+            "UPDATE sync_root_local_change_events SET status='superseded'
+             WHERE sync_root_id=?1 AND baseline_generation=?2 AND status='pending'",
+            params![sync_root_id, expected_generation],
+        )?;
+
+        for event in input.residual_events() {
+            transaction.execute(
+                "INSERT INTO sync_root_local_change_events (
+                    sync_root_id, baseline_generation, baseline_item_count,
+                    baseline_snapshot_completed_at_unix_ms, event_kind, relative_path,
+                    baseline_kind, current_kind, observed_at_unix_ms, status
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending')",
+                params![
+                    sync_root_id,
+                    next_generation,
+                    next_item_count,
+                    input.settled_at_unix_ms,
+                    event.kind.as_str(),
+                    event.relative_path(),
+                    event.baseline_kind.map(LocalItemKind::as_str),
+                    event.current_kind.map(LocalItemKind::as_str),
+                    input.settled_at_unix_ms
+                ],
+            )?;
+        }
+
+        let pending_residual: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_local_change_events
+             WHERE sync_root_id=?1 AND baseline_generation=?2 AND status='pending'",
+            params![sync_root_id, next_generation],
+            |row| row.get(0),
+        )?;
+        let expected_residual = i64::try_from(input.residual_events().len())
+            .map_err(|_| StorageError::NumericOverflow)?;
+        if pending_residual != expected_residual {
+            return Err(StorageError::RemoteWriteSettlementResidualMismatch);
+        }
+
+        transaction.execute(
+            "INSERT INTO sync_root_directory_materialization_receipts (
+                sync_root_id, remote_id, relative_path, materialized_at_unix_ms, receipt_state
+             ) VALUES (?1,?2,?3,?4,'current')",
+            params![
+                sync_root_id,
+                input.predetermined_remote_id(),
+                promoted.relative_path(),
+                input.settled_at_unix_ms
+            ],
+        )?;
+
+        transaction.execute(
+            "INSERT INTO sync_root_remote_write_settlements (
+                intent_id, sync_root_id, source_local_event_id,
+                settled_from_generation, settled_to_generation, settled_at_unix_ms
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                input.intent_id,
+                sync_root_id,
+                input.source_local_event_id,
+                expected_generation,
+                next_generation,
+                input.settled_at_unix_ms
+            ],
+        )?;
+
+        let durable_baseline_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_local_items WHERE sync_root_id=?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        if durable_baseline_count != next_item_count {
+            return Err(StorageError::RemoteWriteSettlementBaselineCountMismatch);
+        }
+
+        transaction.commit()?;
+        Ok(RemoteWriteFolderCreateSettlementResult {
+            settled_from_generation: input.expected_from_generation,
+            settled_to_generation: u64::try_from(next_generation)
+                .map_err(|_| StorageError::NumericOverflow)?,
+            baseline_item_count: u64::try_from(next_item_count)
+                .map_err(|_| StorageError::NumericOverflow)?,
+            residual_pending_events: u64::try_from(pending_residual)
+                .map_err(|_| StorageError::NumericOverflow)?,
+            superseded_old_events: u64::try_from(superseded)
+                .map_err(|_| StorageError::NumericOverflow)?,
+            source_event_applied: true,
+            ownership_receipt_created: true,
+            settlement_recorded: true,
+        })
     }
 
     pub fn list_sync_root_folder_create_candidates(
@@ -5911,6 +6432,18 @@ pub enum StorageError {
     InvalidRemoteWriteIntent,
     #[error("remote-write intent batch must contain between 1 and 64 intents")]
     InvalidRemoteWriteIntentBatch,
+    #[error("remote-write settlement input is invalid")]
+    InvalidRemoteWriteSettlement,
+    #[error("remote-write settlement already exists")]
+    RemoteWriteSettlementAlreadyExists,
+    #[error("remote-write settlement precondition failed")]
+    RemoteWriteSettlementPreconditionFailed,
+    #[error("remote-write settlement compare-and-set failed")]
+    RemoteWriteSettlementCompareAndSetFailed,
+    #[error("remote-write settlement residual journal mismatch")]
+    RemoteWriteSettlementResidualMismatch,
+    #[error("remote-write settlement baseline count mismatch")]
+    RemoteWriteSettlementBaselineCountMismatch,
     #[error("remote-write intent execution transition is invalid")]
     InvalidRemoteWriteIntentExecutionTransition,
     #[error("remote-write intent execution precondition failed")]
@@ -8415,9 +8948,9 @@ mod phase5c10_directory_receipt_tests {
     }
 
     #[test]
-    fn schema_v17_contains_directory_receipts() {
+    fn schema_v18_contains_directory_receipts() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 17);
+        assert_eq!(storage.schema_version().unwrap(), 18);
 
         let exists: i64 = storage
             .connection
@@ -8968,9 +9501,9 @@ mod phase5f1_local_inventory_tests {
     }
 
     #[test]
-    fn phase5f1_schema_is_v17() {
+    fn phase5f1_schema_is_v18() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 17);
+        assert_eq!(storage.schema_version().unwrap(), 18);
     }
 }
 
@@ -9116,9 +9649,9 @@ mod phase5f4_local_journal_tests {
     }
 
     #[test]
-    fn phase5f4_schema_is_v17() {
+    fn phase5f4_schema_is_v18() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 17);
+        assert_eq!(storage.schema_version().unwrap(), 18);
     }
 }
 
@@ -9229,9 +9762,9 @@ mod phase5f5_observation_fence_tests {
     }
 
     #[test]
-    fn phase5f5_schema_is_v17() {
+    fn phase5f5_schema_is_v18() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 17);
+        assert_eq!(storage.schema_version().unwrap(), 18);
     }
 }
 
@@ -9324,9 +9857,9 @@ mod phase5h1_remote_write_intent_foundation_tests {
     }
 
     #[test]
-    fn phase5h1_schema_is_v17_and_tables_exist() {
+    fn phase5h1_schema_is_v18_and_tables_exist() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 17);
+        assert_eq!(storage.schema_version().unwrap(), 18);
         for table in [
             "sync_root_remote_write_authority",
             "sync_root_remote_write_intents",
@@ -9733,9 +10266,9 @@ mod phase5h3_remote_write_planner_storage_tests {
     }
 
     #[test]
-    fn phase5h3_schema_is_v17_and_authority_state_is_cursor_bound() {
+    fn phase5h3_schema_is_v18_and_authority_state_is_cursor_bound() {
         let (mut storage, root, cursor) = ready_root();
-        assert_eq!(storage.schema_version().unwrap(), 17);
+        assert_eq!(storage.schema_version().unwrap(), 18);
 
         let authorities = vec![
             RemoteWriteAuthoritySnapshot::new("remote-root", 10, None, None, true, true, true, 20)
@@ -10301,7 +10834,7 @@ mod phase5h8_folder_create_execution_state_tests {
         storage.configure().unwrap();
         storage.migrate().unwrap();
 
-        assert_eq!(storage.schema_version().unwrap(), 17);
+        assert_eq!(storage.schema_version().unwrap(), 18);
 
         let state = storage
             .sync_root_remote_write_intent_execution_state(1)
@@ -10465,5 +10998,226 @@ mod phase5h10_confirmation_window_tests {
             storage.sync_root_change_cursor(&root.id).unwrap().unwrap(),
             durable
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5h12_folder_create_settlement_tests {
+    use super::*;
+
+    fn fixture() -> (
+        Storage,
+        SyncRoot,
+        RemoteWriteFolderCreateSettlementInput,
+        i64,
+    ) {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5h12-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+        let root = SyncRoot::new(
+            "phase5h12-root",
+            provider,
+            account.subject,
+            "/tmp/phase5h12-root",
+            Some("remote-root".into()),
+            SyncMode::TwoWay,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let baseline =
+            LocalItemSnapshot::new("base", LocalItemKind::Directory, None, 10, 8, 40).unwrap();
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_local_inventory_items(&root.id, &[baseline], 10)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 11)
+            .unwrap();
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+
+        let events = vec![
+            LocalChangeEventInput::new(
+                "new-folder",
+                LocalChangeEventKind::Created,
+                None,
+                Some(LocalItemKind::Directory),
+            )
+            .unwrap(),
+            LocalChangeEventInput::new(
+                "other.txt",
+                LocalChangeEventKind::Created,
+                None,
+                Some(LocalItemKind::File),
+            )
+            .unwrap(),
+        ];
+        storage
+            .reconcile_sync_root_local_change_journal(
+                &root.id,
+                state.generation,
+                state.item_count,
+                state.snapshot_completed_at_unix_ms,
+                &events,
+                12,
+            )
+            .unwrap();
+
+        let source_event_id: i64 = storage
+            .connection
+            .query_row(
+                "SELECT id FROM sync_root_local_change_events
+             WHERE sync_root_id=?1 AND relative_path='new-folder'
+               AND baseline_generation=?2 AND status='pending'",
+                params![root.id, state.generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_remote_items (
+                sync_root_id, remote_id, parent_remote_id, name, item_kind,
+                size_bytes, trashed, observed_at_unix_ms
+             ) VALUES (?1,'generated-folder-id','remote-root','new-folder','folder',NULL,0,20)",
+                params![root.id],
+            )
+            .unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_remote_write_intents (
+                sync_root_id, source_local_event_id, baseline_generation, operation_kind,
+                relative_path, local_kind, local_modified_unix_ns, local_device_id, local_inode,
+                predetermined_remote_id, expected_parent_remote_id, planned_at_unix_ms,
+                execution_generation, confirmed_at_unix_ms, status
+             ) VALUES (?1,?2,?3,'create_folder','new-folder','directory',100,'8','55',
+                       'generated-folder-id','remote-root',13,3,21,'confirmed')",
+                params![root.id, source_event_id, state.generation],
+            )
+            .unwrap();
+        let intent_id = storage.connection.last_insert_rowid();
+
+        let promoted =
+            LocalItemSnapshot::new("new-folder", LocalItemKind::Directory, None, 999, 8, 55)
+                .unwrap();
+        let residual = vec![
+            LocalChangeEventInput::new(
+                "other.txt",
+                LocalChangeEventKind::Created,
+                None,
+                Some(LocalItemKind::File),
+            )
+            .unwrap(),
+        ];
+        let input = RemoteWriteFolderCreateSettlementInput::new(
+            intent_id,
+            source_event_id,
+            3,
+            state.generation,
+            state.item_count,
+            state.snapshot_completed_at_unix_ms,
+            promoted,
+            residual,
+            "generated-folder-id",
+            "remote-root",
+            30,
+        )
+        .unwrap();
+        (storage, root, input, source_event_id)
+    }
+
+    #[test]
+    fn phase5h12_settlement_is_selective_atomic_and_rebases_residual_diff() {
+        let (mut storage, root, input, source_event_id) = fixture();
+        let result = storage
+            .settle_confirmed_sync_root_folder_create(&root.id, &input)
+            .unwrap();
+        assert_eq!(result.settled_from_generation, 1);
+        assert_eq!(result.settled_to_generation, 2);
+        assert_eq!(result.baseline_item_count, 2);
+        assert_eq!(result.residual_pending_events, 1);
+        assert!(result.source_event_applied);
+        assert!(result.ownership_receipt_created);
+        assert!(result.settlement_recorded);
+
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        assert_eq!(state.generation, 2);
+        assert_eq!(state.item_count, 2);
+        assert!(state.observation_valid);
+
+        let source_status: String = storage
+            .connection
+            .query_row(
+                "SELECT status FROM sync_root_local_change_events WHERE id=?1",
+                params![source_event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_status, "applied");
+
+        let pending = storage
+            .list_pending_sync_root_local_change_events(&root.id, 2)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].relative_path(), "other.txt");
+        assert_eq!(
+            storage
+                .sync_root_directory_materialization_receipt_count(&root.id)
+                .unwrap(),
+            1
+        );
+        assert!(
+            storage
+                .sync_root_remote_write_settlement_exists(input.intent_id)
+                .unwrap()
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_write_intent_execution_state(input.intent_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            RemoteWriteIntentStatus::Confirmed
+        );
+    }
+
+    #[test]
+    fn phase5h12_second_settlement_is_rejected_without_second_generation_advance() {
+        let (mut storage, root, input, _) = fixture();
+        storage
+            .settle_confirmed_sync_root_folder_create(&root.id, &input)
+            .unwrap();
+        let after_first = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        assert!(matches!(
+            storage.settle_confirmed_sync_root_folder_create(&root.id, &input),
+            Err(StorageError::RemoteWriteSettlementAlreadyExists)
+        ));
+        let after_second = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        assert_eq!(after_first.generation, after_second.generation);
+        assert_eq!(after_first.item_count, after_second.item_count);
+    }
+
+    #[test]
+    fn phase5h12_schema_v18_contains_settlement_evidence_table() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert_eq!(storage.schema_version().unwrap(), 18);
+        let exists: i64 = storage
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='sync_root_remote_write_settlements'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
     }
 }

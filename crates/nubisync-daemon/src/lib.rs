@@ -11,9 +11,11 @@ use nubisync_drive::{
 };
 use nubisync_storage::{
     LocalChangeEventInput, LocalChangeEventKind, LocalChangeEventRecord, LocalChangeJournalCommit,
-    RemoteWriteAuthoritySnapshot, RemoteWriteIntentInput, RemoteWriteIntentOperation, Storage,
-    StorageError, SyncRootCatalogBatchCommit, SyncRootCatalogMutation,
-    SyncRootDirectoryMaterializationReceipt, SyncRootFileMaterializationReceipt,
+    RemoteWriteAuthoritySnapshot, RemoteWriteFolderCreateCandidate,
+    RemoteWriteFolderCreateSettlementInput, RemoteWriteIntentInput, RemoteWriteIntentOperation,
+    RemoteWriteIntentStatus, Storage, StorageError, SyncRootCatalogBatchCommit,
+    SyncRootCatalogMutation, SyncRootDirectoryMaterializationReceipt,
+    SyncRootFileMaterializationReceipt,
 };
 use nubisync_sync::{
     LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyConvergenceActionKind,
@@ -5638,6 +5640,130 @@ pub struct SelectedRootLocalJournalResult {
     pub superseded_events: u64,
 }
 
+pub fn plan_selected_root_confirmed_folder_create_settlement(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+    candidate: &RemoteWriteFolderCreateCandidate,
+    settled_at_unix_ms: i64,
+) -> Result<RemoteWriteFolderCreateSettlementInput, SelectedRootExecutorError> {
+    if sync_root.mode != SyncMode::TwoWay {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderSettlementModeUnsupported);
+    }
+    if candidate.status != RemoteWriteIntentStatus::Confirmed || settled_at_unix_ms <= 0 {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderSettlementNotEligible);
+    }
+
+    let state = storage.sync_root_local_inventory_state(&sync_root.id)?;
+    if !state.snapshot_complete
+        || !state.observation_valid
+        || state.generation != candidate.baseline_generation
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderSettlementLocalAuthorityMismatch);
+    }
+    let baseline = storage.list_sync_root_local_items(&sync_root.id)?;
+    let baseline_count =
+        u64::try_from(baseline.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+    if baseline_count != state.item_count
+        || baseline
+            .iter()
+            .any(|item| item.relative_path() == candidate.relative_path())
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderSettlementLocalAuthorityMismatch);
+    }
+
+    let first = scan_selected_root_local_snapshot(sync_root)?;
+    let second = scan_selected_root_local_snapshot(sync_root)?;
+    if first != second {
+        return Err(SelectedRootExecutorError::LocalDiffScanRace);
+    }
+    let current_source = first
+        .iter()
+        .find(|item| item.relative_path() == candidate.relative_path())
+        .ok_or(SelectedRootExecutorError::RemoteWriteFolderSettlementLocalIdentityMismatch)?;
+    if current_source.kind() != LocalItemKind::Directory
+        || current_source.size_bytes().is_some()
+        || current_source.device_id() != candidate.local_device_id
+        || current_source.inode() != candidate.local_inode
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderSettlementLocalIdentityMismatch);
+    }
+
+    let old_diff = build_selected_root_local_inventory_diff(
+        &baseline,
+        &first,
+        state.generation,
+        state.snapshot_completed_at_unix_ms,
+    )?;
+    let source_entry = old_diff
+        .entries()
+        .iter()
+        .find(|entry| entry.relative_path() == candidate.relative_path())
+        .ok_or(SelectedRootExecutorError::RemoteWriteFolderSettlementSourceDiffMismatch)?;
+    if source_entry.kind != SelectedRootLocalDiffKind::Created
+        || source_entry.baseline_kind.is_some()
+        || source_entry.current_kind != Some(LocalItemKind::Directory)
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderSettlementSourceDiffMismatch);
+    }
+
+    let remote = storage
+        .sync_root_remote_item(&sync_root.id, candidate.predetermined_remote_id())?
+        .ok_or(SelectedRootExecutorError::RemoteWriteFolderSettlementRemoteCatalogMismatch)?;
+    let expected_name = basename(candidate.relative_path());
+    if expected_name.is_empty()
+        || remote.name != expected_name
+        || remote.kind != RemoteItemKind::Folder
+        || remote.parent_remote_id.as_deref() != Some(candidate.expected_parent_remote_id())
+        || remote.trashed
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderSettlementRemoteCatalogMismatch);
+    }
+
+    let mut proposed_baseline = baseline.clone();
+    proposed_baseline.push(current_source.clone());
+    proposed_baseline.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
+    let next_generation = state
+        .generation
+        .checked_add(1)
+        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+    let residual_diff = build_selected_root_local_inventory_diff(
+        &proposed_baseline,
+        &first,
+        next_generation,
+        Some(settled_at_unix_ms),
+    )?;
+    if residual_diff
+        .entries()
+        .iter()
+        .any(|entry| entry.relative_path() == candidate.relative_path())
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderSettlementResidualMismatch);
+    }
+    let mut residual_events = Vec::with_capacity(residual_diff.entries().len());
+    for entry in residual_diff.entries() {
+        residual_events.push(LocalChangeEventInput::new(
+            entry.relative_path(),
+            local_change_event_kind(entry.kind),
+            entry.baseline_kind,
+            entry.current_kind,
+        )?);
+    }
+
+    Ok(RemoteWriteFolderCreateSettlementInput::new(
+        candidate.intent_id,
+        candidate.source_local_event_id,
+        candidate.execution_generation,
+        state.generation,
+        state.item_count,
+        state.snapshot_completed_at_unix_ms,
+        current_source.clone(),
+        residual_events,
+        candidate.predetermined_remote_id(),
+        candidate.expected_parent_remote_id(),
+        settled_at_unix_ms,
+    )?)
+}
+
 pub fn validate_selected_root_folder_create_local_identity(
     sync_root: &SyncRoot,
     relative_path: &str,
@@ -7462,6 +7588,20 @@ pub enum SelectedRootExecutorError {
     RemoteWritePlanOwnershipAmbiguous,
     #[error("two-way supervised local journal requires a two_way root")]
     TwoWayLocalJournalModeUnsupported,
+    #[error("confirmed folder-create settlement requires a two_way root")]
+    RemoteWriteFolderSettlementModeUnsupported,
+    #[error("confirmed folder-create settlement candidate is not eligible")]
+    RemoteWriteFolderSettlementNotEligible,
+    #[error("confirmed folder-create settlement local authority mismatched")]
+    RemoteWriteFolderSettlementLocalAuthorityMismatch,
+    #[error("confirmed folder-create settlement local identity mismatched")]
+    RemoteWriteFolderSettlementLocalIdentityMismatch,
+    #[error("confirmed folder-create settlement source diff mismatched")]
+    RemoteWriteFolderSettlementSourceDiffMismatch,
+    #[error("confirmed folder-create settlement remote catalog mismatched")]
+    RemoteWriteFolderSettlementRemoteCatalogMismatch,
+    #[error("confirmed folder-create settlement residual diff contains the source")]
+    RemoteWriteFolderSettlementResidualMismatch,
     #[error("folder-create local validation requires a two_way root")]
     RemoteWriteFolderCreateModeUnsupported,
     #[error("folder-create local directory identity no longer matches the durable intent")]
