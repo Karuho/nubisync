@@ -18,6 +18,8 @@ const GOOGLE_DRIVE_START_PAGE_TOKEN_ENDPOINT: &str =
     "https://www.googleapis.com/drive/v3/changes/startPageToken";
 const GOOGLE_DRIVE_CHANGES_ENDPOINT: &str = "https://www.googleapis.com/drive/v3/changes";
 const GOOGLE_DRIVE_FILES_ENDPOINT: &str = "https://www.googleapis.com/drive/v3/files";
+const GOOGLE_DRIVE_GENERATE_IDS_ENDPOINT: &str =
+    "https://www.googleapis.com/drive/v3/files/generateIds";
 const GOOGLE_DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 const GOOGLE_DRIVE_INVENTORY_FIELDS: &str =
     "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,trashed)";
@@ -121,6 +123,32 @@ impl GoogleDriveApi {
             .json()?;
 
         ChangeCursor::new(response.start_page_token).map_err(DriveApiError::from)
+    }
+
+    /// Generates predetermined Drive IDs for ordinary file/folder create intents.
+    ///
+    /// This is the only FullSync provider primitive admitted in phase 5H6.
+    /// It creates no Drive object and reads no file content.
+    pub fn generate_file_ids(&self, count: u16) -> Result<DriveGeneratedIds, DriveApiError> {
+        if !(1..=64).contains(&count) {
+            return Err(DriveApiError::InvalidGeneratedIdCount);
+        }
+
+        let count_text = count.to_string();
+        let response: DriveGeneratedIdsResponse = self
+            .client
+            .get(GOOGLE_DRIVE_GENERATE_IDS_ENDPOINT)
+            .bearer_auth(self.access_token.as_str())
+            .query(&[
+                ("count", count_text.as_str()),
+                ("space", "drive"),
+                ("type", "files"),
+            ])
+            .send()?
+            .error_for_status()?
+            .json()?;
+
+        validate_generated_ids_response(count, response)
     }
 
     /// Observes metadata-only remote authority for later write planning.
@@ -512,6 +540,42 @@ impl fmt::Debug for DriveBlobFingerprint {
             .field("sha256_hex", &"[redacted]")
             .finish()
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct DriveGeneratedIds {
+    ids: Vec<String>,
+}
+
+impl DriveGeneratedIds {
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn into_ids(self) -> Vec<String> {
+        self.ids
+    }
+}
+
+impl fmt::Debug for DriveGeneratedIds {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriveGeneratedIds")
+            .field("count", &self.ids.len())
+            .field("ids", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DriveGeneratedIdsResponse {
+    ids: Vec<String>,
+    space: String,
+    kind: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -940,6 +1004,29 @@ struct GoogleFile {
     trashed: bool,
 }
 
+fn validate_generated_ids_response(
+    expected_count: u16,
+    response: DriveGeneratedIdsResponse,
+) -> Result<DriveGeneratedIds, DriveApiError> {
+    if response.kind != "drive#generatedIds" || response.space != "drive" {
+        return Err(DriveApiError::InvalidGeneratedIdsResponse);
+    }
+
+    if response.ids.len() != usize::from(expected_count) {
+        return Err(DriveApiError::GeneratedIdCountMismatch);
+    }
+
+    let mut seen = HashSet::new();
+    for remote_id in &response.ids {
+        validate_drive_file_id(remote_id)?;
+        if !seen.insert(remote_id.clone()) {
+            return Err(DriveApiError::DuplicateGeneratedId);
+        }
+    }
+
+    Ok(DriveGeneratedIds { ids: response.ids })
+}
+
 fn validate_write_authority_response(
     expected_remote_id: &str,
     metadata: DriveWriteAuthorityResponse,
@@ -1229,6 +1316,14 @@ pub enum DriveApiError {
     DownloadSafetyLimitExceeded,
     #[error("Google Drive file download stream I/O failed")]
     ContentIo(#[from] std::io::Error),
+    #[error("Google Drive generated-ID count must be between 1 and 64")]
+    InvalidGeneratedIdCount,
+    #[error("Google Drive generated-ID response metadata is invalid")]
+    InvalidGeneratedIdsResponse,
+    #[error("Google Drive generated-ID response count mismatched the request")]
+    GeneratedIdCountMismatch,
+    #[error("Google Drive generated-ID response contained a duplicate ID")]
+    DuplicateGeneratedId,
     #[error("Google Drive write-authority metadata ID does not match the requested item")]
     WriteAuthorityMetadataIdMismatch,
     #[error("Google Drive write-authority target is trashed")]
@@ -1288,6 +1383,66 @@ pub enum DriveApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase5h6_generated_ids_validate_count_uniqueness_and_redaction() {
+        let generated = validate_generated_ids_response(
+            2,
+            DriveGeneratedIdsResponse {
+                ids: vec!["generated-id-1".into(), "generated-id-2".into()],
+                space: "drive".into(),
+                kind: "drive#generatedIds".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(generated.len(), 2);
+        assert!(!generated.is_empty());
+
+        let debug = format!("{generated:?}");
+        assert!(!debug.contains("generated-id-1"));
+        assert!(!debug.contains("generated-id-2"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn phase5h6_generated_ids_fail_closed_on_bad_response() {
+        assert!(matches!(
+            validate_generated_ids_response(
+                2,
+                DriveGeneratedIdsResponse {
+                    ids: vec!["generated-id-1".into()],
+                    space: "drive".into(),
+                    kind: "drive#generatedIds".into(),
+                },
+            ),
+            Err(DriveApiError::GeneratedIdCountMismatch)
+        ));
+
+        assert!(matches!(
+            validate_generated_ids_response(
+                2,
+                DriveGeneratedIdsResponse {
+                    ids: vec!["generated-id-1".into(), "generated-id-1".into()],
+                    space: "drive".into(),
+                    kind: "drive#generatedIds".into(),
+                },
+            ),
+            Err(DriveApiError::DuplicateGeneratedId)
+        ));
+
+        assert!(matches!(
+            validate_generated_ids_response(
+                1,
+                DriveGeneratedIdsResponse {
+                    ids: vec!["generated-id-1".into()],
+                    space: "appDataFolder".into(),
+                    kind: "drive#generatedIds".into(),
+                },
+            ),
+            Err(DriveApiError::InvalidGeneratedIdsResponse)
+        ));
+    }
 
     #[test]
     fn phase5h2_write_authority_parses_version_capabilities_and_redacts_metadata() {

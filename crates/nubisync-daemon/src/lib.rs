@@ -11,9 +11,9 @@ use nubisync_drive::{
 };
 use nubisync_storage::{
     LocalChangeEventInput, LocalChangeEventKind, LocalChangeEventRecord, LocalChangeJournalCommit,
-    RemoteWriteAuthoritySnapshot, RemoteWriteIntentOperation, Storage, StorageError,
-    SyncRootCatalogBatchCommit, SyncRootCatalogMutation, SyncRootDirectoryMaterializationReceipt,
-    SyncRootFileMaterializationReceipt,
+    RemoteWriteAuthoritySnapshot, RemoteWriteIntentInput, RemoteWriteIntentOperation, Storage,
+    StorageError, SyncRootCatalogBatchCommit, SyncRootCatalogMutation,
+    SyncRootDirectoryMaterializationReceipt, SyncRootFileMaterializationReceipt,
 };
 use nubisync_sync::{
     LocalTreeEntry, LocalTreeEntryKind, ReceiveOnlyConvergenceActionKind,
@@ -155,6 +155,56 @@ pub struct SelectedRootRemoteWritePlanEntry {
 impl SelectedRootRemoteWritePlanEntry {
     pub fn relative_path(&self) -> &str {
         &self.relative_path
+    }
+
+    pub fn create_intent_input(
+        &self,
+        baseline_generation: u64,
+        predetermined_remote_id: String,
+        planned_at_unix_ms: i64,
+    ) -> Result<RemoteWriteIntentInput, SelectedRootExecutorError> {
+        if self.disposition != SelectedRootRemoteWritePlanDisposition::NeedsPredeterminedRemoteId {
+            return Err(SelectedRootExecutorError::RemoteWriteCreateIntentNotEligible);
+        }
+
+        let operation = self
+            .operation
+            .ok_or(SelectedRootExecutorError::RemoteWriteCreateIntentNotEligible)?;
+        if !matches!(
+            operation,
+            RemoteWriteIntentOperation::CreateFile | RemoteWriteIntentOperation::CreateFolder
+        ) {
+            return Err(SelectedRootExecutorError::RemoteWriteCreateIntentNotEligible);
+        }
+
+        let local_kind = self
+            .local_kind
+            .ok_or(SelectedRootExecutorError::RemoteWriteCreateIntentNotEligible)?;
+        let expected_parent_remote_id = self
+            .expected_parent_remote_id
+            .clone()
+            .ok_or(SelectedRootExecutorError::RemoteWriteCreateIntentNotEligible)?;
+
+        Ok(RemoteWriteIntentInput::new(
+            self.source_local_event_id,
+            baseline_generation,
+            operation,
+            self.relative_path.clone(),
+            local_kind,
+            self.local_size_bytes,
+            self.local_modified_unix_ns,
+            self.local_device_id,
+            self.local_inode,
+            None,
+            Some(predetermined_remote_id),
+            Some(expected_parent_remote_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+            planned_at_unix_ms,
+        )?)
     }
 }
 
@@ -5568,6 +5618,77 @@ pub struct SelectedRootLocalJournalResult {
     pub superseded_events: u64,
 }
 
+pub fn journal_selected_root_two_way_local_inventory_diff(
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    observed_at_unix_ms: i64,
+) -> Result<SelectedRootLocalJournalResult, SelectedRootExecutorError> {
+    if sync_root.mode != SyncMode::TwoWay {
+        return Err(SelectedRootExecutorError::TwoWayLocalJournalModeUnsupported);
+    }
+
+    let state = storage.sync_root_local_inventory_state(&sync_root.id)?;
+    if !state.snapshot_complete {
+        return Err(SelectedRootExecutorError::LocalDiffBaselineMissing);
+    }
+    if !state.observation_valid {
+        return Err(SelectedRootExecutorError::LocalDiffBaselineInvalidated);
+    }
+
+    let baseline = storage.list_sync_root_local_items(&sync_root.id)?;
+    let baseline_count =
+        u64::try_from(baseline.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+    if baseline_count != state.item_count {
+        return Err(SelectedRootExecutorError::LocalDiffBaselineCountMismatch);
+    }
+
+    let first = scan_selected_root_local_snapshot(sync_root)?;
+    let second = scan_selected_root_local_snapshot(sync_root)?;
+    if first != second {
+        return Err(SelectedRootExecutorError::LocalDiffScanRace);
+    }
+
+    let diff = build_selected_root_local_inventory_diff(
+        &baseline,
+        &first,
+        state.generation,
+        state.snapshot_completed_at_unix_ms,
+    )?;
+
+    let mut events = Vec::with_capacity(diff.entries().len());
+    for entry in diff.entries() {
+        events.push(LocalChangeEventInput::new(
+            entry.relative_path(),
+            local_change_event_kind(entry.kind),
+            entry.baseline_kind,
+            entry.current_kind,
+        )?);
+    }
+
+    let baseline_item_count =
+        u64::try_from(diff.baseline_items).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+
+    let commit = storage.reconcile_sync_root_local_change_journal(
+        &sync_root.id,
+        diff.baseline_generation,
+        baseline_item_count,
+        diff.baseline_snapshot_completed_at_unix_ms,
+        &events,
+        observed_at_unix_ms,
+    )?;
+
+    Ok(SelectedRootLocalJournalResult {
+        changes_total: diff.action_count(),
+        created: diff.created,
+        deleted: diff.deleted,
+        modified: diff.modified,
+        type_changed: diff.type_changed,
+        baseline_generation: commit.baseline_generation,
+        pending_events: commit.pending_events,
+        superseded_events: commit.superseded_events,
+    })
+}
+
 pub fn journal_selected_root_local_inventory_diff(
     storage: &mut Storage,
     sync_root: &SyncRoot,
@@ -7278,6 +7399,10 @@ pub enum SelectedRootExecutorError {
     RemoteWritePlanRemoteCatalogIdentityAmbiguous,
     #[error("remote-write planning ownership receipts are ambiguous")]
     RemoteWritePlanOwnershipAmbiguous,
+    #[error("two-way supervised local journal requires a two_way root")]
+    TwoWayLocalJournalModeUnsupported,
+    #[error("remote-write plan entry is not eligible for a create intent")]
+    RemoteWriteCreateIntentNotEligible,
     #[error("local directory materialization is blocked by local-only entries or type conflicts")]
     LocalDirectoryPhaseBlocked,
     #[error("local directory target count mismatched the remote directory plan")]
@@ -11096,5 +11221,48 @@ mod phase5h3_remote_write_intent_planner_tests {
             entries[2].disposition,
             SelectedRootRemoteWritePlanDisposition::Conflict
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5h6_create_id_planner_tests {
+    use super::*;
+
+    #[test]
+    fn phase5h6_create_plan_entry_builds_redacted_storage_input() {
+        let entry = SelectedRootRemoteWritePlanEntry {
+            source_local_event_id: 7,
+            relative_path: "private/new.txt".into(),
+            operation: Some(RemoteWriteIntentOperation::CreateFile),
+            disposition: SelectedRootRemoteWritePlanDisposition::NeedsPredeterminedRemoteId,
+            local_kind: Some(LocalItemKind::File),
+            local_size_bytes: Some(4),
+            local_modified_unix_ns: Some(10),
+            local_device_id: Some(8),
+            local_inode: Some(9),
+            target_remote_id: None,
+            expected_parent_remote_id: Some("private-parent".into()),
+            expected_remote_kind: None,
+            expected_remote_version: None,
+            expected_remote_size_bytes: None,
+            expected_checksum_algorithm: None,
+            expected_content_checksum: None,
+        };
+
+        let input = entry
+            .create_intent_input(2, "generated-private-id".into(), 20)
+            .unwrap();
+
+        assert_eq!(input.operation, RemoteWriteIntentOperation::CreateFile);
+        assert_eq!(input.baseline_generation, 2);
+        assert_eq!(
+            input.predetermined_remote_id(),
+            Some("generated-private-id")
+        );
+
+        let debug = format!("{input:?}");
+        assert!(!debug.contains("private/new.txt"));
+        assert!(!debug.contains("private-parent"));
+        assert!(!debug.contains("generated-private-id"));
     }
 }

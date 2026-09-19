@@ -6,8 +6,9 @@ mod api;
 mod oauth;
 
 pub use api::{
-    DriveApiError, DriveBlobFingerprint, DriveFolderRoot, DriveInventoryPage, DriveProbe,
-    DriveRootMembership, DriveWriteAuthorityObservation, GoogleDriveApi, GoogleUserInfo,
+    DriveApiError, DriveBlobFingerprint, DriveFolderRoot, DriveGeneratedIds, DriveInventoryPage,
+    DriveProbe, DriveRootMembership, DriveWriteAuthorityObservation, GoogleDriveApi,
+    GoogleUserInfo,
 };
 pub use oauth::{
     GOOGLE_DRIVE_FULL_SCOPE, GOOGLE_DRIVE_METADATA_READONLY_SCOPE, GOOGLE_DRIVE_READONLY_SCOPE,

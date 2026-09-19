@@ -12,28 +12,30 @@ use nubisync_core::{
 use nubisync_daemon::{
     SUPERVISED_FILE_BATCH_MAX_ACTIONS, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
     SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS, SelectedRootCrossProcessExecutionLock,
-    SelectedRootReceiveOnlySingleFlightResult, adopt_selected_root_existing_directory,
-    bootstrap_selected_root_snapshot, capture_selected_root_local_baseline,
-    collect_selected_root_change_window_page, delete_selected_root_existing_directory,
-    delete_selected_root_existing_file, delete_selected_root_stale_directories,
-    delete_selected_root_stale_files, execute_completed_selected_root_change_window,
-    execute_selected_root_receive_only_cycle, execute_selected_root_receive_only_single_flight,
+    SelectedRootReceiveOnlySingleFlightResult, SelectedRootRemoteWritePlanDisposition,
+    adopt_selected_root_existing_directory, bootstrap_selected_root_snapshot,
+    capture_selected_root_local_baseline, collect_selected_root_change_window_page,
+    delete_selected_root_existing_directory, delete_selected_root_existing_file,
+    delete_selected_root_stale_directories, delete_selected_root_stale_files,
+    execute_completed_selected_root_change_window, execute_selected_root_receive_only_cycle,
+    execute_selected_root_receive_only_single_flight,
     execute_selected_root_unified_convergence_step, journal_selected_root_local_inventory_diff,
-    materialize_selected_root_directories, materialize_selected_root_missing_file,
-    materialize_selected_root_missing_files, plan_selected_root_local_inventory_diff,
-    plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
-    plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
-    plan_selected_root_remote_replacement, plan_selected_root_remote_write_intents,
-    plan_selected_root_stale_files, plan_selected_root_unified_convergence_step,
-    replace_selected_root_existing_file, replace_selected_root_stale_files,
-    try_acquire_selected_root_cross_process_execution_lock, verify_selected_root_existing_file,
-    verify_selected_root_existing_files, verify_selected_root_local_receipts,
+    journal_selected_root_two_way_local_inventory_diff, materialize_selected_root_directories,
+    materialize_selected_root_missing_file, materialize_selected_root_missing_files,
+    plan_selected_root_local_inventory_diff, plan_selected_root_local_materialization,
+    plan_selected_root_receive_only_convergence, plan_selected_root_remote_deletion,
+    plan_selected_root_remote_directory_deletion, plan_selected_root_remote_replacement,
+    plan_selected_root_remote_write_intents, plan_selected_root_stale_files,
+    plan_selected_root_unified_convergence_step, replace_selected_root_existing_file,
+    replace_selected_root_stale_files, try_acquire_selected_root_cross_process_execution_lock,
+    verify_selected_root_existing_file, verify_selected_root_existing_files,
+    verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_FULL_SCOPE, GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi,
     GoogleOAuthConfig,
 };
-use nubisync_storage::{RemoteWriteAuthoritySnapshot, Storage};
+use nubisync_storage::{REMOTE_WRITE_INTENT_BATCH_MAX, RemoteWriteAuthoritySnapshot, Storage};
 use std::{
     collections::{HashSet, VecDeque},
     env, fs,
@@ -197,6 +199,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_remote_write_plan()
+        }
+        [sync, roots, allocate_create_ids, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && allocate_create_ids == "allocate-create-ids"
+                && approve == "--approve" =>
+        {
+            sync_roots_allocate_create_ids()
         }
         [sync, roots, activate_two_way, approve]
             if sync == "sync"
@@ -470,6 +480,7 @@ USAGE:
   nubisync sync roots local-journal --approve
   nubisync sync roots observe-write-authority --approve
   nubisync sync roots remote-write-plan --approve
+  nubisync sync roots allocate-create-ids --approve
   nubisync sync roots activate-two-way --approve
   nubisync sync roots deactivate-two-way --approve
   nubisync sync roots convergence-plan --approve
@@ -1139,6 +1150,248 @@ fn sync_roots_remote_write_plan() -> Result<(), CliError> {
     println!("TOKEN_VALUES_PRINTED=no");
     println!("OAUTH_FULLSYNC_ACTIVATED=no");
     println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_allocate_create_ids() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootCreateIdAllocationSelectionFailed);
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootCreateIdAllocationSelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootCreateIdAllocationModeUnsupported);
+    }
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let fullsync_key = fullsync_refresh_token_key(&account.subject)?;
+    let fullsync_present = keyring.get(&fullsync_key)?.is_some();
+    if !fullsync_present {
+        return Err(CliError::MissingStoredFullSyncRefreshToken);
+    }
+
+    println!("SYNC_ROOT_CREATE_ID_ALLOCATION_STAGE=journal_local_metadata");
+    let journal =
+        journal_selected_root_two_way_local_inventory_diff(&mut storage, &root, unix_time_ms()?)?;
+
+    println!("SYNC_ROOT_CREATE_ID_ALLOCATION_STAGE=plan");
+    let plan = plan_selected_root_remote_write_intents(&storage, &root, true)?;
+    if !plan.write_gates_satisfied() {
+        return Err(CliError::SyncRootCreateIdAllocationWriteGatesNotSatisfied);
+    }
+    if plan.conflicts != 0 || plan.blocked_identity != 0 || plan.blocked_authority != 0 {
+        return Err(CliError::SyncRootCreateIdAllocationPlanBlocked);
+    }
+
+    let mut eligible_source_ids = Vec::new();
+    let mut existing_intents = 0usize;
+
+    for entry in plan.entries() {
+        if entry.disposition != SelectedRootRemoteWritePlanDisposition::NeedsPredeterminedRemoteId {
+            continue;
+        }
+
+        if storage
+            .sync_root_remote_write_intent_for_source_event(&root.id, entry.source_local_event_id)?
+            .is_some()
+        {
+            existing_intents = existing_intents
+                .checked_add(1)
+                .ok_or(CliError::NumericOverflow)?;
+            continue;
+        }
+
+        eligible_source_ids.push(entry.source_local_event_id);
+    }
+
+    eligible_source_ids.truncate(REMOTE_WRITE_INTENT_BATCH_MAX);
+
+    if eligible_source_ids.is_empty() {
+        println!("SYNC_ROOT_CREATE_ID_ALLOCATION=PASS");
+        println!("MODE=two_way");
+        println!("LOCAL_OBSERVATION=journaled");
+        println!("PENDING_EVENTS={}", journal.pending_events);
+        println!("ELIGIBLE_CREATE_CANDIDATES=0");
+        println!("EXISTING_CREATE_INTENTS={existing_intents}");
+        println!("IDS_REQUESTED=0");
+        println!("IDS_RETURNED=0");
+        println!("INTENTS_PERSISTED=0");
+        println!("GENERATE_IDS_CALL=not_performed");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=yes");
+        println!("FILESYSTEM_READ=metadata_only");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("LOCAL_EVENT_APPLIED=no");
+        println!("BASELINE_ADVANCED=no");
+        println!("REMOTE_IDS_PRINTED=no");
+        println!("TOKEN_VALUES_PRINTED=no");
+        println!("REMOTE_OBJECT_MUTATION=no");
+        println!("DRIVE_WRITE_ACCESS=no_remote_call");
+        println!("DRIVE_WRITE_EXECUTION_ENABLED=no");
+        return Ok(());
+    }
+
+    let fullsync_refresh_token = required_secret_utf8(
+        keyring.get(&fullsync_key)?,
+        CliError::MissingStoredFullSyncRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+
+    println!("SYNC_ROOT_CREATE_ID_ALLOCATION_STAGE=refresh_fullsync_access_token");
+    let tokens = oauth.refresh_access_token(&fullsync_refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_FULL_SCOPE)
+    {
+        return Err(CliError::GoogleFullSyncScopeNotGranted);
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &fullsync_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    let durable_cursor = storage
+        .sync_root_change_cursor(&root.id)?
+        .ok_or(CliError::SyncRootCreateIdAllocationRemoteFenceMissing)?;
+    let authority_state = storage
+        .sync_root_remote_write_authority_state(&root.id)?
+        .ok_or(CliError::SyncRootCreateIdAllocationRemoteFenceMissing)?;
+    if authority_state.change_cursor != durable_cursor {
+        return Err(CliError::SyncRootCreateIdAllocationRemoteFenceMismatch);
+    }
+
+    println!("SYNC_ROOT_CREATE_ID_ALLOCATION_STAGE=establish_remote_fence");
+    let before_cursor = api.current_change_cursor()?;
+    if before_cursor != durable_cursor {
+        return Err(CliError::SyncRootCreateIdAllocationRemoteFenceMismatch);
+    }
+
+    let requested =
+        u16::try_from(eligible_source_ids.len()).map_err(|_| CliError::NumericOverflow)?;
+
+    println!("SYNC_ROOT_CREATE_ID_ALLOCATION_STAGE=generate_ids");
+    let generated = api.generate_file_ids(requested)?;
+    let returned = generated.len();
+    if returned != eligible_source_ids.len() {
+        return Err(CliError::SyncRootCreateIdAllocationCountMismatch);
+    }
+
+    let after_cursor = api.current_change_cursor()?;
+    if after_cursor != before_cursor {
+        return Err(CliError::SyncRootCreateIdAllocationRemoteChanged);
+    }
+
+    println!("SYNC_ROOT_CREATE_ID_ALLOCATION_STAGE=revalidate_local_plan");
+    let journal_after =
+        journal_selected_root_two_way_local_inventory_diff(&mut storage, &root, unix_time_ms()?)?;
+    let plan_after = plan_selected_root_remote_write_intents(&storage, &root, true)?;
+
+    if plan_after.conflicts != 0
+        || plan_after.blocked_identity != 0
+        || plan_after.blocked_authority != 0
+    {
+        return Err(CliError::SyncRootCreateIdAllocationPlanChanged);
+    }
+
+    if storage.sync_root_change_cursor(&root.id)?.as_ref() != Some(&durable_cursor) {
+        return Err(CliError::SyncRootCreateIdAllocationRemoteFenceMismatch);
+    }
+
+    let generated_ids = generated.into_ids();
+    let mut inputs = Vec::with_capacity(generated_ids.len());
+    let planned_at_unix_ms = unix_time_ms()?;
+
+    for (source_id, generated_id) in eligible_source_ids.iter().zip(generated_ids) {
+        if storage
+            .sync_root_remote_write_intent_for_source_event(&root.id, *source_id)?
+            .is_some()
+        {
+            return Err(CliError::SyncRootCreateIdAllocationPlanChanged);
+        }
+
+        let entry = plan_after
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry.source_local_event_id == *source_id
+                    && entry.disposition
+                        == SelectedRootRemoteWritePlanDisposition::NeedsPredeterminedRemoteId
+            })
+            .ok_or(CliError::SyncRootCreateIdAllocationPlanChanged)?;
+
+        inputs.push(entry.create_intent_input(
+            plan_after.baseline_generation,
+            generated_id,
+            planned_at_unix_ms,
+        )?);
+    }
+
+    println!("SYNC_ROOT_CREATE_ID_ALLOCATION_STAGE=persist_intents");
+    let intent_ids = storage.create_sync_root_remote_write_intents_batch(&root.id, &inputs)?;
+
+    if intent_ids.len() != inputs.len() {
+        return Err(CliError::SyncRootCreateIdAllocationPersistenceMismatch);
+    }
+
+    for input in &inputs {
+        let record = storage
+            .sync_root_remote_write_intent_for_source_event(&root.id, input.source_local_event_id)?
+            .ok_or(CliError::SyncRootCreateIdAllocationPersistenceMismatch)?;
+        if record.status.as_str() != "planned" {
+            return Err(CliError::SyncRootCreateIdAllocationPersistenceMismatch);
+        }
+    }
+
+    println!("SYNC_ROOT_CREATE_ID_ALLOCATION=PASS");
+    println!("MODE=two_way");
+    println!("LOCAL_OBSERVATION=journaled");
+    println!("PENDING_EVENTS={}", journal_after.pending_events);
+    println!("ELIGIBLE_CREATE_CANDIDATES={}", eligible_source_ids.len());
+    println!("EXISTING_CREATE_INTENTS={existing_intents}");
+    println!("IDS_REQUESTED={requested}");
+    println!("IDS_RETURNED={returned}");
+    println!("INTENTS_PERSISTED={}", intent_ids.len());
+    println!("GENERATE_IDS_CALL=performed");
+    println!("GENERATE_IDS_SPACE=drive");
+    println!("GENERATE_IDS_TYPE=files");
+    println!("REMOTE_CURSOR_STABLE=yes");
+    println!("AUTHORITY_CURSOR_MATCH=yes");
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("LOCAL_EVENT_APPLIED=no");
+    println!("BASELINE_ADVANCED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("REMOTE_OBJECT_MUTATION=no");
+    println!("DRIVE_WRITE_ACCESS=generate_ids_only");
+    println!("DRIVE_WRITE_EXECUTION_ENABLED=no");
 
     Ok(())
 }
@@ -5493,6 +5746,7 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "local-journal"
                 | "observe-write-authority"
                 | "remote-write-plan"
+                | "allocate-create-ids"
                 | "activate-two-way"
                 | "deactivate-two-way"
                 | "convergence-plan"
@@ -5597,6 +5851,15 @@ mod sync_root_cli_tests {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(!cli_requires_cross_process_execution_lock(&args));
         }
+    }
+
+    #[test]
+    fn phase5h6_execution_lock_covers_create_id_allocation() {
+        let args = ["sync", "roots", "allocate-create-ids", "--approve"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(cli_requires_cross_process_execution_lock(&args));
     }
 
     #[test]
@@ -5916,6 +6179,26 @@ enum CliError {
     SyncRootWriteAuthorityPersistenceMismatch,
     #[error("sync root remote-write planner selection failed")]
     SyncRootRemoteWritePlanSelectionFailed,
+    #[error("sync root create-ID allocation selection failed")]
+    SyncRootCreateIdAllocationSelectionFailed,
+    #[error("sync root create-ID allocation requires two_way mode")]
+    SyncRootCreateIdAllocationModeUnsupported,
+    #[error("sync root create-ID allocation write gates are not satisfied")]
+    SyncRootCreateIdAllocationWriteGatesNotSatisfied,
+    #[error("sync root create-ID allocation plan contains blocked/conflict entries")]
+    SyncRootCreateIdAllocationPlanBlocked,
+    #[error("sync root create-ID allocation requires a durable remote fence")]
+    SyncRootCreateIdAllocationRemoteFenceMissing,
+    #[error("sync root create-ID allocation remote fence is stale")]
+    SyncRootCreateIdAllocationRemoteFenceMismatch,
+    #[error("Google Drive changed during create-ID allocation")]
+    SyncRootCreateIdAllocationRemoteChanged,
+    #[error("Google Drive generated-ID count mismatched eligible candidates")]
+    SyncRootCreateIdAllocationCountMismatch,
+    #[error("local create-intent plan changed during ID allocation")]
+    SyncRootCreateIdAllocationPlanChanged,
+    #[error("create-intent persistence failed its durable postcondition")]
+    SyncRootCreateIdAllocationPersistenceMismatch,
     #[error("sync root two-way activation selection failed")]
     SyncRootTwoWayActivationSelectionFailed,
     #[error("sync root mode is not eligible for two-way activation")]

@@ -11,6 +11,7 @@ use std::path::Path;
 use thiserror::Error;
 
 const SCHEMA_VERSION: i64 = 16;
+pub const REMOTE_WRITE_INTENT_BATCH_MAX: usize = 64;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
@@ -2001,197 +2002,34 @@ impl Storage {
         input: &RemoteWriteIntentInput,
     ) -> Result<i64, StorageError> {
         let transaction = self.connection.transaction()?;
-
-        let mode: Option<String> = transaction
-            .query_row(
-                "SELECT mode FROM sync_roots WHERE id=?1",
-                params![sync_root_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(mode) = mode else {
-            return Err(StorageError::RemoteWriteIntentSourceMismatch);
-        };
-        if SyncMode::parse(&mode)? == SyncMode::ReceiveOnly {
-            return Err(StorageError::RemoteWriteIntentRootNotWriteCapable);
-        }
-
-        let state: Option<(i64, i64)> = transaction
-            .query_row(
-                "SELECT generation, observation_valid
-                 FROM sync_root_local_inventory_state
-                 WHERE sync_root_id=?1 AND snapshot_complete=1",
-                params![sync_root_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((generation, observation_valid)) = state else {
-            return Err(StorageError::RemoteWriteIntentSourceMismatch);
-        };
-        if u64::try_from(generation).map_err(|_| StorageError::NumericOverflow)?
-            != input.baseline_generation
-            || observation_valid == 0
-        {
-            return Err(StorageError::RemoteWriteIntentSourceMismatch);
-        }
-
-        let source: Option<(
-            String,
-            i64,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-        )> = transaction
-            .query_row(
-                "SELECT sync_root_id, baseline_generation, event_kind, relative_path,
-                            baseline_kind, current_kind, status
-                     FROM sync_root_local_change_events WHERE id=?1",
-                params![input.source_local_event_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .optional()?;
-
-        let Some((
-            source_root,
-            source_generation,
-            source_kind,
-            source_path,
-            baseline_kind,
-            current_kind,
-            source_status,
-        )) = source
-        else {
-            return Err(StorageError::RemoteWriteIntentSourceMismatch);
-        };
-
-        if source_root != sync_root_id
-            || u64::try_from(source_generation).map_err(|_| StorageError::NumericOverflow)?
-                != input.baseline_generation
-            || source_path != input.relative_path()
-            || source_status != "pending"
-        {
-            return Err(StorageError::RemoteWriteIntentSourceMismatch);
-        }
-
-        validate_intent_against_local_event(
-            input,
-            &source_kind,
-            baseline_kind.as_deref(),
-            current_kind.as_deref(),
-        )?;
-
-        match input.operation {
-            RemoteWriteIntentOperation::CreateFile | RemoteWriteIntentOperation::CreateFolder => {
-                let parent = input
-                    .expected_parent_remote_id()
-                    .ok_or(StorageError::InvalidRemoteWriteIntent)?;
-                let authority = query_remote_write_authority_in_transaction(
-                    &transaction,
-                    sync_root_id,
-                    parent,
-                )?
-                .ok_or(StorageError::RemoteWriteIntentAuthorityMismatch)?;
-                if !authority.can_add_children {
-                    return Err(StorageError::RemoteWriteIntentAuthorityMismatch);
-                }
-            }
-            RemoteWriteIntentOperation::UpdateFile => {
-                let target = input
-                    .target_remote_id()
-                    .ok_or(StorageError::InvalidRemoteWriteIntent)?;
-                let authority = query_remote_write_authority_in_transaction(
-                    &transaction,
-                    sync_root_id,
-                    target,
-                )?
-                .ok_or(StorageError::RemoteWriteIntentAuthorityMismatch)?;
-                if !authority.can_edit
-                    || Some(authority.remote_version) != input.expected_remote_version
-                {
-                    return Err(StorageError::RemoteWriteIntentAuthorityMismatch);
-                }
-            }
-            RemoteWriteIntentOperation::TrashItem => {
-                let target = input
-                    .target_remote_id()
-                    .ok_or(StorageError::InvalidRemoteWriteIntent)?;
-                let authority = query_remote_write_authority_in_transaction(
-                    &transaction,
-                    sync_root_id,
-                    target,
-                )?
-                .ok_or(StorageError::RemoteWriteIntentAuthorityMismatch)?;
-                if !authority.can_trash
-                    || Some(authority.remote_version) != input.expected_remote_version
-                {
-                    return Err(StorageError::RemoteWriteIntentAuthorityMismatch);
-                }
-            }
-        }
-
-        transaction.execute(
-            "INSERT INTO sync_root_remote_write_intents (
-                sync_root_id, source_local_event_id, baseline_generation,
-                operation_kind, relative_path, local_kind, local_size_bytes,
-                local_modified_unix_ns, local_device_id, local_inode,
-                target_remote_id, predetermined_remote_id, expected_parent_remote_id,
-                expected_remote_kind, expected_remote_version, expected_remote_size_bytes,
-                expected_checksum_algorithm, expected_content_checksum,
-                planned_at_unix_ms, status
-             ) VALUES (
-                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,
-                ?11,?12,?13,?14,?15,?16,?17,?18,?19,'planned'
-             )",
-            params![
-                sync_root_id,
-                input.source_local_event_id,
-                i64::try_from(input.baseline_generation)
-                    .map_err(|_| StorageError::NumericOverflow)?,
-                input.operation.as_str(),
-                input.relative_path(),
-                input.local_kind.as_str(),
-                input
-                    .local_size_bytes
-                    .map(i64::try_from)
-                    .transpose()
-                    .map_err(|_| StorageError::NumericOverflow)?,
-                input.local_modified_unix_ns,
-                input.local_device_id.map(|value| value.to_string()),
-                input.local_inode.map(|value| value.to_string()),
-                input.target_remote_id(),
-                input.predetermined_remote_id(),
-                input.expected_parent_remote_id(),
-                input.expected_remote_kind.map(|kind| match kind {
-                    RemoteItemKind::File => "file",
-                    RemoteItemKind::Folder => "folder",
-                }),
-                input.expected_remote_version.map(|value| value.to_string()),
-                input
-                    .expected_remote_size_bytes
-                    .map(i64::try_from)
-                    .transpose()
-                    .map_err(|_| StorageError::NumericOverflow)?,
-                input.expected_checksum_algorithm(),
-                input.expected_content_checksum(),
-                input.planned_at_unix_ms,
-            ],
-        )?;
-
-        let id = transaction.last_insert_rowid();
+        let id =
+            insert_sync_root_remote_write_intent_in_transaction(&transaction, sync_root_id, input)?;
         transaction.commit()?;
         Ok(id)
+    }
+
+    pub fn create_sync_root_remote_write_intents_batch(
+        &mut self,
+        sync_root_id: &str,
+        inputs: &[RemoteWriteIntentInput],
+    ) -> Result<Vec<i64>, StorageError> {
+        if inputs.is_empty() || inputs.len() > REMOTE_WRITE_INTENT_BATCH_MAX {
+            return Err(StorageError::InvalidRemoteWriteIntentBatch);
+        }
+
+        let transaction = self.connection.transaction()?;
+        let mut ids = Vec::with_capacity(inputs.len());
+
+        for input in inputs {
+            ids.push(insert_sync_root_remote_write_intent_in_transaction(
+                &transaction,
+                sync_root_id,
+                input,
+            )?);
+        }
+
+        transaction.commit()?;
+        Ok(ids)
     }
 
     pub fn sync_root_remote_write_intent(
@@ -2232,6 +2070,28 @@ impl Storage {
             relative_path,
             status: RemoteWriteIntentStatus::parse(&status)?,
         }))
+    }
+
+    pub fn sync_root_remote_write_intent_for_source_event(
+        &self,
+        sync_root_id: &str,
+        source_local_event_id: i64,
+    ) -> Result<Option<RemoteWriteIntentRecord>, StorageError> {
+        let intent_id: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT id
+                 FROM sync_root_remote_write_intents
+                 WHERE sync_root_id=?1 AND source_local_event_id=?2",
+                params![sync_root_id, source_local_event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        intent_id
+            .map(|intent_id| self.sync_root_remote_write_intent(intent_id))
+            .transpose()
+            .map(|record| record.flatten())
     }
 
     pub fn sync_root_remote_write_intent_count(
@@ -4671,6 +4531,191 @@ fn parse_optional_local_kind(value: Option<&str>) -> Result<Option<LocalItemKind
         .transpose()
 }
 
+fn insert_sync_root_remote_write_intent_in_transaction(
+    transaction: &Transaction<'_>,
+    sync_root_id: &str,
+    input: &RemoteWriteIntentInput,
+) -> Result<i64, StorageError> {
+    let mode: Option<String> = transaction
+        .query_row(
+            "SELECT mode FROM sync_roots WHERE id=?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(mode) = mode else {
+        return Err(StorageError::RemoteWriteIntentSourceMismatch);
+    };
+    if SyncMode::parse(&mode)? == SyncMode::ReceiveOnly {
+        return Err(StorageError::RemoteWriteIntentRootNotWriteCapable);
+    }
+
+    let state: Option<(i64, i64)> = transaction
+        .query_row(
+            "SELECT generation, observation_valid
+             FROM sync_root_local_inventory_state
+             WHERE sync_root_id=?1 AND snapshot_complete=1",
+            params![sync_root_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((generation, observation_valid)) = state else {
+        return Err(StorageError::RemoteWriteIntentSourceMismatch);
+    };
+    if u64::try_from(generation).map_err(|_| StorageError::NumericOverflow)?
+        != input.baseline_generation
+        || observation_valid == 0
+    {
+        return Err(StorageError::RemoteWriteIntentSourceMismatch);
+    }
+
+    let source: Option<(
+        String,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    )> = transaction
+        .query_row(
+            "SELECT sync_root_id, baseline_generation, event_kind, relative_path,
+                    baseline_kind, current_kind, status
+             FROM sync_root_local_change_events WHERE id=?1",
+            params![input.source_local_event_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((
+        source_root,
+        source_generation,
+        source_kind,
+        source_path,
+        baseline_kind,
+        current_kind,
+        source_status,
+    )) = source
+    else {
+        return Err(StorageError::RemoteWriteIntentSourceMismatch);
+    };
+
+    if source_root != sync_root_id
+        || u64::try_from(source_generation).map_err(|_| StorageError::NumericOverflow)?
+            != input.baseline_generation
+        || source_path != input.relative_path()
+        || source_status != "pending"
+    {
+        return Err(StorageError::RemoteWriteIntentSourceMismatch);
+    }
+
+    validate_intent_against_local_event(
+        input,
+        &source_kind,
+        baseline_kind.as_deref(),
+        current_kind.as_deref(),
+    )?;
+
+    match input.operation {
+        RemoteWriteIntentOperation::CreateFile | RemoteWriteIntentOperation::CreateFolder => {
+            let parent = input
+                .expected_parent_remote_id()
+                .ok_or(StorageError::InvalidRemoteWriteIntent)?;
+            let authority =
+                query_remote_write_authority_in_transaction(transaction, sync_root_id, parent)?
+                    .ok_or(StorageError::RemoteWriteIntentAuthorityMismatch)?;
+            if !authority.can_add_children {
+                return Err(StorageError::RemoteWriteIntentAuthorityMismatch);
+            }
+        }
+        RemoteWriteIntentOperation::UpdateFile => {
+            let target = input
+                .target_remote_id()
+                .ok_or(StorageError::InvalidRemoteWriteIntent)?;
+            let authority =
+                query_remote_write_authority_in_transaction(transaction, sync_root_id, target)?
+                    .ok_or(StorageError::RemoteWriteIntentAuthorityMismatch)?;
+            if !authority.can_edit
+                || Some(authority.remote_version) != input.expected_remote_version
+            {
+                return Err(StorageError::RemoteWriteIntentAuthorityMismatch);
+            }
+        }
+        RemoteWriteIntentOperation::TrashItem => {
+            let target = input
+                .target_remote_id()
+                .ok_or(StorageError::InvalidRemoteWriteIntent)?;
+            let authority =
+                query_remote_write_authority_in_transaction(transaction, sync_root_id, target)?
+                    .ok_or(StorageError::RemoteWriteIntentAuthorityMismatch)?;
+            if !authority.can_trash
+                || Some(authority.remote_version) != input.expected_remote_version
+            {
+                return Err(StorageError::RemoteWriteIntentAuthorityMismatch);
+            }
+        }
+    }
+
+    transaction.execute(
+        "INSERT INTO sync_root_remote_write_intents (
+            sync_root_id, source_local_event_id, baseline_generation,
+            operation_kind, relative_path, local_kind, local_size_bytes,
+            local_modified_unix_ns, local_device_id, local_inode,
+            target_remote_id, predetermined_remote_id, expected_parent_remote_id,
+            expected_remote_kind, expected_remote_version, expected_remote_size_bytes,
+            expected_checksum_algorithm, expected_content_checksum,
+            planned_at_unix_ms, status
+         ) VALUES (
+            ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,
+            ?11,?12,?13,?14,?15,?16,?17,?18,?19,'planned'
+         )",
+        params![
+            sync_root_id,
+            input.source_local_event_id,
+            i64::try_from(input.baseline_generation).map_err(|_| StorageError::NumericOverflow)?,
+            input.operation.as_str(),
+            input.relative_path(),
+            input.local_kind.as_str(),
+            input
+                .local_size_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| StorageError::NumericOverflow)?,
+            input.local_modified_unix_ns,
+            input.local_device_id.map(|value| value.to_string()),
+            input.local_inode.map(|value| value.to_string()),
+            input.target_remote_id(),
+            input.predetermined_remote_id(),
+            input.expected_parent_remote_id(),
+            input.expected_remote_kind.map(|kind| match kind {
+                RemoteItemKind::File => "file",
+                RemoteItemKind::Folder => "folder",
+            }),
+            input.expected_remote_version.map(|value| value.to_string()),
+            input
+                .expected_remote_size_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| StorageError::NumericOverflow)?,
+            input.expected_checksum_algorithm(),
+            input.expected_content_checksum(),
+            input.planned_at_unix_ms,
+        ],
+    )?;
+
+    Ok(transaction.last_insert_rowid())
+}
+
 fn validate_intent_against_local_event(
     input: &RemoteWriteIntentInput,
     source_kind: &str,
@@ -5176,6 +5221,8 @@ pub enum StorageError {
     InvalidStoredRemoteWriteAuthority,
     #[error("remote-write intent is invalid")]
     InvalidRemoteWriteIntent,
+    #[error("remote-write intent batch must contain between 1 and 64 intents")]
+    InvalidRemoteWriteIntentBatch,
     #[error("stored remote-write intent operation is invalid")]
     InvalidStoredRemoteWriteIntentOperation,
     #[error("stored remote-write intent status is invalid")]
@@ -9150,6 +9197,178 @@ mod phase5h5_root_authority_storage_tests {
         assert_eq!(
             storage
                 .sync_root_remote_write_intent_count("missing-root")
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase5h6_create_id_storage_tests {
+    use super::*;
+
+    fn setup() -> (Storage, SyncRoot, u64, i64, i64) {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5h6-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h6-root",
+            provider,
+            account.subject,
+            "/tmp/phase5h6-root",
+            Some("remote-root".into()),
+            SyncMode::TwoWay,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let baseline = vec![
+            LocalItemSnapshot::new("docs", LocalItemKind::Directory, None, 100, 8, 40).unwrap(),
+        ];
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_local_inventory_items(&root.id, &baseline, 10)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 11)
+            .unwrap();
+
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        let events = vec![
+            LocalChangeEventInput::new(
+                "docs/one.txt",
+                LocalChangeEventKind::Created,
+                None,
+                Some(LocalItemKind::File),
+            )
+            .unwrap(),
+            LocalChangeEventInput::new(
+                "docs/two.txt",
+                LocalChangeEventKind::Created,
+                None,
+                Some(LocalItemKind::File),
+            )
+            .unwrap(),
+        ];
+        storage
+            .reconcile_sync_root_local_change_journal(
+                &root.id,
+                state.generation,
+                state.item_count,
+                state.snapshot_completed_at_unix_ms,
+                &events,
+                20,
+            )
+            .unwrap();
+
+        storage
+            .upsert_sync_root_remote_write_authority(
+                &root.id,
+                &RemoteWriteAuthoritySnapshot::new(
+                    "remote-docs",
+                    5,
+                    None,
+                    None,
+                    true,
+                    true,
+                    true,
+                    30,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let pending = storage
+            .list_pending_sync_root_local_change_events(&root.id, state.generation)
+            .unwrap();
+
+        (
+            storage,
+            root,
+            state.generation,
+            pending[0].id,
+            pending[1].id,
+        )
+    }
+
+    fn input(
+        source_id: i64,
+        generation: u64,
+        relative_path: &str,
+        generated_id: &str,
+    ) -> RemoteWriteIntentInput {
+        RemoteWriteIntentInput::new(
+            source_id,
+            generation,
+            RemoteWriteIntentOperation::CreateFile,
+            relative_path,
+            LocalItemKind::File,
+            Some(3),
+            Some(200),
+            Some(8),
+            Some(u64::try_from(source_id).unwrap() + 100),
+            None,
+            Some(generated_id.to_owned()),
+            Some("remote-docs".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            40,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn phase5h6_create_intent_batch_commits_atomically() {
+        let (mut storage, root, generation, one, two) = setup();
+        let inputs = vec![
+            input(one, generation, "docs/one.txt", "generated-one"),
+            input(two, generation, "docs/two.txt", "generated-two"),
+        ];
+
+        let ids = storage
+            .create_sync_root_remote_write_intents_batch(&root.id, &inputs)
+            .unwrap();
+
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            storage
+                .sync_root_remote_write_intent_count(&root.id)
+                .unwrap(),
+            2
+        );
+        assert!(
+            storage
+                .sync_root_remote_write_intent_for_source_event(&root.id, one)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn phase5h6_create_intent_batch_rolls_back_on_duplicate_source_event() {
+        let (mut storage, root, generation, one, _) = setup();
+        let inputs = vec![
+            input(one, generation, "docs/one.txt", "generated-one"),
+            input(one, generation, "docs/one.txt", "generated-two"),
+        ];
+
+        assert!(
+            storage
+                .create_sync_root_remote_write_intents_batch(&root.id, &inputs)
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_write_intent_count(&root.id)
                 .unwrap(),
             0
         );
