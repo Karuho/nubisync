@@ -416,3 +416,21 @@ unchanged with:
 
 The next implementation step is Phase 5H1: durable remote-write intent
 foundation only, with no Drive write request.
+
+## Implementation progress after the frozen 5H design
+
+The original 5H safety contract remains authoritative. Implementation has now
+closed through Phase 5H6 on top of it:
+
+- durable remote-write intent foundation;
+- cursor-bound remote write-authority observation;
+- deterministic remote-write planner;
+- separate supervised FullSync credential;
+- explicit TwoWay root authority gate;
+- TwoWay daemon standby;
+- supervised `files.generateIds` boundary.
+
+Phase 5H7 freezes the first actual remote object mutation protocol in
+`PHASE_5H7_FIRST_REMOTE_CREATE_BOUNDARY.md`.
+
+No `files.create` provider method is added by the 5H7 design phase.
