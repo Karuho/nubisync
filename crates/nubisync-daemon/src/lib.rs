@@ -39,6 +39,26 @@ use std::{
 };
 use thiserror::Error;
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectedRootFolderCreateLocalValidation {
+    leaf_name: String,
+}
+
+impl SelectedRootFolderCreateLocalValidation {
+    pub fn leaf_name(&self) -> &str {
+        &self.leaf_name
+    }
+}
+
+impl fmt::Debug for SelectedRootFolderCreateLocalValidation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedRootFolderCreateLocalValidation")
+            .field("leaf_name", &"[redacted]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectedRootLocalDiffKind {
     Created,
@@ -5618,6 +5638,47 @@ pub struct SelectedRootLocalJournalResult {
     pub superseded_events: u64,
 }
 
+pub fn validate_selected_root_folder_create_local_identity(
+    sync_root: &SyncRoot,
+    relative_path: &str,
+    expected_modified_unix_ns: i64,
+    expected_device_id: u64,
+    expected_inode: u64,
+) -> Result<SelectedRootFolderCreateLocalValidation, SelectedRootExecutorError> {
+    if sync_root.mode != SyncMode::TwoWay {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderCreateModeUnsupported);
+    }
+
+    let first = scan_selected_root_local_snapshot(sync_root)?;
+    let second = scan_selected_root_local_snapshot(sync_root)?;
+    if first != second {
+        return Err(SelectedRootExecutorError::LocalDiffScanRace);
+    }
+
+    let item = first
+        .iter()
+        .find(|item| item.relative_path() == relative_path)
+        .ok_or(SelectedRootExecutorError::RemoteWriteFolderCreateLocalIdentityMismatch)?;
+
+    if item.kind() != LocalItemKind::Directory
+        || item.size_bytes().is_some()
+        || item.modified_unix_ns() != expected_modified_unix_ns
+        || item.device_id() != expected_device_id
+        || item.inode() != expected_inode
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderCreateLocalIdentityMismatch);
+    }
+
+    let leaf_name = basename(relative_path);
+    if leaf_name.is_empty() {
+        return Err(SelectedRootExecutorError::RemoteWriteFolderCreateLocalIdentityMismatch);
+    }
+
+    Ok(SelectedRootFolderCreateLocalValidation {
+        leaf_name: leaf_name.to_owned(),
+    })
+}
+
 pub fn journal_selected_root_two_way_local_inventory_diff(
     storage: &mut Storage,
     sync_root: &SyncRoot,
@@ -7401,6 +7462,10 @@ pub enum SelectedRootExecutorError {
     RemoteWritePlanOwnershipAmbiguous,
     #[error("two-way supervised local journal requires a two_way root")]
     TwoWayLocalJournalModeUnsupported,
+    #[error("folder-create local validation requires a two_way root")]
+    RemoteWriteFolderCreateModeUnsupported,
+    #[error("folder-create local directory identity no longer matches the durable intent")]
+    RemoteWriteFolderCreateLocalIdentityMismatch,
     #[error("remote-write plan entry is not eligible for a create intent")]
     RemoteWriteCreateIntentNotEligible,
     #[error("local directory materialization is blocked by local-only entries or type conflicts")]
@@ -11264,5 +11329,53 @@ mod phase5h6_create_id_planner_tests {
         assert!(!debug.contains("private/new.txt"));
         assert!(!debug.contains("private-parent"));
         assert!(!debug.contains("generated-private-id"));
+    }
+}
+
+#[cfg(test)]
+mod phase5h9_folder_create_local_validation_tests {
+    use super::*;
+
+    #[test]
+    fn phase5h9_folder_create_local_identity_uses_safe_double_scan() {
+        let root_path =
+            std::env::temp_dir().join(format!("nubisync-phase5h9-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root_path);
+        fs::create_dir(&root_path).unwrap();
+        let child = root_path.join("folder");
+        fs::create_dir(&child).unwrap();
+
+        let metadata = fs::symlink_metadata(&child).unwrap();
+        let modified_unix_ns = metadata
+            .mtime()
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(metadata.mtime_nsec()))
+            .unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h9-root",
+            nubisync_core::ProviderId::new("google-drive").unwrap(),
+            "phase5h9-subject",
+            root_path.to_str().unwrap(),
+            Some("remote-root".into()),
+            SyncMode::TwoWay,
+            1,
+        )
+        .unwrap();
+
+        let validation = validate_selected_root_folder_create_local_identity(
+            &root,
+            "folder",
+            modified_unix_ns,
+            metadata.dev(),
+            metadata.ino(),
+        )
+        .unwrap();
+
+        assert_eq!(validation.leaf_name(), "folder");
+        assert!(!format!("{validation:?}").contains("folder"));
+
+        fs::remove_dir(&child).unwrap();
+        fs::remove_dir(&root_path).unwrap();
     }
 }

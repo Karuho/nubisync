@@ -571,6 +571,54 @@ impl std::fmt::Debug for RemoteWriteIntentInput {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct RemoteWriteFolderCreateCandidate {
+    pub intent_id: i64,
+    pub source_local_event_id: i64,
+    pub baseline_generation: u64,
+    relative_path: String,
+    pub local_modified_unix_ns: i64,
+    pub local_device_id: u64,
+    pub local_inode: u64,
+    predetermined_remote_id: String,
+    expected_parent_remote_id: String,
+    pub status: RemoteWriteIntentStatus,
+    pub execution_generation: u64,
+}
+
+impl RemoteWriteFolderCreateCandidate {
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    pub fn predetermined_remote_id(&self) -> &str {
+        &self.predetermined_remote_id
+    }
+
+    pub fn expected_parent_remote_id(&self) -> &str {
+        &self.expected_parent_remote_id
+    }
+}
+
+impl std::fmt::Debug for RemoteWriteFolderCreateCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteWriteFolderCreateCandidate")
+            .field("intent_id", &self.intent_id)
+            .field("source_local_event_id", &self.source_local_event_id)
+            .field("baseline_generation", &self.baseline_generation)
+            .field("relative_path", &"[redacted]")
+            .field("local_modified_unix_ns", &self.local_modified_unix_ns)
+            .field("local_device_id", &self.local_device_id)
+            .field("local_inode", &self.local_inode)
+            .field("predetermined_remote_id", &"[redacted]")
+            .field("expected_parent_remote_id", &"[redacted]")
+            .field("status", &self.status)
+            .field("execution_generation", &self.execution_generation)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct RemoteWriteIntentExecutionState {
     pub intent_id: i64,
     pub operation: RemoteWriteIntentOperation,
@@ -2155,6 +2203,98 @@ impl Storage {
             relative_path,
             status: RemoteWriteIntentStatus::parse(&status)?,
         }))
+    }
+
+    pub fn list_sync_root_folder_create_candidates(
+        &self,
+        sync_root_id: &str,
+        status: RemoteWriteIntentStatus,
+    ) -> Result<Vec<RemoteWriteFolderCreateCandidate>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, source_local_event_id, baseline_generation, relative_path,
+                    local_modified_unix_ns, local_device_id, local_inode,
+                    predetermined_remote_id, expected_parent_remote_id,
+                    execution_generation
+             FROM sync_root_remote_write_intents
+             WHERE sync_root_id=?1
+               AND operation_kind='create_folder'
+               AND status=?2
+             ORDER BY id",
+        )?;
+
+        let rows = statement.query_map(params![sync_root_id, status.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })?;
+
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (
+                intent_id,
+                source_local_event_id,
+                baseline_generation,
+                relative_path,
+                local_modified_unix_ns,
+                local_device_id,
+                local_inode,
+                predetermined_remote_id,
+                expected_parent_remote_id,
+                execution_generation,
+            ) = row?;
+
+            if intent_id <= 0
+                || source_local_event_id <= 0
+                || !is_safe_local_event_relative_path(&relative_path)
+            {
+                return Err(StorageError::InvalidStoredRemoteWriteIntentExecutionState);
+            }
+
+            let local_modified_unix_ns = local_modified_unix_ns
+                .ok_or(StorageError::InvalidStoredRemoteWriteIntentExecutionState)?;
+            let local_device_id = local_device_id
+                .ok_or(StorageError::InvalidStoredRemoteWriteIntentExecutionState)?
+                .parse::<u64>()
+                .map_err(|_| StorageError::InvalidStoredRemoteWriteIntentExecutionState)?;
+            let local_inode = local_inode
+                .ok_or(StorageError::InvalidStoredRemoteWriteIntentExecutionState)?
+                .parse::<u64>()
+                .map_err(|_| StorageError::InvalidStoredRemoteWriteIntentExecutionState)?;
+            let predetermined_remote_id = predetermined_remote_id
+                .ok_or(StorageError::InvalidStoredRemoteWriteIntentExecutionState)?;
+            let expected_parent_remote_id = expected_parent_remote_id
+                .ok_or(StorageError::InvalidStoredRemoteWriteIntentExecutionState)?;
+
+            validate_remote_write_identifier(&predetermined_remote_id)?;
+            validate_remote_write_identifier(&expected_parent_remote_id)?;
+
+            candidates.push(RemoteWriteFolderCreateCandidate {
+                intent_id,
+                source_local_event_id,
+                baseline_generation: u64::try_from(baseline_generation)
+                    .map_err(|_| StorageError::InvalidStoredRemoteWriteIntentExecutionState)?,
+                relative_path,
+                local_modified_unix_ns,
+                local_device_id,
+                local_inode,
+                predetermined_remote_id,
+                expected_parent_remote_id,
+                status,
+                execution_generation: u64::try_from(execution_generation)
+                    .map_err(|_| StorageError::InvalidStoredRemoteWriteIntentExecutionState)?,
+            });
+        }
+
+        Ok(candidates)
     }
 
     pub fn sync_root_remote_write_intent_execution_state(
@@ -10105,5 +10245,77 @@ mod phase5h8_folder_create_execution_state_tests {
             .map(Result::unwrap)
             .any(|name| name == "attempt_count");
         assert!(has_attempt_count);
+    }
+}
+
+#[cfg(test)]
+mod phase5h9_folder_create_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn phase5h9_folder_create_candidate_is_loaded_and_redacted() {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5h9-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h9-root",
+            provider,
+            account.subject,
+            "/tmp/phase5h9-root",
+            Some("remote-root".into()),
+            SyncMode::TwoWay,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_local_change_events (
+                sync_root_id, baseline_generation, baseline_item_count,
+                baseline_snapshot_completed_at_unix_ms, event_kind,
+                relative_path, baseline_kind, current_kind,
+                observed_at_unix_ms, status
+             ) VALUES (?1,1,0,1,'created','private-folder',NULL,'directory',2,'pending')",
+                params![root.id],
+            )
+            .unwrap();
+        let event_id = storage.connection.last_insert_rowid();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_remote_write_intents (
+                sync_root_id, source_local_event_id, baseline_generation,
+                operation_kind, relative_path, local_kind,
+                local_modified_unix_ns, local_device_id, local_inode,
+                predetermined_remote_id, expected_parent_remote_id,
+                planned_at_unix_ms, status
+             ) VALUES (
+                ?1,?2,1,'create_folder','private-folder','directory',
+                10,'20','30','generated-private-id','private-parent',3,'planned'
+             )",
+                params![root.id, event_id],
+            )
+            .unwrap();
+
+        let candidates = storage
+            .list_sync_root_folder_create_candidates(&root.id, RemoteWriteIntentStatus::Planned)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.relative_path(), "private-folder");
+        assert_eq!(candidate.predetermined_remote_id(), "generated-private-id");
+        assert_eq!(candidate.expected_parent_remote_id(), "private-parent");
+
+        let debug = format!("{candidate:?}");
+        assert!(!debug.contains("private-folder"));
+        assert!(!debug.contains("generated-private-id"));
+        assert!(!debug.contains("private-parent"));
+        assert!(debug.contains("[redacted]"));
     }
 }

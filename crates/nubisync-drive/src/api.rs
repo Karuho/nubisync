@@ -2,8 +2,8 @@ use crate::OAuthAccessToken;
 use nubisync_core::{
     ChangeCursor, ChangePage, ContinuationToken, RemoteChange, RemoteItem, RemoteItemKind,
 };
-use reqwest::blocking::Client;
-use serde::Deserialize;
+use reqwest::{StatusCode, blocking::Client};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
     fmt,
@@ -32,6 +32,7 @@ const GOOGLE_DRIVE_WRITE_AUTHORITY_FIELDS: &str = concat!(
     "id,mimeType,trashed,version,md5Checksum,",
     "capabilities(canEdit,canTrash,canAddChildren)"
 );
+const GOOGLE_DRIVE_FOLDER_CREATE_FIELDS: &str = "id,name,mimeType,parents,trashed,version";
 
 pub struct GoogleDriveApi {
     client: Client,
@@ -149,6 +150,83 @@ impl GoogleDriveApi {
             .json()?;
 
         validate_generated_ids_response(count, response)
+    }
+
+    /// Creates exactly one Drive folder with a predetermined ID.
+    ///
+    /// This is the first remote-object mutation primitive admitted by NubiSync.
+    pub fn create_folder_with_predetermined_id(
+        &self,
+        remote_id: &str,
+        name: &str,
+        parent_remote_id: &str,
+    ) -> Result<DriveFolderCreateSubmission, DriveApiError> {
+        validate_drive_file_id(remote_id)?;
+        validate_drive_file_id(parent_remote_id)?;
+        validate_folder_create_name(name)?;
+
+        let body = DriveFolderCreateRequest {
+            id: remote_id,
+            name,
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE,
+            parents: [parent_remote_id],
+        };
+
+        let response = self
+            .client
+            .post(GOOGLE_DRIVE_FILES_ENDPOINT)
+            .bearer_auth(self.access_token.as_str())
+            .query(&[("fields", GOOGLE_DRIVE_FOLDER_CREATE_FIELDS)])
+            .json(&body)
+            .send()?;
+
+        if response.status() == StatusCode::CONFLICT {
+            return Ok(DriveFolderCreateSubmission::Conflict);
+        }
+
+        let metadata: DriveFolderMutationResponse = response.error_for_status()?.json()?;
+        if !folder_create_response_matches(remote_id, name, parent_remote_id, &metadata) {
+            return Err(DriveApiError::FolderCreatePostconditionMismatch);
+        }
+
+        Ok(DriveFolderCreateSubmission::Created)
+    }
+
+    /// Inspects a predetermined folder ID without mutating Drive.
+    pub fn inspect_expected_folder(
+        &self,
+        remote_id: &str,
+        expected_name: &str,
+        expected_parent_remote_id: &str,
+    ) -> Result<DriveExpectedFolderLookup, DriveApiError> {
+        validate_drive_file_id(remote_id)?;
+        validate_drive_file_id(expected_parent_remote_id)?;
+        validate_folder_create_name(expected_name)?;
+
+        let response = self
+            .client
+            .get(format!("{GOOGLE_DRIVE_FILES_ENDPOINT}/{remote_id}"))
+            .bearer_auth(self.access_token.as_str())
+            .query(&[("fields", GOOGLE_DRIVE_FOLDER_CREATE_FIELDS)])
+            .send()?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(DriveExpectedFolderLookup::Missing);
+        }
+
+        let metadata: DriveFolderMutationResponse = response.error_for_status()?.json()?;
+        Ok(
+            if folder_create_response_matches(
+                remote_id,
+                expected_name,
+                expected_parent_remote_id,
+                &metadata,
+            ) {
+                DriveExpectedFolderLookup::Exact
+            } else {
+                DriveExpectedFolderLookup::Mismatch
+            },
+        )
     }
 
     /// Observes metadata-only remote authority for later write planning.
@@ -578,9 +656,45 @@ struct DriveGeneratedIdsResponse {
     kind: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveFolderCreateSubmission {
+    Created,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveExpectedFolderLookup {
+    Exact,
+    Missing,
+    Mismatch,
+}
+
+#[derive(Serialize)]
+struct DriveFolderCreateRequest<'a> {
+    id: &'a str,
+    name: &'a str,
+    #[serde(rename = "mimeType")]
+    mime_type: &'static str,
+    parents: [&'a str; 1],
+}
+
+#[derive(Deserialize)]
+struct DriveFolderMutationResponse {
+    id: String,
+    name: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    #[serde(default)]
+    parents: Vec<String>,
+    #[serde(default)]
+    trashed: bool,
+    version: Option<String>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct DriveWriteAuthorityObservation {
     remote_id: String,
+    pub kind: RemoteItemKind,
     pub remote_version: u64,
     md5_checksum: Option<String>,
     pub can_edit: bool,
@@ -603,6 +717,7 @@ impl fmt::Debug for DriveWriteAuthorityObservation {
         formatter
             .debug_struct("DriveWriteAuthorityObservation")
             .field("remote_id", &"[redacted]")
+            .field("kind", &self.kind)
             .field("remote_version", &self.remote_version)
             .field(
                 "md5_checksum",
@@ -1004,6 +1119,32 @@ struct GoogleFile {
     trashed: bool,
 }
 
+fn validate_folder_create_name(name: &str) -> Result<(), DriveApiError> {
+    if name.is_empty() || name.contains('/') || name.contains('\0') {
+        return Err(DriveApiError::InvalidFolderCreateName);
+    }
+    Ok(())
+}
+
+fn folder_create_response_matches(
+    expected_remote_id: &str,
+    expected_name: &str,
+    expected_parent_remote_id: &str,
+    metadata: &DriveFolderMutationResponse,
+) -> bool {
+    metadata.id == expected_remote_id
+        && metadata.name == expected_name
+        && metadata.mime_type == GOOGLE_DRIVE_FOLDER_MIME_TYPE
+        && metadata.parents.len() == 1
+        && metadata.parents.first().map(String::as_str) == Some(expected_parent_remote_id)
+        && !metadata.trashed
+        && metadata
+            .version
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|value| value > 0)
+}
+
 fn validate_generated_ids_response(
     expected_count: u16,
     response: DriveGeneratedIdsResponse,
@@ -1047,6 +1188,12 @@ fn validate_write_authority_response(
         return Err(DriveApiError::WriteAuthorityProviderNativeUnsupported);
     }
 
+    let kind = if metadata.mime_type == GOOGLE_DRIVE_FOLDER_MIME_TYPE {
+        RemoteItemKind::Folder
+    } else {
+        RemoteItemKind::File
+    };
+
     let remote_version = metadata
         .version
         .as_deref()
@@ -1074,6 +1221,7 @@ fn validate_write_authority_response(
 
     Ok(DriveWriteAuthorityObservation {
         remote_id: metadata.id,
+        kind,
         remote_version,
         md5_checksum,
         can_edit: metadata.capabilities.can_edit,
@@ -1324,6 +1472,10 @@ pub enum DriveApiError {
     GeneratedIdCountMismatch,
     #[error("Google Drive generated-ID response contained a duplicate ID")]
     DuplicateGeneratedId,
+    #[error("Google Drive folder-create name is invalid")]
+    InvalidFolderCreateName,
+    #[error("Google Drive folder-create response did not match the durable intent")]
+    FolderCreatePostconditionMismatch,
     #[error("Google Drive write-authority metadata ID does not match the requested item")]
     WriteAuthorityMetadataIdMismatch,
     #[error("Google Drive write-authority target is trashed")]
@@ -1383,6 +1535,48 @@ pub enum DriveApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase5h9_folder_create_postcondition_requires_exact_identity() {
+        let exact = DriveFolderMutationResponse {
+            id: "generated-folder-id".into(),
+            name: "folder".into(),
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME_TYPE.into(),
+            parents: vec!["parent-id".into()],
+            trashed: false,
+            version: Some("7".into()),
+        };
+        assert!(folder_create_response_matches(
+            "generated-folder-id",
+            "folder",
+            "parent-id",
+            &exact,
+        ));
+
+        let wrong_parent = DriveFolderMutationResponse {
+            parents: vec!["different-parent".into()],
+            ..exact
+        };
+        assert!(!folder_create_response_matches(
+            "generated-folder-id",
+            "folder",
+            "parent-id",
+            &wrong_parent,
+        ));
+    }
+
+    #[test]
+    fn phase5h9_folder_create_name_validation_is_fail_closed() {
+        assert!(validate_folder_create_name("folder").is_ok());
+        assert!(matches!(
+            validate_folder_create_name(""),
+            Err(DriveApiError::InvalidFolderCreateName)
+        ));
+        assert!(matches!(
+            validate_folder_create_name("bad/name"),
+            Err(DriveApiError::InvalidFolderCreateName)
+        ));
+    }
 
     #[test]
     fn phase5h6_generated_ids_validate_count_uniqueness_and_redaction() {

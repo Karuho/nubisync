@@ -28,10 +28,11 @@ use nubisync_daemon::{
     plan_selected_root_remote_write_intents, plan_selected_root_stale_files,
     plan_selected_root_unified_convergence_step, replace_selected_root_existing_file,
     replace_selected_root_stale_files, try_acquire_selected_root_cross_process_execution_lock,
-    verify_selected_root_existing_file, verify_selected_root_existing_files,
-    verify_selected_root_local_receipts,
+    validate_selected_root_folder_create_local_identity, verify_selected_root_existing_file,
+    verify_selected_root_existing_files, verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
+    DriveExpectedFolderLookup, DriveFolderCreateSubmission, DriveRootMembership,
     GOOGLE_DRIVE_FULL_SCOPE, GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi,
     GoogleOAuthConfig,
 };
@@ -217,6 +218,22 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_folder_create_recovery_plan()
+        }
+        [sync, roots, submit_folder_create, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && submit_folder_create == "submit-folder-create"
+                && approve == "--approve" =>
+        {
+            sync_roots_submit_folder_create()
+        }
+        [sync, roots, recover_folder_create, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && recover_folder_create == "recover-folder-create-submission"
+                && approve == "--approve" =>
+        {
+            sync_roots_recover_folder_create_submission()
         }
         [sync, roots, activate_two_way, approve]
             if sync == "sync"
@@ -492,6 +509,8 @@ USAGE:
   nubisync sync roots remote-write-plan --approve
   nubisync sync roots allocate-create-ids --approve
   nubisync sync roots folder-create-recovery-plan --approve
+  nubisync sync roots submit-folder-create --approve
+  nubisync sync roots recover-folder-create-submission --approve
   nubisync sync roots activate-two-way --approve
   nubisync sync roots deactivate-two-way --approve
   nubisync sync roots convergence-plan --approve
@@ -1403,6 +1422,400 @@ fn sync_roots_allocate_create_ids() -> Result<(), CliError> {
     println!("REMOTE_OBJECT_MUTATION=no");
     println!("DRIVE_WRITE_ACCESS=generate_ids_only");
     println!("DRIVE_WRITE_EXECUTION_ENABLED=no");
+
+    Ok(())
+}
+
+fn sync_roots_submit_folder_create() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootFolderCreateSubmissionSelectionFailed);
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootFolderCreateSubmissionSelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootFolderCreateSubmissionModeUnsupported);
+    }
+
+    let candidates = storage
+        .list_sync_root_folder_create_candidates(&root.id, RemoteWriteIntentStatus::Planned)?;
+
+    if candidates.is_empty() {
+        println!("SYNC_ROOT_FOLDER_CREATE_SUBMISSION=PASS");
+        println!("MODE=two_way");
+        println!("PLANNED_CREATE_FOLDER_INTENTS=0");
+        println!("SELECTED_INTENTS=0");
+        println!("SUBMISSION_ATTEMPTED=no");
+        println!("PROVIDER_POST=not_performed");
+        println!("INTENT_STATUS_AFTER=none");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_READ=not_performed");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("REMOTE_OBJECT_MUTATION=none");
+        println!("CONFIRMED=no");
+        println!("LOCAL_EVENT_APPLIED=no");
+        println!("BASELINE_ADVANCED=no");
+        println!("LOCAL_NAMES_PRINTED=no");
+        println!("REMOTE_IDS_PRINTED=no");
+        println!("CURSOR_VALUES_PRINTED=no");
+        println!("TOKEN_VALUES_PRINTED=no");
+        println!("DRIVE_WRITE_ACCESS=no_remote_call");
+        return Ok(());
+    }
+
+    let candidate = candidates
+        .first()
+        .cloned()
+        .ok_or(CliError::SyncRootFolderCreateSubmissionSelectionFailed)?;
+
+    println!("SYNC_ROOT_FOLDER_CREATE_SUBMISSION_STAGE=revalidate_local_identity");
+    let local = validate_selected_root_folder_create_local_identity(
+        &root,
+        candidate.relative_path(),
+        candidate.local_modified_unix_ns,
+        candidate.local_device_id,
+        candidate.local_inode,
+    )?;
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let fullsync_key = fullsync_refresh_token_key(&account.subject)?;
+    let fullsync_refresh_token = required_secret_utf8(
+        keyring.get(&fullsync_key)?,
+        CliError::MissingStoredFullSyncRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+
+    println!("SYNC_ROOT_FOLDER_CREATE_SUBMISSION_STAGE=refresh_fullsync_access_token");
+    let tokens = oauth.refresh_access_token(&fullsync_refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_FULL_SCOPE)
+    {
+        return Err(CliError::GoogleFullSyncScopeNotGranted);
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &fullsync_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    let durable_cursor = storage
+        .sync_root_change_cursor(&root.id)?
+        .ok_or(CliError::SyncRootFolderCreateRemoteFenceMismatch)?;
+    let authority_state = storage
+        .sync_root_remote_write_authority_state(&root.id)?
+        .ok_or(CliError::SyncRootFolderCreateRemoteFenceMismatch)?;
+    if authority_state.change_cursor != durable_cursor {
+        return Err(CliError::SyncRootFolderCreateRemoteFenceMismatch);
+    }
+
+    let parent_remote_id = candidate.expected_parent_remote_id();
+    let durable_parent_authority = storage
+        .sync_root_remote_write_authority(&root.id, parent_remote_id)?
+        .ok_or(CliError::SyncRootFolderCreateParentAuthorityMismatch)?;
+    if !durable_parent_authority.can_add_children {
+        return Err(CliError::SyncRootFolderCreateParentAuthorityMismatch);
+    }
+
+    println!("SYNC_ROOT_FOLDER_CREATE_SUBMISSION_STAGE=verify_fresh_parent");
+    let fresh_parent = api.observe_write_authority(parent_remote_id)?;
+    if fresh_parent.kind != RemoteItemKind::Folder
+        || !fresh_parent.can_add_children
+        || fresh_parent.remote_version != durable_parent_authority.remote_version
+    {
+        return Err(CliError::SyncRootFolderCreateParentAuthorityMismatch);
+    }
+
+    let root_remote_id = root
+        .remote_root_id
+        .as_deref()
+        .ok_or(CliError::SyncRootFolderCreateRemoteRootMissing)?;
+    let drive_root = api.resolve_folder_root(root_remote_id)?;
+
+    if parent_remote_id != root_remote_id {
+        let parent_item = storage
+            .sync_root_remote_item(&root.id, parent_remote_id)?
+            .ok_or(CliError::SyncRootFolderCreateParentTopologyMismatch)?;
+        if parent_item.kind != RemoteItemKind::Folder || parent_item.trashed {
+            return Err(CliError::SyncRootFolderCreateParentTopologyMismatch);
+        }
+        if api.resolve_item_membership(&parent_item, &drive_root)?
+            != DriveRootMembership::Descendant
+        {
+            return Err(CliError::SyncRootFolderCreateParentTopologyMismatch);
+        }
+    }
+
+    println!("SYNC_ROOT_FOLDER_CREATE_SUBMISSION_STAGE=establish_pre_submit_fence");
+    let provider_cursor = api.current_change_cursor()?;
+    if provider_cursor != durable_cursor {
+        return Err(CliError::SyncRootFolderCreateRemoteFenceMismatch);
+    }
+
+    println!("SYNC_ROOT_FOLDER_CREATE_SUBMISSION_STAGE=commit_submitted");
+    let submitted = storage.begin_sync_root_folder_create_submission(
+        &root.id,
+        candidate.intent_id,
+        candidate.execution_generation,
+        &provider_cursor,
+        unix_time_ms()?,
+    )?;
+
+    println!("SYNC_ROOT_FOLDER_CREATE_SUBMISSION_STAGE=provider_create");
+    let create_result = api.create_folder_with_predetermined_id(
+        candidate.predetermined_remote_id(),
+        local.leaf_name(),
+        parent_remote_id,
+    )?;
+
+    let (status_after, remote_mutation, recovery_path) = match create_result {
+        DriveFolderCreateSubmission::Created => {
+            let next = storage.transition_sync_root_folder_create_intent(
+                candidate.intent_id,
+                RemoteWriteIntentStatus::Submitted,
+                submitted.execution_generation,
+                RemoteWriteIntentStatus::AwaitingConfirmation,
+                unix_time_ms()?,
+            )?;
+            (next.status.as_str(), "created", "not_needed")
+        }
+        DriveFolderCreateSubmission::Conflict => {
+            println!("SYNC_ROOT_FOLDER_CREATE_SUBMISSION_STAGE=verify_409_predetermined_id");
+            match api.inspect_expected_folder(
+                candidate.predetermined_remote_id(),
+                local.leaf_name(),
+                parent_remote_id,
+            )? {
+                DriveExpectedFolderLookup::Exact => {
+                    let next = storage.transition_sync_root_folder_create_intent(
+                        candidate.intent_id,
+                        RemoteWriteIntentStatus::Submitted,
+                        submitted.execution_generation,
+                        RemoteWriteIntentStatus::AwaitingConfirmation,
+                        unix_time_ms()?,
+                    )?;
+                    (
+                        next.status.as_str(),
+                        "previously_created_or_existing_exact",
+                        "exact_id_match",
+                    )
+                }
+                DriveExpectedFolderLookup::Mismatch => {
+                    let next = storage.transition_sync_root_folder_create_intent(
+                        candidate.intent_id,
+                        RemoteWriteIntentStatus::Submitted,
+                        submitted.execution_generation,
+                        RemoteWriteIntentStatus::Conflict,
+                        unix_time_ms()?,
+                    )?;
+                    (next.status.as_str(), "none_conflict", "exact_id_mismatch")
+                }
+                DriveExpectedFolderLookup::Missing => (
+                    RemoteWriteIntentStatus::Submitted.as_str(),
+                    "ambiguous",
+                    "exact_id_missing_no_retry",
+                ),
+            }
+        }
+    };
+
+    println!("SYNC_ROOT_FOLDER_CREATE_SUBMISSION=PASS");
+    println!("MODE=two_way");
+    println!("PLANNED_CREATE_FOLDER_INTENTS={}", candidates.len());
+    println!("SELECTED_INTENTS=1");
+    println!("SUBMISSION_ATTEMPTED=yes");
+    println!("LOCAL_IDENTITY_VERIFIED=yes");
+    println!("FULLSYNC_CREDENTIAL_VERIFIED=yes");
+    println!("ACCOUNT_SUBJECT_MATCH=yes");
+    println!("PARENT_AUTHORITY_VERIFIED=yes");
+    println!("PARENT_TOPOLOGY_VERIFIED=yes");
+    println!("PRE_SUBMIT_CURSOR_MATCH=yes");
+    println!("DURABLE_SUBMITTED_BEFORE_POST=yes");
+    println!("PROVIDER_POST=performed");
+    println!("HTTP_409_RECOVERY={recovery_path}");
+    println!("INTENT_STATUS_AFTER={status_after}");
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("REMOTE_OBJECT_MUTATION={remote_mutation}");
+    println!("CONFIRMED=no");
+    println!("CHANGE_STREAM_CONFIRMATION_REQUIRED=yes");
+    println!("LOCAL_EVENT_APPLIED=no");
+    println!("BASELINE_ADVANCED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("CURSOR_VALUES_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=folder_create_only");
+
+    Ok(())
+}
+
+fn sync_roots_recover_folder_create_submission() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootFolderCreateSubmissionSelectionFailed);
+    }
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootFolderCreateSubmissionSelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootFolderCreateSubmissionModeUnsupported);
+    }
+
+    let candidates = storage
+        .list_sync_root_folder_create_candidates(&root.id, RemoteWriteIntentStatus::Submitted)?;
+
+    if candidates.is_empty() {
+        println!("SYNC_ROOT_FOLDER_CREATE_RECOVERY=PASS");
+        println!("MODE=two_way");
+        println!("SUBMITTED_CREATE_FOLDER_INTENTS=0");
+        println!("SELECTED_INTENTS=0");
+        println!("RECOVERY_OUTCOME=none");
+        println!("PROVIDER_POST=not_performed");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_READ=not_performed");
+        println!("REMOTE_OBJECT_MUTATION=none");
+        println!("CONFIRMED=no");
+        println!("LOCAL_EVENT_APPLIED=no");
+        println!("BASELINE_ADVANCED=no");
+        println!("REMOTE_IDS_PRINTED=no");
+        println!("TOKEN_VALUES_PRINTED=no");
+        println!("DRIVE_WRITE_ACCESS=no_remote_call");
+        return Ok(());
+    }
+
+    let candidate = candidates
+        .first()
+        .cloned()
+        .ok_or(CliError::SyncRootFolderCreateSubmissionSelectionFailed)?;
+
+    let local = validate_selected_root_folder_create_local_identity(
+        &root,
+        candidate.relative_path(),
+        candidate.local_modified_unix_ns,
+        candidate.local_device_id,
+        candidate.local_inode,
+    )?;
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let fullsync_key = fullsync_refresh_token_key(&account.subject)?;
+    let fullsync_refresh_token = required_secret_utf8(
+        keyring.get(&fullsync_key)?,
+        CliError::MissingStoredFullSyncRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&fullsync_refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_FULL_SCOPE)
+    {
+        return Err(CliError::GoogleFullSyncScopeNotGranted);
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &fullsync_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    let lookup = api.inspect_expected_folder(
+        candidate.predetermined_remote_id(),
+        local.leaf_name(),
+        candidate.expected_parent_remote_id(),
+    )?;
+
+    let (status_after, recovery_outcome, database_mutation) = match lookup {
+        DriveExpectedFolderLookup::Exact => {
+            let next = storage.transition_sync_root_folder_create_intent(
+                candidate.intent_id,
+                RemoteWriteIntentStatus::Submitted,
+                candidate.execution_generation,
+                RemoteWriteIntentStatus::AwaitingConfirmation,
+                unix_time_ms()?,
+            )?;
+            (next.status.as_str(), "exact_id_match", "yes")
+        }
+        DriveExpectedFolderLookup::Mismatch => {
+            let next = storage.transition_sync_root_folder_create_intent(
+                candidate.intent_id,
+                RemoteWriteIntentStatus::Submitted,
+                candidate.execution_generation,
+                RemoteWriteIntentStatus::Conflict,
+                unix_time_ms()?,
+            )?;
+            (next.status.as_str(), "exact_id_mismatch", "yes")
+        }
+        DriveExpectedFolderLookup::Missing => (
+            RemoteWriteIntentStatus::Submitted.as_str(),
+            "exact_id_missing_no_retry",
+            "no",
+        ),
+    };
+
+    println!("SYNC_ROOT_FOLDER_CREATE_RECOVERY=PASS");
+    println!("MODE=two_way");
+    println!("SUBMITTED_CREATE_FOLDER_INTENTS={}", candidates.len());
+    println!("SELECTED_INTENTS=1");
+    println!("RECOVERY_OUTCOME={recovery_outcome}");
+    println!("INTENT_STATUS_AFTER={status_after}");
+    println!("PROVIDER_POST=not_performed");
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION={database_mutation}");
+    println!("FILESYSTEM_READ=metadata_only");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("REMOTE_OBJECT_MUTATION=none");
+    println!("CONFIRMED=no");
+    println!("LOCAL_EVENT_APPLIED=no");
+    println!("BASELINE_ADVANCED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("CURSOR_VALUES_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=metadata_recovery_only");
 
     Ok(())
 }
@@ -5837,6 +6250,8 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "remote-write-plan"
                 | "allocate-create-ids"
                 | "folder-create-recovery-plan"
+                | "submit-folder-create"
+                | "recover-folder-create-submission"
                 | "activate-two-way"
                 | "deactivate-two-way"
                 | "convergence-plan"
@@ -5940,6 +6355,22 @@ mod sync_root_cli_tests {
         ] {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(!cli_requires_cross_process_execution_lock(&args));
+        }
+    }
+
+    #[test]
+    fn phase5h9_execution_lock_covers_folder_create_submission_and_recovery() {
+        for args in [
+            ["sync", "roots", "submit-folder-create", "--approve"],
+            [
+                "sync",
+                "roots",
+                "recover-folder-create-submission",
+                "--approve",
+            ],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(cli_requires_cross_process_execution_lock(&args));
         }
     }
 
@@ -6282,6 +6713,18 @@ enum CliError {
     SyncRootCreateIdAllocationSelectionFailed,
     #[error("sync root folder-create recovery-plan selection failed")]
     SyncRootFolderCreateRecoverySelectionFailed,
+    #[error("sync root folder-create submission selection failed")]
+    SyncRootFolderCreateSubmissionSelectionFailed,
+    #[error("sync root folder-create submission requires two_way mode")]
+    SyncRootFolderCreateSubmissionModeUnsupported,
+    #[error("sync root folder-create durable remote root is missing")]
+    SyncRootFolderCreateRemoteRootMissing,
+    #[error("sync root folder-create parent authority no longer matches")]
+    SyncRootFolderCreateParentAuthorityMismatch,
+    #[error("sync root folder-create parent topology is no longer valid")]
+    SyncRootFolderCreateParentTopologyMismatch,
+    #[error("sync root folder-create remote cursor fence no longer matches")]
+    SyncRootFolderCreateRemoteFenceMismatch,
     #[error("sync root folder-create recovery-plan requires two_way mode")]
     SyncRootFolderCreateRecoveryModeUnsupported,
     #[error("sync root create-ID allocation requires two_way mode")]
