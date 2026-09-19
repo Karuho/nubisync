@@ -35,7 +35,9 @@ use nubisync_drive::{
     GOOGLE_DRIVE_FULL_SCOPE, GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi,
     GoogleOAuthConfig,
 };
-use nubisync_storage::{REMOTE_WRITE_INTENT_BATCH_MAX, RemoteWriteAuthoritySnapshot, Storage};
+use nubisync_storage::{
+    REMOTE_WRITE_INTENT_BATCH_MAX, RemoteWriteAuthoritySnapshot, RemoteWriteIntentStatus, Storage,
+};
 use std::{
     collections::{HashSet, VecDeque},
     env, fs,
@@ -207,6 +209,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_allocate_create_ids()
+        }
+        [sync, roots, folder_create_recovery_plan, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && folder_create_recovery_plan == "folder-create-recovery-plan"
+                && approve == "--approve" =>
+        {
+            sync_roots_folder_create_recovery_plan()
         }
         [sync, roots, activate_two_way, approve]
             if sync == "sync"
@@ -481,6 +491,7 @@ USAGE:
   nubisync sync roots observe-write-authority --approve
   nubisync sync roots remote-write-plan --approve
   nubisync sync roots allocate-create-ids --approve
+  nubisync sync roots folder-create-recovery-plan --approve
   nubisync sync roots activate-two-way --approve
   nubisync sync roots deactivate-two-way --approve
   nubisync sync roots convergence-plan --approve
@@ -1392,6 +1403,84 @@ fn sync_roots_allocate_create_ids() -> Result<(), CliError> {
     println!("REMOTE_OBJECT_MUTATION=no");
     println!("DRIVE_WRITE_ACCESS=generate_ids_only");
     println!("DRIVE_WRITE_EXECUTION_ENABLED=no");
+
+    Ok(())
+}
+
+fn sync_roots_folder_create_recovery_plan() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootFolderCreateRecoverySelectionFailed);
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootFolderCreateRecoverySelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootFolderCreateRecoveryModeUnsupported);
+    }
+
+    let states = storage.list_sync_root_folder_create_execution_states(&root.id)?;
+    let mut planned = 0usize;
+    let mut submitted = 0usize;
+    let mut awaiting_confirmation = 0usize;
+    let mut confirmed = 0usize;
+    let mut conflict = 0usize;
+    let mut failed = 0usize;
+    let mut superseded = 0usize;
+    let mut attempted = 0usize;
+
+    for state in &states {
+        if state.attempt_count > 0 {
+            attempted = attempted.checked_add(1).ok_or(CliError::NumericOverflow)?;
+        }
+        match state.status {
+            RemoteWriteIntentStatus::Planned => planned += 1,
+            RemoteWriteIntentStatus::Submitted => submitted += 1,
+            RemoteWriteIntentStatus::AwaitingConfirmation => awaiting_confirmation += 1,
+            RemoteWriteIntentStatus::Confirmed => confirmed += 1,
+            RemoteWriteIntentStatus::Conflict => conflict += 1,
+            RemoteWriteIntentStatus::Failed => failed += 1,
+            RemoteWriteIntentStatus::Superseded => superseded += 1,
+        }
+    }
+
+    println!("SYNC_ROOT_FOLDER_CREATE_RECOVERY_PLAN=PASS");
+    println!("MODE=two_way");
+    println!("FOLDER_CREATE_INTENTS={}", states.len());
+    println!("PLANNED={planned}");
+    println!("SUBMITTED={submitted}");
+    println!("AWAITING_CONFIRMATION={awaiting_confirmation}");
+    println!("CONFIRMED={confirmed}");
+    println!("CONFLICT={conflict}");
+    println!("FAILED={failed}");
+    println!("SUPERSEDED={superseded}");
+    println!("ATTEMPTED_INTENTS={attempted}");
+    println!(
+        "RECOVERY_REQUIRED={}",
+        yes_no(submitted > 0 || awaiting_confirmation > 0)
+    );
+    println!("NETWORK_CHECK=not_performed");
+    println!("FILESYSTEM_READ=not_performed");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("INTENT_STATUS_MUTATION=no");
+    println!("LOCAL_EVENT_APPLIED=no");
+    println!("BASELINE_ADVANCED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("CURSOR_VALUES_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("REMOTE_OBJECT_MUTATION=no");
+    println!("DRIVE_WRITE_ACCESS=no");
 
     Ok(())
 }
@@ -5747,6 +5836,7 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "observe-write-authority"
                 | "remote-write-plan"
                 | "allocate-create-ids"
+                | "folder-create-recovery-plan"
                 | "activate-two-way"
                 | "deactivate-two-way"
                 | "convergence-plan"
@@ -5851,6 +5941,15 @@ mod sync_root_cli_tests {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(!cli_requires_cross_process_execution_lock(&args));
         }
+    }
+
+    #[test]
+    fn phase5h8_execution_lock_covers_folder_create_recovery_plan() {
+        let args = ["sync", "roots", "folder-create-recovery-plan", "--approve"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(cli_requires_cross_process_execution_lock(&args));
     }
 
     #[test]
@@ -6181,6 +6280,10 @@ enum CliError {
     SyncRootRemoteWritePlanSelectionFailed,
     #[error("sync root create-ID allocation selection failed")]
     SyncRootCreateIdAllocationSelectionFailed,
+    #[error("sync root folder-create recovery-plan selection failed")]
+    SyncRootFolderCreateRecoverySelectionFailed,
+    #[error("sync root folder-create recovery-plan requires two_way mode")]
+    SyncRootFolderCreateRecoveryModeUnsupported,
     #[error("sync root create-ID allocation requires two_way mode")]
     SyncRootCreateIdAllocationModeUnsupported,
     #[error("sync root create-ID allocation write gates are not satisfied")]

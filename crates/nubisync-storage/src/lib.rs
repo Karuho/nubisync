@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 pub const REMOTE_WRITE_INTENT_BATCH_MAX: usize = 64;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
@@ -571,6 +571,52 @@ impl std::fmt::Debug for RemoteWriteIntentInput {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct RemoteWriteIntentExecutionState {
+    pub intent_id: i64,
+    pub operation: RemoteWriteIntentOperation,
+    pub status: RemoteWriteIntentStatus,
+    pub attempt_count: u64,
+    pub execution_generation: u64,
+    pub last_attempt_at_unix_ms: Option<i64>,
+    pub submitted_at_unix_ms: Option<i64>,
+    pre_submit_change_cursor: Option<ChangeCursor>,
+    pub awaiting_confirmation_at_unix_ms: Option<i64>,
+    pub confirmed_at_unix_ms: Option<i64>,
+    pub terminal_at_unix_ms: Option<i64>,
+}
+
+impl RemoteWriteIntentExecutionState {
+    pub fn pre_submit_change_cursor(&self) -> Option<&ChangeCursor> {
+        self.pre_submit_change_cursor.as_ref()
+    }
+}
+
+impl std::fmt::Debug for RemoteWriteIntentExecutionState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteWriteIntentExecutionState")
+            .field("intent_id", &self.intent_id)
+            .field("operation", &self.operation)
+            .field("status", &self.status)
+            .field("attempt_count", &self.attempt_count)
+            .field("execution_generation", &self.execution_generation)
+            .field("last_attempt_at_unix_ms", &self.last_attempt_at_unix_ms)
+            .field("submitted_at_unix_ms", &self.submitted_at_unix_ms)
+            .field(
+                "pre_submit_change_cursor",
+                &self.pre_submit_change_cursor.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "awaiting_confirmation_at_unix_ms",
+                &self.awaiting_confirmation_at_unix_ms,
+            )
+            .field("confirmed_at_unix_ms", &self.confirmed_at_unix_ms)
+            .field("terminal_at_unix_ms", &self.terminal_at_unix_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct RemoteWriteIntentRecord {
     pub id: i64,
     pub source_local_event_id: i64,
@@ -902,6 +948,15 @@ impl Storage {
                 expected_checksum_algorithm TEXT,
                 expected_content_checksum TEXT,
                 planned_at_unix_ms INTEGER NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                execution_generation INTEGER NOT NULL DEFAULT 0
+                    CHECK (execution_generation >= 0),
+                last_attempt_at_unix_ms INTEGER,
+                submitted_at_unix_ms INTEGER,
+                pre_submit_change_cursor TEXT,
+                awaiting_confirmation_at_unix_ms INTEGER,
+                confirmed_at_unix_ms INTEGER,
+                terminal_at_unix_ms INTEGER,
                 status TEXT NOT NULL CHECK (
                     status IN (
                         'planned','submitted','awaiting_confirmation',
@@ -915,6 +970,11 @@ impl Storage {
 
             CREATE INDEX IF NOT EXISTS sync_root_remote_write_intents_status_idx
             ON sync_root_remote_write_intents(sync_root_id, status, id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                sync_root_remote_write_intents_predetermined_id_idx
+            ON sync_root_remote_write_intents(sync_root_id, predetermined_remote_id)
+            WHERE predetermined_remote_id IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS local_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1161,6 +1221,31 @@ impl Storage {
                  ADD COLUMN observation_valid INTEGER NOT NULL DEFAULT 0
                  CHECK (observation_valid IN (0, 1))",
                 [],
+            )?;
+        }
+
+        if current_version == 16 {
+            transaction.execute_batch(
+                "
+                ALTER TABLE sync_root_remote_write_intents
+                    ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (attempt_count >= 0);
+                ALTER TABLE sync_root_remote_write_intents
+                    ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0
+                    CHECK (execution_generation >= 0);
+                ALTER TABLE sync_root_remote_write_intents
+                    ADD COLUMN last_attempt_at_unix_ms INTEGER;
+                ALTER TABLE sync_root_remote_write_intents
+                    ADD COLUMN submitted_at_unix_ms INTEGER;
+                ALTER TABLE sync_root_remote_write_intents
+                    ADD COLUMN pre_submit_change_cursor TEXT;
+                ALTER TABLE sync_root_remote_write_intents
+                    ADD COLUMN awaiting_confirmation_at_unix_ms INTEGER;
+                ALTER TABLE sync_root_remote_write_intents
+                    ADD COLUMN confirmed_at_unix_ms INTEGER;
+                ALTER TABLE sync_root_remote_write_intents
+                    ADD COLUMN terminal_at_unix_ms INTEGER;
+                ",
             )?;
         }
 
@@ -2070,6 +2155,317 @@ impl Storage {
             relative_path,
             status: RemoteWriteIntentStatus::parse(&status)?,
         }))
+    }
+
+    pub fn sync_root_remote_write_intent_execution_state(
+        &self,
+        intent_id: i64,
+    ) -> Result<Option<RemoteWriteIntentExecutionState>, StorageError> {
+        query_remote_write_intent_execution_state(&self.connection, intent_id)
+    }
+
+    pub fn list_sync_root_folder_create_execution_states(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<Vec<RemoteWriteIntentExecutionState>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id
+             FROM sync_root_remote_write_intents
+             WHERE sync_root_id=?1 AND operation_kind='create_folder'
+             ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![sync_root_id], |row| row.get::<_, i64>(0))?;
+
+        let mut states = Vec::new();
+        for row in rows {
+            let intent_id = row?;
+            let state = query_remote_write_intent_execution_state(&self.connection, intent_id)?
+                .ok_or(StorageError::RemoteWriteIntentExecutionStateMissing)?;
+            states.push(state);
+        }
+        Ok(states)
+    }
+
+    pub fn begin_sync_root_folder_create_submission(
+        &mut self,
+        sync_root_id: &str,
+        intent_id: i64,
+        expected_execution_generation: u64,
+        pre_submit_change_cursor: &ChangeCursor,
+        attempt_at_unix_ms: i64,
+    ) -> Result<RemoteWriteIntentExecutionState, StorageError> {
+        if intent_id <= 0 || attempt_at_unix_ms <= 0 {
+            return Err(StorageError::InvalidRemoteWriteIntentExecutionTransition);
+        }
+
+        let expected_generation_i64 = i64::try_from(expected_execution_generation)
+            .map_err(|_| StorageError::NumericOverflow)?;
+        let transaction = self.connection.transaction()?;
+
+        let mode: Option<String> = transaction
+            .query_row(
+                "SELECT mode FROM sync_roots WHERE id=?1",
+                params![sync_root_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(mode) = mode else {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        };
+        if SyncMode::parse(&mode)? != SyncMode::TwoWay {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        }
+
+        let intent: Option<(
+            i64,
+            i64,
+            String,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+        )> = transaction
+            .query_row(
+                "SELECT source_local_event_id, baseline_generation, operation_kind,
+                            status, execution_generation,
+                            predetermined_remote_id, expected_parent_remote_id
+                     FROM sync_root_remote_write_intents
+                     WHERE id=?1 AND sync_root_id=?2",
+                params![intent_id, sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((
+            source_event_id,
+            baseline_generation,
+            operation,
+            status,
+            execution_generation,
+            predetermined_remote_id,
+            expected_parent_remote_id,
+        )) = intent
+        else {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        };
+
+        if operation != "create_folder"
+            || status != "planned"
+            || execution_generation != expected_generation_i64
+            || predetermined_remote_id.is_none()
+            || expected_parent_remote_id.is_none()
+        {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        }
+
+        let local_state: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT generation, observation_valid
+                 FROM sync_root_local_inventory_state
+                 WHERE sync_root_id=?1 AND snapshot_complete=1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((local_generation, observation_valid)) = local_state else {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        };
+        if local_generation != baseline_generation || observation_valid == 0 {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        }
+
+        let source_ok: Option<i64> = transaction
+            .query_row(
+                "SELECT 1
+                 FROM sync_root_local_change_events
+                 WHERE id=?1
+                   AND sync_root_id=?2
+                   AND baseline_generation=?3
+                   AND event_kind='created'
+                   AND current_kind='directory'
+                   AND status='pending'",
+                params![source_event_id, sync_root_id, baseline_generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if source_ok.is_none() {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        }
+
+        let catalog: Option<(i64, i64, Option<String>)> = transaction
+            .query_row(
+                "SELECT snapshot_complete, catchup_complete, change_cursor
+                 FROM sync_root_remote_inventory_state
+                 WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((snapshot_complete, catchup_complete, durable_cursor)) = catalog else {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        };
+        if snapshot_complete == 0
+            || catchup_complete == 0
+            || durable_cursor.as_deref() != Some(pre_submit_change_cursor.as_str())
+        {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        }
+
+        let open_window: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_change_window_state WHERE sync_root_id=?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        if open_window != 0 {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        }
+
+        let authority_cursor: Option<String> = transaction
+            .query_row(
+                "SELECT change_cursor
+                 FROM sync_root_remote_write_authority_state
+                 WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if authority_cursor.as_deref() != Some(pre_submit_change_cursor.as_str()) {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        }
+
+        let parent = expected_parent_remote_id
+            .as_deref()
+            .ok_or(StorageError::RemoteWriteIntentExecutionPreconditionFailed)?;
+        let parent_can_add: Option<i64> = transaction
+            .query_row(
+                "SELECT can_add_children
+                 FROM sync_root_remote_write_authority
+                 WHERE sync_root_id=?1 AND remote_id=?2",
+                params![sync_root_id, parent],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if parent_can_add != Some(1) {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        }
+
+        let changed = transaction.execute(
+            "UPDATE sync_root_remote_write_intents
+             SET status='submitted',
+                 attempt_count=attempt_count+1,
+                 execution_generation=execution_generation+1,
+                 last_attempt_at_unix_ms=?1,
+                 submitted_at_unix_ms=?1,
+                 pre_submit_change_cursor=?2
+             WHERE id=?3
+               AND sync_root_id=?4
+               AND operation_kind='create_folder'
+               AND status='planned'
+               AND execution_generation=?5",
+            params![
+                attempt_at_unix_ms,
+                pre_submit_change_cursor.as_str(),
+                intent_id,
+                sync_root_id,
+                expected_generation_i64,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::RemoteWriteIntentExecutionCompareAndSetFailed);
+        }
+
+        transaction.commit()?;
+        self.sync_root_remote_write_intent_execution_state(intent_id)?
+            .ok_or(StorageError::RemoteWriteIntentExecutionStateMissing)
+    }
+
+    pub fn transition_sync_root_folder_create_intent(
+        &self,
+        intent_id: i64,
+        expected_status: RemoteWriteIntentStatus,
+        expected_execution_generation: u64,
+        new_status: RemoteWriteIntentStatus,
+        transitioned_at_unix_ms: i64,
+    ) -> Result<RemoteWriteIntentExecutionState, StorageError> {
+        if intent_id <= 0 || transitioned_at_unix_ms <= 0 {
+            return Err(StorageError::InvalidRemoteWriteIntentExecutionTransition);
+        }
+
+        let valid = matches!(
+            (expected_status, new_status),
+            (
+                RemoteWriteIntentStatus::Submitted,
+                RemoteWriteIntentStatus::AwaitingConfirmation
+            ) | (
+                RemoteWriteIntentStatus::Submitted,
+                RemoteWriteIntentStatus::Conflict
+            ) | (
+                RemoteWriteIntentStatus::Submitted,
+                RemoteWriteIntentStatus::Failed
+            ) | (
+                RemoteWriteIntentStatus::AwaitingConfirmation,
+                RemoteWriteIntentStatus::Confirmed
+            ) | (
+                RemoteWriteIntentStatus::AwaitingConfirmation,
+                RemoteWriteIntentStatus::Conflict
+            )
+        );
+        if !valid {
+            return Err(StorageError::InvalidRemoteWriteIntentExecutionTransition);
+        }
+
+        let expected_generation_i64 = i64::try_from(expected_execution_generation)
+            .map_err(|_| StorageError::NumericOverflow)?;
+
+        let (awaiting_confirmation_at, confirmed_at, terminal_at) = match new_status {
+            RemoteWriteIntentStatus::AwaitingConfirmation => {
+                (Some(transitioned_at_unix_ms), None, None)
+            }
+            RemoteWriteIntentStatus::Confirmed => (None, Some(transitioned_at_unix_ms), None),
+            RemoteWriteIntentStatus::Conflict | RemoteWriteIntentStatus::Failed => {
+                (None, None, Some(transitioned_at_unix_ms))
+            }
+            _ => return Err(StorageError::InvalidRemoteWriteIntentExecutionTransition),
+        };
+
+        let changed = self.connection.execute(
+            "UPDATE sync_root_remote_write_intents
+             SET status=?1,
+                 execution_generation=execution_generation+1,
+                 awaiting_confirmation_at_unix_ms=
+                    COALESCE(?2, awaiting_confirmation_at_unix_ms),
+                 confirmed_at_unix_ms=COALESCE(?3, confirmed_at_unix_ms),
+                 terminal_at_unix_ms=COALESCE(?4, terminal_at_unix_ms)
+             WHERE id=?5
+               AND operation_kind='create_folder'
+               AND status=?6
+               AND execution_generation=?7",
+            params![
+                new_status.as_str(),
+                awaiting_confirmation_at,
+                confirmed_at,
+                terminal_at,
+                intent_id,
+                expected_status.as_str(),
+                expected_generation_i64,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::RemoteWriteIntentExecutionCompareAndSetFailed);
+        }
+
+        self.sync_root_remote_write_intent_execution_state(intent_id)?
+            .ok_or(StorageError::RemoteWriteIntentExecutionStateMissing)
     }
 
     pub fn sync_root_remote_write_intent_for_source_event(
@@ -4531,6 +4927,82 @@ fn parse_optional_local_kind(value: Option<&str>) -> Result<Option<LocalItemKind
         .transpose()
 }
 
+fn query_remote_write_intent_execution_state(
+    connection: &Connection,
+    intent_id: i64,
+) -> Result<Option<RemoteWriteIntentExecutionState>, StorageError> {
+    let row: Option<(
+        String,
+        String,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    )> = connection
+        .query_row(
+            "SELECT operation_kind, status, attempt_count, execution_generation,
+                    last_attempt_at_unix_ms, submitted_at_unix_ms,
+                    pre_submit_change_cursor, awaiting_confirmation_at_unix_ms,
+                    confirmed_at_unix_ms, terminal_at_unix_ms
+             FROM sync_root_remote_write_intents
+             WHERE id=?1",
+            params![intent_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((
+        operation,
+        status,
+        attempt_count,
+        execution_generation,
+        last_attempt_at_unix_ms,
+        submitted_at_unix_ms,
+        pre_submit_change_cursor,
+        awaiting_confirmation_at_unix_ms,
+        confirmed_at_unix_ms,
+        terminal_at_unix_ms,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(RemoteWriteIntentExecutionState {
+        intent_id,
+        operation: RemoteWriteIntentOperation::parse(&operation)?,
+        status: RemoteWriteIntentStatus::parse(&status)?,
+        attempt_count: u64::try_from(attempt_count)
+            .map_err(|_| StorageError::InvalidStoredRemoteWriteIntentExecutionState)?,
+        execution_generation: u64::try_from(execution_generation)
+            .map_err(|_| StorageError::InvalidStoredRemoteWriteIntentExecutionState)?,
+        last_attempt_at_unix_ms,
+        submitted_at_unix_ms,
+        pre_submit_change_cursor: pre_submit_change_cursor
+            .map(ChangeCursor::new)
+            .transpose()?,
+        awaiting_confirmation_at_unix_ms,
+        confirmed_at_unix_ms,
+        terminal_at_unix_ms,
+    }))
+}
+
 fn insert_sync_root_remote_write_intent_in_transaction(
     transaction: &Transaction<'_>,
     sync_root_id: &str,
@@ -5223,6 +5695,16 @@ pub enum StorageError {
     InvalidRemoteWriteIntent,
     #[error("remote-write intent batch must contain between 1 and 64 intents")]
     InvalidRemoteWriteIntentBatch,
+    #[error("remote-write intent execution transition is invalid")]
+    InvalidRemoteWriteIntentExecutionTransition,
+    #[error("remote-write intent execution precondition failed")]
+    RemoteWriteIntentExecutionPreconditionFailed,
+    #[error("remote-write intent execution compare-and-set failed")]
+    RemoteWriteIntentExecutionCompareAndSetFailed,
+    #[error("remote-write intent execution state is missing")]
+    RemoteWriteIntentExecutionStateMissing,
+    #[error("stored remote-write intent execution state is invalid")]
+    InvalidStoredRemoteWriteIntentExecutionState,
     #[error("stored remote-write intent operation is invalid")]
     InvalidStoredRemoteWriteIntentOperation,
     #[error("stored remote-write intent status is invalid")]
@@ -7717,9 +8199,9 @@ mod phase5c10_directory_receipt_tests {
     }
 
     #[test]
-    fn schema_v16_contains_directory_receipts() {
+    fn schema_v17_contains_directory_receipts() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 16);
+        assert_eq!(storage.schema_version().unwrap(), 17);
 
         let exists: i64 = storage
             .connection
@@ -8270,9 +8752,9 @@ mod phase5f1_local_inventory_tests {
     }
 
     #[test]
-    fn phase5f1_schema_is_v16() {
+    fn phase5f1_schema_is_v17() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 16);
+        assert_eq!(storage.schema_version().unwrap(), 17);
     }
 }
 
@@ -8418,9 +8900,9 @@ mod phase5f4_local_journal_tests {
     }
 
     #[test]
-    fn phase5f4_schema_is_v16() {
+    fn phase5f4_schema_is_v17() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 16);
+        assert_eq!(storage.schema_version().unwrap(), 17);
     }
 }
 
@@ -8531,9 +9013,9 @@ mod phase5f5_observation_fence_tests {
     }
 
     #[test]
-    fn phase5f5_schema_is_v16() {
+    fn phase5f5_schema_is_v17() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 16);
+        assert_eq!(storage.schema_version().unwrap(), 17);
     }
 }
 
@@ -8626,9 +9108,9 @@ mod phase5h1_remote_write_intent_foundation_tests {
     }
 
     #[test]
-    fn phase5h1_schema_is_v16_and_tables_exist() {
+    fn phase5h1_schema_is_v17_and_tables_exist() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 16);
+        assert_eq!(storage.schema_version().unwrap(), 17);
         for table in [
             "sync_root_remote_write_authority",
             "sync_root_remote_write_intents",
@@ -9035,9 +9517,9 @@ mod phase5h3_remote_write_planner_storage_tests {
     }
 
     #[test]
-    fn phase5h3_schema_is_v16_and_authority_state_is_cursor_bound() {
+    fn phase5h3_schema_is_v17_and_authority_state_is_cursor_bound() {
         let (mut storage, root, cursor) = ready_root();
-        assert_eq!(storage.schema_version().unwrap(), 16);
+        assert_eq!(storage.schema_version().unwrap(), 17);
 
         let authorities = vec![
             RemoteWriteAuthoritySnapshot::new("remote-root", 10, None, None, true, true, true, 20)
@@ -9372,5 +9854,256 @@ mod phase5h6_create_id_storage_tests {
                 .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5h8_folder_create_execution_state_tests {
+    use super::*;
+
+    fn fixture() -> (Storage, SyncRoot, i64, ChangeCursor) {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5h8-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h8-root",
+            provider,
+            account.subject,
+            "/tmp/phase5h8-root",
+            Some("remote-root".into()),
+            SyncMode::TwoWay,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 10)
+            .unwrap();
+        let local_state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+
+        storage
+            .reconcile_sync_root_local_change_journal(
+                &root.id,
+                local_state.generation,
+                local_state.item_count,
+                local_state.snapshot_completed_at_unix_ms,
+                &[LocalChangeEventInput::new(
+                    "new-folder",
+                    LocalChangeEventKind::Created,
+                    None,
+                    Some(LocalItemKind::Directory),
+                )
+                .unwrap()],
+                11,
+            )
+            .unwrap();
+
+        let bootstrap = ChangeCursor::new("phase5h8-bootstrap").unwrap();
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(&root.id, &bootstrap, 12)
+            .unwrap();
+
+        let current = ChangeCursor::new("phase5h8-current").unwrap();
+        storage
+            .commit_sync_root_catalog_batch_and_cursor(&root.id, &bootstrap, &[], &current, 13)
+            .unwrap();
+
+        let authority =
+            RemoteWriteAuthoritySnapshot::new("remote-root", 7, None, None, true, true, true, 14)
+                .unwrap();
+        storage
+            .commit_sync_root_remote_write_authority_snapshot(&root.id, &current, &[authority], 14)
+            .unwrap();
+
+        let event = storage
+            .list_pending_sync_root_local_change_events(&root.id, local_state.generation)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let input = RemoteWriteIntentInput::new(
+            event.id,
+            local_state.generation,
+            RemoteWriteIntentOperation::CreateFolder,
+            "new-folder",
+            LocalItemKind::Directory,
+            None,
+            Some(100),
+            Some(8),
+            Some(9),
+            None,
+            Some("generated-folder-id".into()),
+            Some("remote-root".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            15,
+        )
+        .unwrap();
+
+        let intent_id = storage
+            .create_sync_root_remote_write_intent(&root.id, &input)
+            .unwrap();
+
+        (storage, root, intent_id, current)
+    }
+
+    #[test]
+    fn phase5h8_submission_and_confirmation_transitions_are_cas_and_cursor_bound() {
+        let (mut storage, root, intent_id, cursor) = fixture();
+
+        let submitted = storage
+            .begin_sync_root_folder_create_submission(&root.id, intent_id, 0, &cursor, 20)
+            .unwrap();
+        assert_eq!(submitted.status, RemoteWriteIntentStatus::Submitted);
+        assert_eq!(submitted.attempt_count, 1);
+        assert_eq!(submitted.execution_generation, 1);
+        assert_eq!(submitted.pre_submit_change_cursor(), Some(&cursor));
+
+        let debug = format!("{submitted:?}");
+        assert!(!debug.contains("phase5h8-current"));
+        assert!(debug.contains("[redacted]"));
+
+        assert!(matches!(
+            storage.begin_sync_root_folder_create_submission(&root.id, intent_id, 0, &cursor, 21,),
+            Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed)
+                | Err(StorageError::RemoteWriteIntentExecutionCompareAndSetFailed)
+        ));
+
+        let awaiting = storage
+            .transition_sync_root_folder_create_intent(
+                intent_id,
+                RemoteWriteIntentStatus::Submitted,
+                1,
+                RemoteWriteIntentStatus::AwaitingConfirmation,
+                22,
+            )
+            .unwrap();
+        assert_eq!(
+            awaiting.status,
+            RemoteWriteIntentStatus::AwaitingConfirmation
+        );
+        assert_eq!(awaiting.execution_generation, 2);
+        assert_eq!(awaiting.awaiting_confirmation_at_unix_ms, Some(22));
+
+        let confirmed = storage
+            .transition_sync_root_folder_create_intent(
+                intent_id,
+                RemoteWriteIntentStatus::AwaitingConfirmation,
+                2,
+                RemoteWriteIntentStatus::Confirmed,
+                23,
+            )
+            .unwrap();
+        assert_eq!(confirmed.status, RemoteWriteIntentStatus::Confirmed);
+        assert_eq!(confirmed.execution_generation, 3);
+        assert_eq!(confirmed.confirmed_at_unix_ms, Some(23));
+    }
+
+    #[test]
+    fn phase5h8_invalid_direct_confirmation_fails_closed() {
+        let (storage, _, intent_id, _) = fixture();
+
+        assert!(matches!(
+            storage.transition_sync_root_folder_create_intent(
+                intent_id,
+                RemoteWriteIntentStatus::Planned,
+                0,
+                RemoteWriteIntentStatus::Confirmed,
+                20,
+            ),
+            Err(StorageError::InvalidRemoteWriteIntentExecutionTransition)
+        ));
+
+        let state = storage
+            .sync_root_remote_write_intent_execution_state(intent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, RemoteWriteIntentStatus::Planned);
+        assert_eq!(state.attempt_count, 0);
+        assert_eq!(state.execution_generation, 0);
+    }
+
+    #[test]
+    fn phase5h8_schema_v16_migrates_execution_columns_and_preserves_planned_defaults() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE sync_root_remote_write_intents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sync_root_id TEXT NOT NULL,
+                    source_local_event_id INTEGER NOT NULL UNIQUE,
+                    baseline_generation INTEGER NOT NULL,
+                    operation_kind TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    local_kind TEXT NOT NULL,
+                    local_size_bytes INTEGER,
+                    local_modified_unix_ns INTEGER,
+                    local_device_id TEXT,
+                    local_inode TEXT,
+                    target_remote_id TEXT,
+                    predetermined_remote_id TEXT,
+                    expected_parent_remote_id TEXT,
+                    expected_remote_kind TEXT,
+                    expected_remote_version TEXT,
+                    expected_remote_size_bytes INTEGER,
+                    expected_checksum_algorithm TEXT,
+                    expected_content_checksum TEXT,
+                    planned_at_unix_ms INTEGER NOT NULL,
+                    status TEXT NOT NULL
+                );
+                INSERT INTO sync_root_remote_write_intents (
+                    sync_root_id, source_local_event_id, baseline_generation,
+                    operation_kind, relative_path, local_kind,
+                    local_modified_unix_ns, local_device_id, local_inode,
+                    predetermined_remote_id, expected_parent_remote_id,
+                    planned_at_unix_ms, status
+                ) VALUES (
+                    'root', 1, 1, 'create_folder', 'folder', 'directory',
+                    1, '2', '3', 'generated-id', 'parent', 4, 'planned'
+                );
+                PRAGMA user_version = 16;
+                ",
+            )
+            .unwrap();
+
+        let mut storage = Storage { connection };
+        storage.configure().unwrap();
+        storage.migrate().unwrap();
+
+        assert_eq!(storage.schema_version().unwrap(), 17);
+
+        let state = storage
+            .sync_root_remote_write_intent_execution_state(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, RemoteWriteIntentStatus::Planned);
+        assert_eq!(state.attempt_count, 0);
+        assert_eq!(state.execution_generation, 0);
+        assert!(state.pre_submit_change_cursor().is_none());
+
+        let has_attempt_count = storage
+            .connection
+            .prepare("PRAGMA table_info(sync_root_remote_write_intents)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .any(|name| name == "attempt_count");
+        assert!(has_attempt_count);
     }
 }
