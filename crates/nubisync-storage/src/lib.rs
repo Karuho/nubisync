@@ -3421,6 +3421,82 @@ impl Storage {
         })
     }
 
+    pub fn discard_sync_root_change_window(
+        &mut self,
+        sync_root_id: &str,
+        expected_base_cursor: &ChangeCursor,
+    ) -> Result<bool, StorageError> {
+        let transaction = self.connection.transaction()?;
+
+        let window_base: Option<String> = transaction
+            .query_row(
+                "SELECT base_cursor
+                 FROM sync_root_change_window_state
+                 WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(window_base) = window_base else {
+            return Ok(false);
+        };
+
+        if window_base != expected_base_cursor.as_str() {
+            return Err(StorageError::SyncRootChangeWindowBaseCursorMismatch);
+        }
+
+        let state: Option<SyncRootCursorStateRow> = transaction
+            .query_row(
+                "SELECT snapshot_complete, catchup_complete,
+                        catchup_from_cursor, change_cursor
+                 FROM sync_root_remote_inventory_state
+                 WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+
+        let Some((snapshot_complete, catchup_complete, catchup_from_cursor, change_cursor)) = state
+        else {
+            return Err(StorageError::SyncRootCatalogSnapshotMissing);
+        };
+
+        if snapshot_complete == 0 {
+            return Err(StorageError::SyncRootCatalogSnapshotMissing);
+        }
+
+        let durable_cursor = if catchup_complete == 0 {
+            catchup_from_cursor
+                .as_deref()
+                .ok_or(StorageError::SyncRootCatalogCatchupCursorMissing)?
+        } else {
+            change_cursor
+                .as_deref()
+                .ok_or(StorageError::SyncRootCatalogChangeCursorMissing)?
+        };
+
+        if durable_cursor != expected_base_cursor.as_str() {
+            return Err(StorageError::SyncRootCatalogExpectedCursorMismatch);
+        }
+
+        transaction.execute(
+            "DELETE FROM sync_root_change_window_events WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_change_window_tokens WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_change_window_state WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn sync_root_change_window_changes(
         &self,
         sync_root_id: &str,
@@ -10317,5 +10393,77 @@ mod phase5h9_folder_create_candidate_tests {
         assert!(!debug.contains("generated-private-id"));
         assert!(!debug.contains("private-parent"));
         assert!(debug.contains("[redacted]"));
+    }
+}
+
+#[cfg(test)]
+mod phase5h10_confirmation_window_tests {
+    use super::*;
+
+    #[test]
+    fn phase5h10_discarded_confirmation_window_preserves_authoritative_cursor() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5h10-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h10-root",
+            provider,
+            account.subject,
+            "/tmp/phase5h10-root",
+            Some("remote-root".into()),
+            SyncMode::TwoWay,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let bootstrap = ChangeCursor::new("phase5h10-bootstrap").unwrap();
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(&root.id, &bootstrap, 3)
+            .unwrap();
+
+        let durable = ChangeCursor::new("phase5h10-durable").unwrap();
+        storage
+            .commit_sync_root_catalog_batch_and_cursor(&root.id, &bootstrap, &[], &durable, 4)
+            .unwrap();
+
+        let page = nubisync_core::ChangePage {
+            changes: vec![],
+            continuation: None,
+            checkpoint: Some(ChangeCursor::new("phase5h10-checkpoint").unwrap()),
+        };
+        storage
+            .stage_sync_root_change_window_page(&root.id, &durable, None, &page)
+            .unwrap();
+
+        assert!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .unwrap()
+                .is_complete()
+        );
+
+        assert!(
+            storage
+                .discard_sync_root_change_window(&root.id, &durable)
+                .unwrap()
+        );
+        assert!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage.sync_root_change_cursor(&root.id).unwrap().unwrap(),
+            durable
+        );
     }
 }

@@ -235,6 +235,14 @@ fn run() -> Result<(), CliError> {
         {
             sync_roots_recover_folder_create_submission()
         }
+        [sync, roots, confirm_folder_create, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && confirm_folder_create == "confirm-folder-create"
+                && approve == "--approve" =>
+        {
+            sync_roots_confirm_folder_create()
+        }
         [sync, roots, activate_two_way, approve]
             if sync == "sync"
                 && roots == "roots"
@@ -511,6 +519,7 @@ USAGE:
   nubisync sync roots folder-create-recovery-plan --approve
   nubisync sync roots submit-folder-create --approve
   nubisync sync roots recover-folder-create-submission --approve
+  nubisync sync roots confirm-folder-create --approve
   nubisync sync roots activate-two-way --approve
   nubisync sync roots deactivate-two-way --approve
   nubisync sync roots convergence-plan --approve
@@ -1816,6 +1825,333 @@ fn sync_roots_recover_folder_create_submission() -> Result<(), CliError> {
     println!("CURSOR_VALUES_PRINTED=no");
     println!("TOKEN_VALUES_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=metadata_recovery_only");
+
+    Ok(())
+}
+
+fn sync_roots_confirm_folder_create() -> Result<(), CliError> {
+    const MAX_CONFIRMATION_PAGES_PER_APPROVAL: usize = 64;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootFolderCreateConfirmationSelectionFailed);
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootFolderCreateConfirmationSelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootFolderCreateConfirmationModeUnsupported);
+    }
+
+    let candidates = storage.list_sync_root_folder_create_candidates(
+        &root.id,
+        RemoteWriteIntentStatus::AwaitingConfirmation,
+    )?;
+
+    if candidates.is_empty() {
+        println!("SYNC_ROOT_FOLDER_CREATE_CONFIRMATION=PASS");
+        println!("MODE=two_way");
+        println!("AWAITING_CONFIRMATION_INTENTS=0");
+        println!("SELECTED_INTENTS=0");
+        println!("CHANGE_STREAM_SCAN=not_performed");
+        println!("TARGET_CHANGE_OBSERVED=no");
+        println!("CURSOR_ADVANCED=no");
+        println!("INTENT_STATUS_AFTER=none");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_READ=not_performed");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("PROVIDER_WRITE_METHOD_CALLED=no");
+        println!("REMOTE_OBJECT_MUTATION=no");
+        println!("LOCAL_EVENT_APPLIED=no");
+        println!("BASELINE_ADVANCED=no");
+        println!("LOCAL_NAMES_PRINTED=no");
+        println!("REMOTE_IDS_PRINTED=no");
+        println!("REMOTE_METADATA_PRINTED=no");
+        println!("CURSOR_VALUES_PRINTED=no");
+        println!("TOKEN_VALUES_PRINTED=no");
+        println!("DRIVE_WRITE_ACCESS=no_remote_call");
+        return Ok(());
+    }
+
+    let candidate = candidates
+        .first()
+        .cloned()
+        .ok_or(CliError::SyncRootFolderCreateConfirmationSelectionFailed)?;
+
+    let execution_state = storage
+        .sync_root_remote_write_intent_execution_state(candidate.intent_id)?
+        .ok_or(CliError::SyncRootFolderCreateConfirmationStateMismatch)?;
+    if execution_state.status != RemoteWriteIntentStatus::AwaitingConfirmation
+        || execution_state.execution_generation != candidate.execution_generation
+    {
+        return Err(CliError::SyncRootFolderCreateConfirmationStateMismatch);
+    }
+
+    let pre_submit_cursor = execution_state
+        .pre_submit_change_cursor()
+        .cloned()
+        .ok_or(CliError::SyncRootFolderCreateConfirmationFenceMissing)?;
+
+    let local_state_before = storage.sync_root_local_inventory_state(&root.id)?;
+    if !local_state_before.snapshot_complete
+        || !local_state_before.observation_valid
+        || local_state_before.generation != candidate.baseline_generation
+    {
+        return Err(CliError::SyncRootFolderCreateConfirmationLocalStateChanged);
+    }
+
+    let pending_before = storage
+        .list_pending_sync_root_local_change_events(&root.id, candidate.baseline_generation)?;
+    if !pending_before
+        .iter()
+        .any(|event| event.id == candidate.source_local_event_id)
+    {
+        return Err(CliError::SyncRootFolderCreateConfirmationLocalStateChanged);
+    }
+
+    match storage.sync_root_change_window_state(&root.id)? {
+        Some(window) => {
+            if window.base_cursor != pre_submit_cursor {
+                return Err(CliError::SyncRootFolderCreateConfirmationFenceMismatch);
+            }
+        }
+        None => {
+            let durable_cursor = storage
+                .sync_root_change_cursor(&root.id)?
+                .ok_or(CliError::SyncRootFolderCreateConfirmationFenceMissing)?;
+            if durable_cursor != pre_submit_cursor {
+                return Err(CliError::SyncRootFolderCreateConfirmationFenceMismatch);
+            }
+        }
+    }
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+
+    println!("SYNC_ROOT_FOLDER_CREATE_CONFIRMATION_STAGE=refresh_readonly_access_token");
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_FOLDER_CREATE_CONFIRMATION_STAGE=collect_change_window");
+    let mut pages_collected = 0usize;
+    loop {
+        let result = collect_selected_root_change_window_page(&api, &mut storage, &root)?;
+        pages_collected = pages_collected
+            .checked_add(1)
+            .ok_or(CliError::NumericOverflow)?;
+        if result.complete {
+            break;
+        }
+        if pages_collected >= MAX_CONFIRMATION_PAGES_PER_APPROVAL {
+            return Err(CliError::SyncRootFolderCreateConfirmationPageLimitExceeded);
+        }
+    }
+
+    let window = storage
+        .sync_root_change_window_state(&root.id)?
+        .ok_or(CliError::SyncRootFolderCreateConfirmationWindowMismatch)?;
+    if !window.is_complete() || window.base_cursor != pre_submit_cursor {
+        return Err(CliError::SyncRootFolderCreateConfirmationWindowMismatch);
+    }
+
+    let expected_name = candidate
+        .relative_path()
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .unwrap_or(candidate.relative_path());
+    if expected_name.is_empty() {
+        return Err(CliError::SyncRootFolderCreateConfirmationStateMismatch);
+    }
+
+    let target_id = candidate.predetermined_remote_id();
+    let expected_parent = candidate.expected_parent_remote_id();
+    let changes = storage.sync_root_change_window_changes(&root.id)?;
+
+    let mut target_changes = 0usize;
+    let mut last_target_exact = None;
+    for change in &changes {
+        match change {
+            RemoteChange::Upsert(item) if item.remote_id == target_id => {
+                target_changes = target_changes
+                    .checked_add(1)
+                    .ok_or(CliError::NumericOverflow)?;
+                last_target_exact = Some(
+                    item.name == expected_name
+                        && item.kind == RemoteItemKind::Folder
+                        && item.parent_remote_id.as_deref() == Some(expected_parent)
+                        && !item.trashed,
+                );
+            }
+            RemoteChange::Delete { remote_id } if remote_id == target_id => {
+                target_changes = target_changes
+                    .checked_add(1)
+                    .ok_or(CliError::NumericOverflow)?;
+                last_target_exact = Some(false);
+            }
+            _ => {}
+        }
+    }
+
+    if target_changes == 0 {
+        println!("SYNC_ROOT_FOLDER_CREATE_CONFIRMATION_STAGE=discard_unobserved_window");
+        if !storage.discard_sync_root_change_window(&root.id, &pre_submit_cursor)? {
+            return Err(CliError::SyncRootFolderCreateConfirmationWindowMismatch);
+        }
+
+        let local_state_after = storage.sync_root_local_inventory_state(&root.id)?;
+        let pending_after = storage
+            .list_pending_sync_root_local_change_events(&root.id, candidate.baseline_generation)?;
+        if local_state_after.generation != local_state_before.generation
+            || local_state_after.item_count != local_state_before.item_count
+            || local_state_after.snapshot_completed_at_unix_ms
+                != local_state_before.snapshot_completed_at_unix_ms
+            || local_state_after.observation_valid != local_state_before.observation_valid
+            || !pending_after
+                .iter()
+                .any(|event| event.id == candidate.source_local_event_id)
+        {
+            return Err(CliError::SyncRootFolderCreateConfirmationLocalStateChanged);
+        }
+
+        println!("SYNC_ROOT_FOLDER_CREATE_CONFIRMATION=PASS");
+        println!("MODE=two_way");
+        println!("AWAITING_CONFIRMATION_INTENTS={}", candidates.len());
+        println!("SELECTED_INTENTS=1");
+        println!("CHANGE_STREAM_SCAN=performed");
+        println!("WINDOW_PAGES_COLLECTED={pages_collected}");
+        println!("TARGET_CHANGE_OBSERVED=no");
+        println!("STAGED_WINDOW_DISCARDED=yes");
+        println!("CURSOR_ADVANCED=no");
+        println!("INTENT_STATUS_AFTER=awaiting_confirmation");
+        println!("NETWORK_CHECK=performed");
+        println!("DATABASE_MUTATION=yes");
+        println!("FILESYSTEM_READ=not_performed");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("PROVIDER_WRITE_METHOD_CALLED=no");
+        println!("REMOTE_OBJECT_MUTATION=no");
+        println!("LOCAL_EVENT_APPLIED=no");
+        println!("BASELINE_ADVANCED=no");
+        println!("LOCAL_NAMES_PRINTED=no");
+        println!("REMOTE_IDS_PRINTED=no");
+        println!("REMOTE_METADATA_PRINTED=no");
+        println!("CURSOR_VALUES_PRINTED=no");
+        println!("TOKEN_VALUES_PRINTED=no");
+        println!("DRIVE_WRITE_ACCESS=readonly_confirmation_only");
+        return Ok(());
+    }
+
+    println!("SYNC_ROOT_FOLDER_CREATE_CONFIRMATION_STAGE=commit_change_window");
+    let execution =
+        execute_completed_selected_root_change_window(&api, &mut storage, &root, unix_time_ms()?)?;
+
+    let final_item = storage.sync_root_remote_item(&root.id, target_id)?;
+    let final_exact = final_item.as_ref().is_some_and(|item| {
+        item.name == expected_name
+            && item.kind == RemoteItemKind::Folder
+            && item.parent_remote_id.as_deref() == Some(expected_parent)
+            && !item.trashed
+    });
+
+    let exact_change = last_target_exact == Some(true);
+    let new_status = if exact_change && final_exact {
+        RemoteWriteIntentStatus::Confirmed
+    } else {
+        RemoteWriteIntentStatus::Conflict
+    };
+
+    println!("SYNC_ROOT_FOLDER_CREATE_CONFIRMATION_STAGE=transition_intent");
+    let transitioned = storage.transition_sync_root_folder_create_intent(
+        candidate.intent_id,
+        RemoteWriteIntentStatus::AwaitingConfirmation,
+        candidate.execution_generation,
+        new_status,
+        unix_time_ms()?,
+    )?;
+
+    let local_state_after = storage.sync_root_local_inventory_state(&root.id)?;
+    let pending_after = storage
+        .list_pending_sync_root_local_change_events(&root.id, candidate.baseline_generation)?;
+
+    if local_state_after.generation != local_state_before.generation
+        || local_state_after.item_count != local_state_before.item_count
+        || local_state_after.snapshot_completed_at_unix_ms
+            != local_state_before.snapshot_completed_at_unix_ms
+        || local_state_after.observation_valid != local_state_before.observation_valid
+        || !pending_after
+            .iter()
+            .any(|event| event.id == candidate.source_local_event_id)
+    {
+        return Err(CliError::SyncRootFolderCreateConfirmationLocalStateChanged);
+    }
+
+    println!("SYNC_ROOT_FOLDER_CREATE_CONFIRMATION=PASS");
+    println!("MODE=two_way");
+    println!("AWAITING_CONFIRMATION_INTENTS={}", candidates.len());
+    println!("SELECTED_INTENTS=1");
+    println!("CHANGE_STREAM_SCAN=performed");
+    println!("WINDOW_PAGES_COLLECTED={pages_collected}");
+    println!("TARGET_CHANGE_OBSERVED=yes");
+    println!("TARGET_LAST_CHANGE_EXACT={}", yes_no(exact_change));
+    println!("FINAL_CATALOG_ITEM_EXACT={}", yes_no(final_exact));
+    println!("CURSOR_ADVANCED=yes");
+    println!("CATALOG_MUTATIONS={}", execution.storage_mutations);
+    println!("INTENT_STATUS_AFTER={}", transitioned.status.as_str());
+    println!(
+        "CONFIRMED={}",
+        yes_no(transitioned.status == RemoteWriteIntentStatus::Confirmed)
+    );
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_READ=not_performed");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("PROVIDER_WRITE_METHOD_CALLED=no");
+    println!("REMOTE_OBJECT_MUTATION=no");
+    println!("LOCAL_EVENT_APPLIED=no");
+    println!("BASELINE_ADVANCED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("CURSOR_VALUES_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=readonly_confirmation_only");
 
     Ok(())
 }
@@ -6252,6 +6588,7 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "folder-create-recovery-plan"
                 | "submit-folder-create"
                 | "recover-folder-create-submission"
+                | "confirm-folder-create"
                 | "activate-two-way"
                 | "deactivate-two-way"
                 | "convergence-plan"
@@ -6356,6 +6693,15 @@ mod sync_root_cli_tests {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(!cli_requires_cross_process_execution_lock(&args));
         }
+    }
+
+    #[test]
+    fn phase5h10_execution_lock_covers_folder_create_confirmation() {
+        let args = ["sync", "roots", "confirm-folder-create", "--approve"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(cli_requires_cross_process_execution_lock(&args));
     }
 
     #[test]
@@ -6715,6 +7061,22 @@ enum CliError {
     SyncRootFolderCreateRecoverySelectionFailed,
     #[error("sync root folder-create submission selection failed")]
     SyncRootFolderCreateSubmissionSelectionFailed,
+    #[error("sync root folder-create confirmation selection failed")]
+    SyncRootFolderCreateConfirmationSelectionFailed,
+    #[error("sync root folder-create confirmation requires two_way mode")]
+    SyncRootFolderCreateConfirmationModeUnsupported,
+    #[error("sync root folder-create confirmation execution state mismatched")]
+    SyncRootFolderCreateConfirmationStateMismatch,
+    #[error("sync root folder-create confirmation pre-submit fence is missing")]
+    SyncRootFolderCreateConfirmationFenceMissing,
+    #[error("sync root folder-create confirmation fence mismatched")]
+    SyncRootFolderCreateConfirmationFenceMismatch,
+    #[error("sync root folder-create confirmation local authority changed")]
+    SyncRootFolderCreateConfirmationLocalStateChanged,
+    #[error("sync root folder-create confirmation exceeded the supervised page limit")]
+    SyncRootFolderCreateConfirmationPageLimitExceeded,
+    #[error("sync root folder-create confirmation change window mismatched")]
+    SyncRootFolderCreateConfirmationWindowMismatch,
     #[error("sync root folder-create submission requires two_way mode")]
     SyncRootFolderCreateSubmissionModeUnsupported,
     #[error("sync root folder-create durable remote root is missing")]
