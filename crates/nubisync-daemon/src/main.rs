@@ -5,9 +5,9 @@
 use nubisync_auth::{KeyringSecretStore, SecretKey, SecretStore, SecretValue};
 use nubisync_core::{ProviderAccount, ProviderId, SyncMode, SyncRoot};
 use nubisync_daemon::{
-    SelectedRootPeriodicLocalObservation, SelectedRootReceiveOnlyPeriodicDecision,
-    SelectedRootReceiveOnlyPeriodicState, SelectedRootReceiveOnlyPeriodicTick,
-    execute_selected_root_receive_only_periodic_tick,
+    SelectedRootExecutionBusyScope, SelectedRootPeriodicLocalObservation,
+    SelectedRootReceiveOnlyPeriodicDecision, SelectedRootReceiveOnlyPeriodicState,
+    SelectedRootReceiveOnlyPeriodicTick, execute_selected_root_receive_only_periodic_tick,
 };
 use nubisync_drive::{GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveApi, GoogleOAuthConfig, OAuthError};
 use nubisync_storage::Storage;
@@ -99,6 +99,9 @@ fn print_help() {
     println!("MODE=receive_only");
     println!("POLL_INTERVAL_SECONDS=30");
     println!("SINGLE_FLIGHT_SCOPE=in_process");
+    println!("CROSS_PROCESS_LOCK_SCOPE=user_global_sync_execution");
+    println!("CROSS_PROCESS_LOCK_LIFETIME=per_tick");
+    println!("EXECUTION_LOCK_PATH_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=no");
 }
 
@@ -128,6 +131,7 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
     let mut session: Option<DriveSession> = None;
     let now = unix_time_ms()?;
     let mut scheduler = SelectedRootReceiveOnlyPeriodicState::new_immediate(now);
+    let execution_lock_path = nubisync_execution_lock_path()?;
     let shutdown_requested = install_shutdown_handler()?;
     let mut executed_ticks = 0usize;
 
@@ -136,6 +140,9 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
     println!("PERIODIC_SCHEDULER=yes");
     println!("POLL_INTERVAL_SECONDS=30");
     println!("SINGLE_FLIGHT_SCOPE=in_process");
+    println!("CROSS_PROCESS_LOCK_SCOPE=user_global_sync_execution");
+    println!("CROSS_PROCESS_LOCK_LIFETIME=per_tick");
+    println!("EXECUTION_LOCK_PATH_PRINTED=no");
     println!("ACCESS_TOKEN_STORAGE=memory_only");
     println!("REFRESH_TOKEN_STORAGE=OS_KEYRING");
     println!("ROOT_PATH_PRINTED=no");
@@ -214,6 +221,7 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
             api,
             &mut storage,
             &config.root,
+            &execution_lock_path,
             now,
         ) {
             Ok(SelectedRootReceiveOnlyPeriodicTick::Executed {
@@ -226,6 +234,8 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
                     .ok_or(DaemonError::NumericOverflow)?;
 
                 println!("NUBISYNCD_TICK=PASS");
+                println!("CROSS_PROCESS_LOCK=acquired");
+                println!("EXECUTION_LOCK_PATH_PRINTED=no");
                 println!("EXECUTED_TICKS={executed_ticks}");
                 println!("ROUNDS_EXECUTED={}", execution.rounds_executed);
                 println!("METADATA_ROUNDS={}", execution.metadata_rounds);
@@ -310,8 +320,21 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
                 println!("TOKEN_VALUES_PRINTED=no");
                 println!("DRIVE_WRITE_ACCESS=no");
             }
-            Ok(SelectedRootReceiveOnlyPeriodicTick::Busy { retry_after_ms }) => {
+            Ok(SelectedRootReceiveOnlyPeriodicTick::Busy {
+                retry_after_ms,
+                scope,
+            }) => {
                 println!("NUBISYNCD_TICK=BUSY");
+                println!("BUSY_SCOPE={}", scope.as_str());
+                println!(
+                    "CROSS_PROCESS_LOCK={}",
+                    if scope == SelectedRootExecutionBusyScope::CrossProcess {
+                        "busy"
+                    } else {
+                        "acquired"
+                    }
+                );
+                println!("EXECUTION_LOCK_PATH_PRINTED=no");
                 println!("RETRY_AFTER_MS={retry_after_ms}");
                 println!("SYNC_EXECUTION=not_started");
                 println!("DRIVE_WRITE_ACCESS=no");
@@ -503,6 +526,10 @@ fn single_google_account(accounts: Vec<ProviderAccount>) -> Result<ProviderAccou
 
 fn nubisync_database_path() -> Result<PathBuf, DaemonError> {
     Ok(nubisync_data_dir()?.join("nubisync.db"))
+}
+
+fn nubisync_execution_lock_path() -> Result<PathBuf, DaemonError> {
+    Ok(nubisync_data_dir()?.join("execution.lock"))
 }
 
 fn nubisync_data_dir() -> Result<PathBuf, DaemonError> {

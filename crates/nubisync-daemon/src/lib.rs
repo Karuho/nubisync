@@ -449,6 +449,64 @@ pub struct SelectedRootReceiveOnlyRunExecution {
     pub stop_reason: SelectedRootReceiveOnlyRunStopReason,
 }
 
+pub struct SelectedRootCrossProcessExecutionGuard {
+    _file: fs::File,
+}
+
+pub enum SelectedRootCrossProcessExecutionLock {
+    Acquired(SelectedRootCrossProcessExecutionGuard),
+    Busy,
+}
+
+pub fn try_acquire_selected_root_cross_process_execution_lock(
+    lock_path: &Path,
+) -> Result<SelectedRootCrossProcessExecutionLock, SelectedRootExecutorError> {
+    let parent = lock_path
+        .parent()
+        .ok_or(SelectedRootExecutorError::CrossProcessExecutionLockPathInvalid)?;
+
+    let parent_metadata =
+        fs::metadata(parent).map_err(|_| SelectedRootExecutorError::CrossProcessExecutionLockIo)?;
+    if !parent_metadata.is_dir() {
+        return Err(SelectedRootExecutorError::CrossProcessExecutionLockPathInvalid);
+    }
+
+    match fs::symlink_metadata(lock_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(SelectedRootExecutorError::CrossProcessExecutionLockPathInvalid);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(SelectedRootExecutorError::CrossProcessExecutionLockIo),
+    }
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|_| SelectedRootExecutorError::CrossProcessExecutionLockIo)?;
+
+    if !file
+        .metadata()
+        .map_err(|_| SelectedRootExecutorError::CrossProcessExecutionLockIo)?
+        .is_file()
+    {
+        return Err(SelectedRootExecutorError::CrossProcessExecutionLockPathInvalid);
+    }
+
+    match file.try_lock() {
+        Ok(()) => Ok(SelectedRootCrossProcessExecutionLock::Acquired(
+            SelectedRootCrossProcessExecutionGuard { _file: file },
+        )),
+        Err(fs::TryLockError::WouldBlock) => Ok(SelectedRootCrossProcessExecutionLock::Busy),
+        Err(fs::TryLockError::Error(_)) => {
+            Err(SelectedRootExecutorError::CrossProcessExecutionLockIo)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectedRootReceiveOnlySingleFlightStatus {
     Idle,
@@ -553,6 +611,21 @@ impl SelectedRootPeriodicLocalObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootExecutionBusyScope {
+    CrossProcess,
+    InProcess,
+}
+
+impl SelectedRootExecutionBusyScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CrossProcess => "cross_process",
+            Self::InProcess => "in_process",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectedRootReceiveOnlyPeriodicTick {
     Waiting {
         delay_ms: i64,
@@ -561,6 +634,7 @@ pub enum SelectedRootReceiveOnlyPeriodicTick {
     Shutdown,
     Busy {
         retry_after_ms: i64,
+        scope: SelectedRootExecutionBusyScope,
     },
     Executed {
         execution: SelectedRootReceiveOnlyRunExecution,
@@ -1443,6 +1517,7 @@ pub fn execute_selected_root_receive_only_periodic_tick<P>(
     provider: &P,
     storage: &mut Storage,
     sync_root: &SyncRoot,
+    execution_lock_path: &Path,
     now_unix_ms: i64,
 ) -> Result<SelectedRootReceiveOnlyPeriodicTick, SelectedRootExecutorError>
 where
@@ -1464,6 +1539,22 @@ where
         SelectedRootReceiveOnlyPeriodicDecision::Due => {}
     }
 
+    let _cross_process_guard =
+        match try_acquire_selected_root_cross_process_execution_lock(execution_lock_path) {
+            Ok(SelectedRootCrossProcessExecutionLock::Acquired(guard)) => guard,
+            Ok(SelectedRootCrossProcessExecutionLock::Busy) => {
+                state.schedule_busy_retry(now_unix_ms);
+                return Ok(SelectedRootReceiveOnlyPeriodicTick::Busy {
+                    retry_after_ms: RECEIVE_ONLY_PERIODIC_BUSY_RETRY_MS,
+                    scope: SelectedRootExecutionBusyScope::CrossProcess,
+                });
+            }
+            Err(error) => {
+                state.schedule_failure(now_unix_ms);
+                return Err(error);
+            }
+        };
+
     let execution = match execute_selected_root_receive_only_periodic_single_flight(
         provider,
         storage,
@@ -1482,6 +1573,7 @@ where
             state.schedule_busy_retry(now_unix_ms);
             Ok(SelectedRootReceiveOnlyPeriodicTick::Busy {
                 retry_after_ms: RECEIVE_ONLY_PERIODIC_BUSY_RETRY_MS,
+                scope: SelectedRootExecutionBusyScope::InProcess,
             })
         }
         SelectedRootReceiveOnlyPeriodicSingleFlightResult::Executed {
@@ -6571,6 +6663,10 @@ pub enum SelectedRootExecutorError {
     ReceiveOnlyCycleModeUnsupported,
     #[error("receive-only single-flight execution state is unavailable")]
     ReceiveOnlySingleFlightStatePoisoned,
+    #[error("cross-process execution lock path is invalid")]
+    CrossProcessExecutionLockPathInvalid,
+    #[error("cross-process execution lock I/O failed")]
+    CrossProcessExecutionLockIo,
     #[error("unified convergence is blocked by fail-closed planner actions")]
     UnifiedConvergenceBlocked,
     #[error("unified convergence requires a readonly content provider for this phase")]
@@ -10011,5 +10107,71 @@ mod phase5f5_periodic_local_observation_tests {
             SelectedRootPeriodicLocalObservation::DeferredUntilReceiveOnlyConverged.as_str(),
             "deferred_until_receive_only_converged"
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5g_cross_process_execution_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_lock_path(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nubisync-phase5g-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("execution.lock")
+    }
+
+    #[test]
+    fn phase5g_exclusive_lock_is_busy_then_released_by_guard_drop() {
+        let path = temp_lock_path("exclusive");
+
+        let first = match try_acquire_selected_root_cross_process_execution_lock(&path).unwrap() {
+            SelectedRootCrossProcessExecutionLock::Acquired(guard) => guard,
+            SelectedRootCrossProcessExecutionLock::Busy => panic!("first lock must acquire"),
+        };
+
+        assert!(matches!(
+            try_acquire_selected_root_cross_process_execution_lock(&path).unwrap(),
+            SelectedRootCrossProcessExecutionLock::Busy
+        ));
+
+        drop(first);
+
+        let second = match try_acquire_selected_root_cross_process_execution_lock(&path).unwrap() {
+            SelectedRootCrossProcessExecutionLock::Acquired(guard) => guard,
+            SelectedRootCrossProcessExecutionLock::Busy => {
+                panic!("lock must be released when guard drops")
+            }
+        };
+        drop(second);
+
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn phase5g_lock_rejects_symlink_lockfile() {
+        use std::os::unix::fs::symlink;
+
+        let path = temp_lock_path("symlink");
+        let target = path.parent().unwrap().join("target");
+        fs::write(&target, b"").unwrap();
+        symlink(&target, &path).unwrap();
+
+        assert!(matches!(
+            try_acquire_selected_root_cross_process_execution_lock(&path),
+            Err(SelectedRootExecutorError::CrossProcessExecutionLockPathInvalid)
+        ));
+
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
     }
 }

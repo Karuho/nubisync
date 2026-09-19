@@ -11,13 +11,13 @@ use nubisync_core::{
 };
 use nubisync_daemon::{
     SUPERVISED_FILE_BATCH_MAX_ACTIONS, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
-    SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS, SelectedRootReceiveOnlySingleFlightResult,
-    adopt_selected_root_existing_directory, bootstrap_selected_root_snapshot,
-    capture_selected_root_local_baseline, collect_selected_root_change_window_page,
-    delete_selected_root_existing_directory, delete_selected_root_existing_file,
-    delete_selected_root_stale_directories, delete_selected_root_stale_files,
-    execute_completed_selected_root_change_window, execute_selected_root_receive_only_cycle,
-    execute_selected_root_receive_only_single_flight,
+    SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS, SelectedRootCrossProcessExecutionLock,
+    SelectedRootReceiveOnlySingleFlightResult, adopt_selected_root_existing_directory,
+    bootstrap_selected_root_snapshot, capture_selected_root_local_baseline,
+    collect_selected_root_change_window_page, delete_selected_root_existing_directory,
+    delete_selected_root_existing_file, delete_selected_root_stale_directories,
+    delete_selected_root_stale_files, execute_completed_selected_root_change_window,
+    execute_selected_root_receive_only_cycle, execute_selected_root_receive_only_single_flight,
     execute_selected_root_unified_convergence_step, journal_selected_root_local_inventory_diff,
     materialize_selected_root_directories, materialize_selected_root_missing_file,
     materialize_selected_root_missing_files, plan_selected_root_local_inventory_diff,
@@ -25,8 +25,9 @@ use nubisync_daemon::{
     plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
     plan_selected_root_remote_replacement, plan_selected_root_stale_files,
     plan_selected_root_unified_convergence_step, replace_selected_root_existing_file,
-    replace_selected_root_stale_files, verify_selected_root_existing_file,
-    verify_selected_root_existing_files, verify_selected_root_local_receipts,
+    replace_selected_root_stale_files, try_acquire_selected_root_cross_process_execution_lock,
+    verify_selected_root_existing_file, verify_selected_root_existing_files,
+    verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -57,6 +58,33 @@ fn main() {
 
 fn run() -> Result<(), CliError> {
     let args: Vec<String> = env::args().skip(1).collect();
+
+    let _cross_process_guard = if cli_requires_cross_process_execution_lock(&args) {
+        match try_acquire_selected_root_cross_process_execution_lock(
+            &nubisync_execution_lock_path()?,
+        )? {
+            SelectedRootCrossProcessExecutionLock::Acquired(guard) => {
+                println!("CROSS_PROCESS_LOCK=acquired");
+                println!("CROSS_PROCESS_LOCK_SCOPE=user_global_sync_execution");
+                println!("EXECUTION_LOCK_PATH_PRINTED=no");
+                Some(guard)
+            }
+            SelectedRootCrossProcessExecutionLock::Busy => {
+                println!("SYNC_EXECUTION=BUSY");
+                println!("CROSS_PROCESS_LOCK=busy");
+                println!("CROSS_PROCESS_LOCK_SCOPE=user_global_sync_execution");
+                println!("DATABASE_MUTATION=no");
+                println!("FILESYSTEM_MUTATION=no");
+                println!("ROOT_PATH_PRINTED=no");
+                println!("LOCAL_NAMES_PRINTED=no");
+                println!("EXECUTION_LOCK_PATH_PRINTED=no");
+                println!("DRIVE_WRITE_ACCESS=no");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
 
     match args.as_slice() {
         [] => {
@@ -4746,8 +4774,49 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
+    if args.len() >= 3 && args[0] == "sync" && args[1] == "roots" {
+        return matches!(
+            args[2].as_str(),
+            "metadata-step"
+                | "cycle"
+                | "run-to-idle"
+                | "local-baseline"
+                | "local-diff"
+                | "local-journal"
+                | "convergence-plan"
+                | "converge"
+                | "stale-files-plan"
+                | "replace-stale-files"
+                | "delete-stale-files"
+                | "delete-stale-directories"
+                | "reconcile-plan"
+                | "materialize-directories"
+                | "adopt-directory"
+                | "materialize-files"
+                | "materialize-file"
+                | "verify-files"
+                | "verify-file"
+                | "verify-local"
+                | "replacement-plan"
+                | "replace-file"
+                | "directory-deletion-plan"
+                | "delete-directory"
+                | "deletion-plan"
+                | "delete-file"
+                | "add"
+        );
+    }
+
+    args.len() >= 3 && args[0] == "drive" && args[1] == "catalog" && args[2] == "catchup"
+}
+
 fn nubisync_database_path() -> Result<PathBuf, CliError> {
     Ok(nubisync_data_dir()?.join("nubisync.db"))
+}
+
+fn nubisync_execution_lock_path() -> Result<PathBuf, CliError> {
+    Ok(nubisync_data_dir()?.join("execution.lock"))
 }
 
 fn nubisync_data_dir() -> Result<PathBuf, CliError> {
@@ -4784,6 +4853,34 @@ mod sync_root_cli_tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn phase5g_execution_lock_policy_covers_sync_mutation_surfaces() {
+        let locked = [
+            vec!["sync", "roots", "run-to-idle", "--approve"],
+            vec!["sync", "roots", "local-baseline", "--approve"],
+            vec!["sync", "roots", "local-journal", "--approve"],
+            vec!["sync", "roots", "materialize-file", "--approve"],
+            vec!["sync", "roots", "delete-file", "--approve"],
+            vec!["sync", "roots", "add", "--mode", "receive_only"],
+            vec!["drive", "catalog", "catchup"],
+        ];
+
+        for args in locked {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(cli_requires_cross_process_execution_lock(&args));
+        }
+
+        for args in [
+            vec!["sync", "roots", "status"],
+            vec!["sync", "roots", "inventory", "--limit", "10"],
+            vec!["drive", "catalog", "status"],
+            vec!["auth", "google", "status"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(!cli_requires_cross_process_execution_lock(&args));
+        }
     }
 
     #[test]
