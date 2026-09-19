@@ -10,7 +10,8 @@ use nubisync_drive::{
     DriveApiError, DriveBlobFingerprint, DriveFolderRoot, DriveRootMembership, GoogleDriveApi,
 };
 use nubisync_storage::{
-    LocalChangeEventInput, LocalChangeEventKind, LocalChangeJournalCommit, Storage, StorageError,
+    LocalChangeEventInput, LocalChangeEventKind, LocalChangeEventRecord, LocalChangeJournalCommit,
+    RemoteWriteAuthoritySnapshot, RemoteWriteIntentOperation, Storage, StorageError,
     SyncRootCatalogBatchCommit, SyncRootCatalogMutation, SyncRootDirectoryMaterializationReceipt,
     SyncRootFileMaterializationReceipt,
 };
@@ -107,6 +108,132 @@ impl SelectedRootLocalInventoryDiff {
 
     pub fn clean(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedRootRemoteWritePlanDisposition {
+    Ready,
+    NeedsPredeterminedRemoteId,
+    Conflict,
+    BlockedIdentity,
+    BlockedAuthority,
+}
+
+impl SelectedRootRemoteWritePlanDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NeedsPredeterminedRemoteId => "needs_predetermined_remote_id",
+            Self::Conflict => "conflict",
+            Self::BlockedIdentity => "blocked_identity",
+            Self::BlockedAuthority => "blocked_authority",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectedRootRemoteWritePlanEntry {
+    pub source_local_event_id: i64,
+    relative_path: String,
+    pub operation: Option<RemoteWriteIntentOperation>,
+    pub disposition: SelectedRootRemoteWritePlanDisposition,
+    pub local_kind: Option<LocalItemKind>,
+    pub local_size_bytes: Option<u64>,
+    pub local_modified_unix_ns: Option<i64>,
+    pub local_device_id: Option<u64>,
+    pub local_inode: Option<u64>,
+    target_remote_id: Option<String>,
+    expected_parent_remote_id: Option<String>,
+    pub expected_remote_kind: Option<RemoteItemKind>,
+    pub expected_remote_version: Option<u64>,
+    pub expected_remote_size_bytes: Option<u64>,
+    expected_checksum_algorithm: Option<String>,
+    expected_content_checksum: Option<String>,
+}
+
+impl SelectedRootRemoteWritePlanEntry {
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+}
+
+impl fmt::Debug for SelectedRootRemoteWritePlanEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedRootRemoteWritePlanEntry")
+            .field("source_local_event_id", &self.source_local_event_id)
+            .field("relative_path", &"[redacted]")
+            .field("operation", &self.operation)
+            .field("disposition", &self.disposition)
+            .field("local_kind", &self.local_kind)
+            .field("local_size_bytes", &self.local_size_bytes)
+            .field(
+                "target_remote_id",
+                &self.target_remote_id.as_deref().map(|_| "[redacted]"),
+            )
+            .field(
+                "expected_parent_remote_id",
+                &self
+                    .expected_parent_remote_id
+                    .as_deref()
+                    .map(|_| "[redacted]"),
+            )
+            .field("expected_remote_kind", &self.expected_remote_kind)
+            .field("expected_remote_version", &self.expected_remote_version)
+            .field(
+                "expected_remote_size_bytes",
+                &self.expected_remote_size_bytes,
+            )
+            .field(
+                "expected_checksum_algorithm",
+                &self
+                    .expected_checksum_algorithm
+                    .as_deref()
+                    .map(|_| "[redacted]"),
+            )
+            .field(
+                "expected_content_checksum",
+                &self
+                    .expected_content_checksum
+                    .as_deref()
+                    .map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedRootRemoteWriteIntentPlan {
+    pub baseline_generation: u64,
+    pub pending_events: usize,
+    pub create_file_needs_id: usize,
+    pub create_folder_needs_id: usize,
+    pub update_file_ready: usize,
+    pub trash_item_ready: usize,
+    pub conflicts: usize,
+    pub blocked_identity: usize,
+    pub blocked_authority: usize,
+    pub root_write_capable: bool,
+    pub full_sync_credential_present: bool,
+    entries: Vec<SelectedRootRemoteWritePlanEntry>,
+}
+
+impl SelectedRootRemoteWriteIntentPlan {
+    pub fn entries(&self) -> &[SelectedRootRemoteWritePlanEntry] {
+        &self.entries
+    }
+
+    pub fn write_gates_satisfied(&self) -> bool {
+        self.root_write_capable && self.full_sync_credential_present
+    }
+
+    pub fn persistable_existing_intents(&self) -> usize {
+        if self.write_gates_satisfied() {
+            self.update_file_ready + self.trash_item_ready
+        } else {
+            0
+        }
     }
 }
 
@@ -5482,6 +5609,524 @@ pub fn journal_selected_root_local_inventory_diff(
     })
 }
 
+pub fn plan_selected_root_remote_write_intents(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+    full_sync_credential_present: bool,
+) -> Result<SelectedRootRemoteWriteIntentPlan, SelectedRootExecutorError> {
+    let local_state = storage.sync_root_local_inventory_state(&sync_root.id)?;
+    if !local_state.snapshot_complete {
+        return Err(SelectedRootExecutorError::RemoteWritePlanLocalBaselineMissing);
+    }
+    if !local_state.observation_valid {
+        return Err(SelectedRootExecutorError::RemoteWritePlanLocalBaselineInvalid);
+    }
+
+    let baseline = storage.list_sync_root_local_items(&sync_root.id)?;
+    let baseline_count =
+        u64::try_from(baseline.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+    if baseline_count != local_state.item_count {
+        return Err(SelectedRootExecutorError::RemoteWritePlanLocalBaselineCountMismatch);
+    }
+
+    let first = scan_selected_root_local_snapshot(sync_root)?;
+    let second = scan_selected_root_local_snapshot(sync_root)?;
+    if first != second {
+        return Err(SelectedRootExecutorError::RemoteWritePlanLocalScanRace);
+    }
+
+    let diff = build_selected_root_local_inventory_diff(
+        &baseline,
+        &first,
+        local_state.generation,
+        local_state.snapshot_completed_at_unix_ms,
+    )?;
+    let events = storage
+        .list_pending_sync_root_local_change_events(&sync_root.id, local_state.generation)?;
+
+    if events.len() != diff.entries().len() {
+        return Err(SelectedRootExecutorError::RemoteWritePlanLocalJournalMismatch);
+    }
+
+    for (event, entry) in events.iter().zip(diff.entries()) {
+        if event.relative_path() != entry.relative_path()
+            || event.kind != local_change_event_kind(entry.kind)
+            || event.baseline_kind != entry.baseline_kind
+            || event.current_kind != entry.current_kind
+        {
+            return Err(SelectedRootExecutorError::RemoteWritePlanLocalJournalMismatch);
+        }
+    }
+
+    let remote_root_id = sync_root
+        .remote_root_id
+        .as_deref()
+        .ok_or(SelectedRootExecutorError::MissingRemoteRoot)?;
+
+    let remote_state = storage.sync_root_remote_inventory_state(&sync_root.id)?;
+    if !remote_state.ready_for_reconciliation() {
+        return Err(SelectedRootExecutorError::RemoteWritePlanRemoteCatalogNotReady);
+    }
+    if storage
+        .sync_root_change_window_state(&sync_root.id)?
+        .is_some()
+    {
+        return Err(SelectedRootExecutorError::RemoteWritePlanRemoteChangeWindowPending);
+    }
+    let remote_cursor = storage
+        .sync_root_change_cursor(&sync_root.id)?
+        .ok_or(SelectedRootExecutorError::RemoteWritePlanRemoteCursorMissing)?;
+
+    let remote_items = storage.list_sync_root_remote_items(&sync_root.id)?;
+    let remote_item_count =
+        u64::try_from(remote_items.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+    if remote_item_count != remote_state.item_count {
+        return Err(SelectedRootExecutorError::RemoteWritePlanRemoteCatalogCountMismatch);
+    }
+
+    let authority_state = storage
+        .sync_root_remote_write_authority_state(&sync_root.id)?
+        .ok_or(SelectedRootExecutorError::RemoteWritePlanAuthorityStateMissing)?;
+    if authority_state.change_cursor != remote_cursor {
+        return Err(SelectedRootExecutorError::RemoteWritePlanAuthorityCursorMismatch);
+    }
+
+    let authorities = storage.list_sync_root_remote_write_authorities(&sync_root.id)?;
+    let expected_authority_count = remote_item_count
+        .checked_add(1)
+        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+    if authority_state.item_count != expected_authority_count
+        || u64::try_from(authorities.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?
+            != expected_authority_count
+    {
+        return Err(SelectedRootExecutorError::RemoteWritePlanAuthorityCountMismatch);
+    }
+
+    let expected_ids = std::iter::once(remote_root_id.to_owned())
+        .chain(remote_items.iter().map(|item| item.remote_id.clone()))
+        .collect::<HashSet<_>>();
+    let authority_ids = authorities
+        .iter()
+        .map(|authority| authority.remote_id().to_owned())
+        .collect::<HashSet<_>>();
+    if expected_ids != authority_ids {
+        return Err(SelectedRootExecutorError::RemoteWritePlanAuthorityCoverageMismatch);
+    }
+
+    let file_receipts = storage.list_sync_root_file_materialization_receipts(&sync_root.id)?;
+    let directory_receipts =
+        storage.list_sync_root_directory_materialization_receipts(&sync_root.id)?;
+
+    let entries = derive_selected_root_remote_write_plan_entries(
+        remote_root_id,
+        &events,
+        &baseline,
+        &first,
+        &remote_items,
+        &file_receipts,
+        &directory_receipts,
+        &authorities,
+    )?;
+
+    let create_file_needs_id = entries
+        .iter()
+        .filter(|entry| {
+            entry.operation == Some(RemoteWriteIntentOperation::CreateFile)
+                && entry.disposition
+                    == SelectedRootRemoteWritePlanDisposition::NeedsPredeterminedRemoteId
+        })
+        .count();
+    let create_folder_needs_id = entries
+        .iter()
+        .filter(|entry| {
+            entry.operation == Some(RemoteWriteIntentOperation::CreateFolder)
+                && entry.disposition
+                    == SelectedRootRemoteWritePlanDisposition::NeedsPredeterminedRemoteId
+        })
+        .count();
+    let update_file_ready = entries
+        .iter()
+        .filter(|entry| {
+            entry.operation == Some(RemoteWriteIntentOperation::UpdateFile)
+                && entry.disposition == SelectedRootRemoteWritePlanDisposition::Ready
+        })
+        .count();
+    let trash_item_ready = entries
+        .iter()
+        .filter(|entry| {
+            entry.operation == Some(RemoteWriteIntentOperation::TrashItem)
+                && entry.disposition == SelectedRootRemoteWritePlanDisposition::Ready
+        })
+        .count();
+    let conflicts = entries
+        .iter()
+        .filter(|entry| entry.disposition == SelectedRootRemoteWritePlanDisposition::Conflict)
+        .count();
+    let blocked_identity = entries
+        .iter()
+        .filter(|entry| {
+            entry.disposition == SelectedRootRemoteWritePlanDisposition::BlockedIdentity
+        })
+        .count();
+    let blocked_authority = entries
+        .iter()
+        .filter(|entry| {
+            entry.disposition == SelectedRootRemoteWritePlanDisposition::BlockedAuthority
+        })
+        .count();
+
+    Ok(SelectedRootRemoteWriteIntentPlan {
+        baseline_generation: local_state.generation,
+        pending_events: events.len(),
+        create_file_needs_id,
+        create_folder_needs_id,
+        update_file_ready,
+        trash_item_ready,
+        conflicts,
+        blocked_identity,
+        blocked_authority,
+        root_write_capable: !matches!(sync_root.mode, SyncMode::ReceiveOnly),
+        full_sync_credential_present,
+        entries,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_selected_root_remote_write_plan_entries(
+    remote_root_id: &str,
+    events: &[LocalChangeEventRecord],
+    baseline: &[LocalItemSnapshot],
+    current: &[LocalItemSnapshot],
+    remote_items: &[RemoteItem],
+    file_receipts: &[SyncRootFileMaterializationReceipt],
+    directory_receipts: &[SyncRootDirectoryMaterializationReceipt],
+    authorities: &[RemoteWriteAuthoritySnapshot],
+) -> Result<Vec<SelectedRootRemoteWritePlanEntry>, SelectedRootExecutorError> {
+    let baseline_by_path = baseline
+        .iter()
+        .map(|item| (item.relative_path(), item))
+        .collect::<BTreeMap<_, _>>();
+    let current_by_path = current
+        .iter()
+        .map(|item| (item.relative_path(), item))
+        .collect::<BTreeMap<_, _>>();
+    if baseline_by_path.len() != baseline.len() || current_by_path.len() != current.len() {
+        return Err(SelectedRootExecutorError::LocalDiffDuplicatePath);
+    }
+
+    let remote_by_id = remote_items
+        .iter()
+        .map(|item| (item.remote_id.clone(), item))
+        .collect::<BTreeMap<_, _>>();
+    if remote_by_id.len() != remote_items.len() {
+        return Err(SelectedRootExecutorError::RemoteWritePlanRemoteCatalogIdentityAmbiguous);
+    }
+
+    let authority_by_id = authorities
+        .iter()
+        .map(|authority| (authority.remote_id().to_owned(), authority))
+        .collect::<BTreeMap<_, _>>();
+    if authority_by_id.len() != authorities.len() {
+        return Err(SelectedRootExecutorError::RemoteWritePlanAuthorityCoverageMismatch);
+    }
+
+    let mut ownership = BTreeMap::<String, (String, LocalItemKind)>::new();
+    for receipt in file_receipts {
+        if ownership
+            .insert(
+                receipt.relative_path.clone(),
+                (receipt.remote_id.clone(), LocalItemKind::File),
+            )
+            .is_some()
+        {
+            return Err(SelectedRootExecutorError::RemoteWritePlanOwnershipAmbiguous);
+        }
+    }
+    for receipt in directory_receipts {
+        if ownership
+            .insert(
+                receipt.relative_path.clone(),
+                (receipt.remote_id.clone(), LocalItemKind::Directory),
+            )
+            .is_some()
+        {
+            return Err(SelectedRootExecutorError::RemoteWritePlanOwnershipAmbiguous);
+        }
+    }
+
+    let deleted_paths = events
+        .iter()
+        .filter(|event| event.kind == LocalChangeEventKind::Deleted)
+        .map(|event| event.relative_path().to_owned())
+        .collect::<HashSet<_>>();
+
+    let mut entries = Vec::with_capacity(events.len());
+
+    for event in events {
+        let operation = match (event.kind, event.current_kind, event.baseline_kind) {
+            (LocalChangeEventKind::Created, Some(LocalItemKind::File), _) => {
+                Some(RemoteWriteIntentOperation::CreateFile)
+            }
+            (LocalChangeEventKind::Created, Some(LocalItemKind::Directory), _) => {
+                Some(RemoteWriteIntentOperation::CreateFolder)
+            }
+            (LocalChangeEventKind::Modified, Some(LocalItemKind::File), _) => {
+                Some(RemoteWriteIntentOperation::UpdateFile)
+            }
+            (LocalChangeEventKind::Deleted, _, _) => Some(RemoteWriteIntentOperation::TrashItem),
+            (LocalChangeEventKind::Modified, Some(LocalItemKind::Directory), _)
+            | (LocalChangeEventKind::TypeChanged, _, _) => None,
+            _ => None,
+        };
+
+        let identity_snapshot = match event.kind {
+            LocalChangeEventKind::Created | LocalChangeEventKind::Modified => {
+                current_by_path.get(event.relative_path()).copied()
+            }
+            LocalChangeEventKind::Deleted => baseline_by_path.get(event.relative_path()).copied(),
+            LocalChangeEventKind::TypeChanged => {
+                current_by_path.get(event.relative_path()).copied()
+            }
+        };
+
+        let mut entry = plan_entry_from_snapshot(event, operation, identity_snapshot);
+
+        if event.kind == LocalChangeEventKind::TypeChanged
+            || (event.kind == LocalChangeEventKind::Modified
+                && event.current_kind == Some(LocalItemKind::Directory))
+        {
+            entry.disposition = SelectedRootRemoteWritePlanDisposition::Conflict;
+            entries.push(entry);
+            continue;
+        }
+
+        let Some(snapshot) = identity_snapshot else {
+            entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedIdentity;
+            entries.push(entry);
+            continue;
+        };
+
+        if event.kind == LocalChangeEventKind::Deleted
+            && has_deleted_ancestor(event.relative_path(), &deleted_paths)
+        {
+            entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedIdentity;
+            entries.push(entry);
+            continue;
+        }
+
+        match event.kind {
+            LocalChangeEventKind::Created => {
+                let Some(parent_remote_id) = resolve_owned_parent_remote_id(
+                    event.relative_path(),
+                    remote_root_id,
+                    &ownership,
+                    &remote_by_id,
+                ) else {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedIdentity;
+                    entries.push(entry);
+                    continue;
+                };
+
+                entry.expected_parent_remote_id = Some(parent_remote_id.clone());
+                let Some(parent_authority) = authority_by_id.get(&parent_remote_id) else {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedAuthority;
+                    entries.push(entry);
+                    continue;
+                };
+
+                if !parent_authority.can_add_children {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedAuthority;
+                    entries.push(entry);
+                    continue;
+                }
+
+                entry.local_kind = Some(snapshot.kind());
+                entry.disposition =
+                    SelectedRootRemoteWritePlanDisposition::NeedsPredeterminedRemoteId;
+            }
+            LocalChangeEventKind::Modified | LocalChangeEventKind::Deleted => {
+                let expected_kind = if event.kind == LocalChangeEventKind::Modified {
+                    event.current_kind
+                } else {
+                    event.baseline_kind
+                };
+                let Some(expected_kind) = expected_kind else {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedIdentity;
+                    entries.push(entry);
+                    continue;
+                };
+
+                let Some((remote_id, receipt_kind)) = ownership.get(event.relative_path()) else {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedIdentity;
+                    entries.push(entry);
+                    continue;
+                };
+                if *receipt_kind != expected_kind {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedIdentity;
+                    entries.push(entry);
+                    continue;
+                }
+
+                let Some(remote_item) = remote_by_id.get(remote_id) else {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedIdentity;
+                    entries.push(entry);
+                    continue;
+                };
+
+                let expected_remote_kind = match expected_kind {
+                    LocalItemKind::File => RemoteItemKind::File,
+                    LocalItemKind::Directory => RemoteItemKind::Folder,
+                };
+                if remote_item.kind != expected_remote_kind
+                    || remote_item.trashed
+                    || remote_item.name != basename(event.relative_path())
+                {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedIdentity;
+                    entries.push(entry);
+                    continue;
+                }
+
+                let Some(expected_parent_remote_id) = resolve_owned_parent_remote_id(
+                    event.relative_path(),
+                    remote_root_id,
+                    &ownership,
+                    &remote_by_id,
+                ) else {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedIdentity;
+                    entries.push(entry);
+                    continue;
+                };
+                if remote_item.parent_remote_id.as_deref()
+                    != Some(expected_parent_remote_id.as_str())
+                {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedIdentity;
+                    entries.push(entry);
+                    continue;
+                }
+
+                let Some(authority) = authority_by_id.get(remote_id) else {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedAuthority;
+                    entries.push(entry);
+                    continue;
+                };
+
+                let capability_ok = match event.kind {
+                    LocalChangeEventKind::Modified => authority.can_edit,
+                    LocalChangeEventKind::Deleted => authority.can_trash,
+                    LocalChangeEventKind::Created | LocalChangeEventKind::TypeChanged => false,
+                };
+                if !capability_ok {
+                    entry.disposition = SelectedRootRemoteWritePlanDisposition::BlockedAuthority;
+                    entries.push(entry);
+                    continue;
+                }
+
+                entry.target_remote_id = Some(remote_id.clone());
+                entry.expected_parent_remote_id = Some(expected_parent_remote_id);
+                entry.expected_remote_kind = Some(expected_remote_kind);
+                entry.expected_remote_version = Some(authority.remote_version);
+                entry.expected_remote_size_bytes = remote_item.size_bytes;
+                entry.expected_checksum_algorithm =
+                    authority.checksum_algorithm().map(str::to_owned);
+                entry.expected_content_checksum = authority.content_checksum().map(str::to_owned);
+                entry.disposition = SelectedRootRemoteWritePlanDisposition::Ready;
+            }
+            LocalChangeEventKind::TypeChanged => unreachable!("handled above"),
+        }
+
+        entries.push(entry);
+    }
+
+    Ok(entries)
+}
+
+fn plan_entry_from_snapshot(
+    event: &LocalChangeEventRecord,
+    operation: Option<RemoteWriteIntentOperation>,
+    snapshot: Option<&LocalItemSnapshot>,
+) -> SelectedRootRemoteWritePlanEntry {
+    SelectedRootRemoteWritePlanEntry {
+        source_local_event_id: event.id,
+        relative_path: event.relative_path().to_owned(),
+        operation,
+        disposition: SelectedRootRemoteWritePlanDisposition::BlockedIdentity,
+        local_kind: snapshot.map(LocalItemSnapshot::kind),
+        local_size_bytes: snapshot.and_then(LocalItemSnapshot::size_bytes),
+        local_modified_unix_ns: snapshot.map(LocalItemSnapshot::modified_unix_ns),
+        local_device_id: snapshot.map(LocalItemSnapshot::device_id),
+        local_inode: snapshot.map(LocalItemSnapshot::inode),
+        target_remote_id: None,
+        expected_parent_remote_id: None,
+        expected_remote_kind: None,
+        expected_remote_version: None,
+        expected_remote_size_bytes: None,
+        expected_checksum_algorithm: None,
+        expected_content_checksum: None,
+    }
+}
+
+fn resolve_owned_parent_remote_id(
+    relative_path: &str,
+    remote_root_id: &str,
+    ownership: &BTreeMap<String, (String, LocalItemKind)>,
+    remote_by_id: &BTreeMap<String, &RemoteItem>,
+) -> Option<String> {
+    let Some((parent_path, _)) = relative_path.rsplit_once('/') else {
+        return Some(remote_root_id.to_owned());
+    };
+    resolve_owned_directory_remote_id(parent_path, remote_root_id, ownership, remote_by_id)
+}
+
+fn resolve_owned_directory_remote_id(
+    relative_path: &str,
+    remote_root_id: &str,
+    ownership: &BTreeMap<String, (String, LocalItemKind)>,
+    remote_by_id: &BTreeMap<String, &RemoteItem>,
+) -> Option<String> {
+    let (remote_id, kind) = ownership.get(relative_path)?;
+    if *kind != LocalItemKind::Directory {
+        return None;
+    }
+    let remote = remote_by_id.get(remote_id)?;
+    if remote.kind != RemoteItemKind::Folder
+        || remote.trashed
+        || remote.name != basename(relative_path)
+    {
+        return None;
+    }
+
+    let expected_parent = match relative_path.rsplit_once('/') {
+        Some((parent_path, _)) => {
+            resolve_owned_directory_remote_id(parent_path, remote_root_id, ownership, remote_by_id)?
+        }
+        None => remote_root_id.to_owned(),
+    };
+
+    if remote.parent_remote_id.as_deref() != Some(expected_parent.as_str()) {
+        return None;
+    }
+
+    Some(remote_id.clone())
+}
+
+fn basename(relative_path: &str) -> &str {
+    relative_path
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .unwrap_or(relative_path)
+}
+
+fn has_deleted_ancestor(relative_path: &str, deleted_paths: &HashSet<String>) -> bool {
+    let mut candidate = relative_path;
+    while let Some((parent, _)) = candidate.rsplit_once('/') {
+        if deleted_paths.contains(parent) {
+            return true;
+        }
+        candidate = parent;
+    }
+    false
+}
+
 fn local_change_event_kind(kind: SelectedRootLocalDiffKind) -> LocalChangeEventKind {
     match kind {
         SelectedRootLocalDiffKind::Created => LocalChangeEventKind::Created,
@@ -6603,6 +7248,36 @@ pub enum SelectedRootExecutorError {
     LocalDiffScanRace,
     #[error("local inventory diff encountered a duplicate relative path")]
     LocalDiffDuplicatePath,
+    #[error("remote-write planning requires a durable local baseline")]
+    RemoteWritePlanLocalBaselineMissing,
+    #[error("remote-write planning requires a valid local observation baseline")]
+    RemoteWritePlanLocalBaselineInvalid,
+    #[error("remote-write planning local baseline count mismatched durable state")]
+    RemoteWritePlanLocalBaselineCountMismatch,
+    #[error("remote-write planning local scan changed while planning")]
+    RemoteWritePlanLocalScanRace,
+    #[error("remote-write planning pending journal does not match the fresh local diff")]
+    RemoteWritePlanLocalJournalMismatch,
+    #[error("remote-write planning requires a fully caught-up remote catalog")]
+    RemoteWritePlanRemoteCatalogNotReady,
+    #[error("remote-write planning requires no open remote change window")]
+    RemoteWritePlanRemoteChangeWindowPending,
+    #[error("remote-write planning requires a durable remote change cursor")]
+    RemoteWritePlanRemoteCursorMissing,
+    #[error("remote-write planning remote catalog count mismatched durable state")]
+    RemoteWritePlanRemoteCatalogCountMismatch,
+    #[error("remote-write planning requires a cursor-bound authority snapshot")]
+    RemoteWritePlanAuthorityStateMissing,
+    #[error("remote-write planning authority cursor is stale")]
+    RemoteWritePlanAuthorityCursorMismatch,
+    #[error("remote-write planning authority count mismatched the catalog")]
+    RemoteWritePlanAuthorityCountMismatch,
+    #[error("remote-write planning authority coverage mismatched the catalog")]
+    RemoteWritePlanAuthorityCoverageMismatch,
+    #[error("remote-write planning remote catalog identity is ambiguous")]
+    RemoteWritePlanRemoteCatalogIdentityAmbiguous,
+    #[error("remote-write planning ownership receipts are ambiguous")]
+    RemoteWritePlanOwnershipAmbiguous,
     #[error("local directory materialization is blocked by local-only entries or type conflicts")]
     LocalDirectoryPhaseBlocked,
     #[error("local directory target count mismatched the remote directory plan")]
@@ -10173,5 +10848,253 @@ mod phase5g_cross_process_execution_tests {
         fs::remove_file(&path).unwrap();
         fs::remove_file(&target).unwrap();
         fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod phase5h3_remote_write_intent_planner_tests {
+    use super::*;
+
+    #[test]
+    fn phase5h3_derives_create_needing_id_and_exact_update_candidate() {
+        let baseline = vec![
+            LocalItemSnapshot::new("docs", LocalItemKind::Directory, None, 10, 8, 100).unwrap(),
+            LocalItemSnapshot::new(
+                "docs/existing.txt",
+                LocalItemKind::File,
+                Some(4),
+                11,
+                8,
+                101,
+            )
+            .unwrap(),
+        ];
+        let current = vec![
+            baseline[0].clone(),
+            LocalItemSnapshot::new(
+                "docs/existing.txt",
+                LocalItemKind::File,
+                Some(5),
+                20,
+                8,
+                101,
+            )
+            .unwrap(),
+            LocalItemSnapshot::new("docs/new.txt", LocalItemKind::File, Some(3), 21, 8, 102)
+                .unwrap(),
+        ];
+        let events = vec![
+            LocalChangeEventRecord::new(
+                1,
+                1,
+                "docs/existing.txt",
+                LocalChangeEventKind::Modified,
+                Some(LocalItemKind::File),
+                Some(LocalItemKind::File),
+            )
+            .unwrap(),
+            LocalChangeEventRecord::new(
+                2,
+                1,
+                "docs/new.txt",
+                LocalChangeEventKind::Created,
+                None,
+                Some(LocalItemKind::File),
+            )
+            .unwrap(),
+        ];
+        let remote_items = vec![
+            RemoteItem {
+                remote_id: "remote-docs".into(),
+                parent_remote_id: Some("remote-root".into()),
+                name: "docs".into(),
+                kind: RemoteItemKind::Folder,
+                size_bytes: None,
+                modified_unix_ms: None,
+                trashed: false,
+            },
+            RemoteItem {
+                remote_id: "remote-existing".into(),
+                parent_remote_id: Some("remote-docs".into()),
+                name: "existing.txt".into(),
+                kind: RemoteItemKind::File,
+                size_bytes: Some(4),
+                modified_unix_ms: None,
+                trashed: false,
+            },
+        ];
+        let file_receipts = vec![SyncRootFileMaterializationReceipt {
+            remote_id: "remote-existing".into(),
+            relative_path: "docs/existing.txt".into(),
+            size_bytes: 4,
+            sha256_hex: "a".repeat(64),
+            materialized_at_unix_ms: 5,
+        }];
+        let directory_receipts = vec![SyncRootDirectoryMaterializationReceipt {
+            remote_id: "remote-docs".into(),
+            relative_path: "docs".into(),
+            materialized_at_unix_ms: 5,
+        }];
+        let authorities = vec![
+            RemoteWriteAuthoritySnapshot::new("remote-root", 5, None, None, true, true, true, 30)
+                .unwrap(),
+            RemoteWriteAuthoritySnapshot::new("remote-docs", 6, None, None, true, true, true, 30)
+                .unwrap(),
+            RemoteWriteAuthoritySnapshot::new(
+                "remote-existing",
+                7,
+                Some("md5".into()),
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+                true,
+                true,
+                false,
+                30,
+            )
+            .unwrap(),
+        ];
+
+        let entries = derive_selected_root_remote_write_plan_entries(
+            "remote-root",
+            &events,
+            &baseline,
+            &current,
+            &remote_items,
+            &file_receipts,
+            &directory_receipts,
+            &authorities,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].operation,
+            Some(RemoteWriteIntentOperation::UpdateFile)
+        );
+        assert_eq!(
+            entries[0].disposition,
+            SelectedRootRemoteWritePlanDisposition::Ready
+        );
+        assert_eq!(entries[0].expected_remote_version, Some(7));
+        assert_eq!(
+            entries[1].operation,
+            Some(RemoteWriteIntentOperation::CreateFile)
+        );
+        assert_eq!(
+            entries[1].disposition,
+            SelectedRootRemoteWritePlanDisposition::NeedsPredeterminedRemoteId
+        );
+
+        let debug = format!("{entries:?}");
+        assert!(!debug.contains("docs/existing.txt"));
+        assert!(!debug.contains("docs/new.txt"));
+        assert!(!debug.contains("remote-existing"));
+        assert!(!debug.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn phase5h3_type_change_is_conflict_and_nested_delete_is_fail_closed() {
+        let baseline = vec![
+            LocalItemSnapshot::new("folder", LocalItemKind::Directory, None, 10, 8, 100).unwrap(),
+            LocalItemSnapshot::new("folder/child.txt", LocalItemKind::File, Some(4), 11, 8, 101)
+                .unwrap(),
+            LocalItemSnapshot::new("shape", LocalItemKind::File, Some(1), 12, 8, 102).unwrap(),
+        ];
+        let current = vec![
+            LocalItemSnapshot::new("shape", LocalItemKind::Directory, None, 20, 8, 103).unwrap(),
+        ];
+        let events = vec![
+            LocalChangeEventRecord::new(
+                1,
+                1,
+                "folder",
+                LocalChangeEventKind::Deleted,
+                Some(LocalItemKind::Directory),
+                None,
+            )
+            .unwrap(),
+            LocalChangeEventRecord::new(
+                2,
+                1,
+                "folder/child.txt",
+                LocalChangeEventKind::Deleted,
+                Some(LocalItemKind::File),
+                None,
+            )
+            .unwrap(),
+            LocalChangeEventRecord::new(
+                3,
+                1,
+                "shape",
+                LocalChangeEventKind::TypeChanged,
+                Some(LocalItemKind::File),
+                Some(LocalItemKind::Directory),
+            )
+            .unwrap(),
+        ];
+        let remote_items = vec![
+            RemoteItem {
+                remote_id: "remote-folder".into(),
+                parent_remote_id: Some("remote-root".into()),
+                name: "folder".into(),
+                kind: RemoteItemKind::Folder,
+                size_bytes: None,
+                modified_unix_ms: None,
+                trashed: false,
+            },
+            RemoteItem {
+                remote_id: "remote-child".into(),
+                parent_remote_id: Some("remote-folder".into()),
+                name: "child.txt".into(),
+                kind: RemoteItemKind::File,
+                size_bytes: Some(4),
+                modified_unix_ms: None,
+                trashed: false,
+            },
+        ];
+        let file_receipts = vec![SyncRootFileMaterializationReceipt {
+            remote_id: "remote-child".into(),
+            relative_path: "folder/child.txt".into(),
+            size_bytes: 4,
+            sha256_hex: "a".repeat(64),
+            materialized_at_unix_ms: 5,
+        }];
+        let directory_receipts = vec![SyncRootDirectoryMaterializationReceipt {
+            remote_id: "remote-folder".into(),
+            relative_path: "folder".into(),
+            materialized_at_unix_ms: 5,
+        }];
+        let authorities = vec![
+            RemoteWriteAuthoritySnapshot::new("remote-root", 5, None, None, true, true, true, 30)
+                .unwrap(),
+            RemoteWriteAuthoritySnapshot::new("remote-folder", 6, None, None, true, true, true, 30)
+                .unwrap(),
+            RemoteWriteAuthoritySnapshot::new("remote-child", 7, None, None, true, true, false, 30)
+                .unwrap(),
+        ];
+
+        let entries = derive_selected_root_remote_write_plan_entries(
+            "remote-root",
+            &events,
+            &baseline,
+            &current,
+            &remote_items,
+            &file_receipts,
+            &directory_receipts,
+            &authorities,
+        )
+        .unwrap();
+
+        assert_eq!(
+            entries[0].disposition,
+            SelectedRootRemoteWritePlanDisposition::Ready
+        );
+        assert_eq!(
+            entries[1].disposition,
+            SelectedRootRemoteWritePlanDisposition::BlockedIdentity
+        );
+        assert_eq!(
+            entries[2].disposition,
+            SelectedRootRemoteWritePlanDisposition::Conflict
+        );
     }
 }

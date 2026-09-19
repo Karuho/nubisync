@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 type RemoteInventoryStateRow = (i64, i64, i64, Option<i64>, Option<String>);
 type SyncRootRemoteItemRow = (Option<String>, String, String, Option<i64>, i64);
@@ -42,6 +42,16 @@ impl LocalChangeEventKind {
             Self::Deleted => "deleted",
             Self::Modified => "modified",
             Self::TypeChanged => "type_changed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "created" => Ok(Self::Created),
+            "deleted" => Ok(Self::Deleted),
+            "modified" => Ok(Self::Modified),
+            "type_changed" => Ok(Self::TypeChanged),
+            _ => Err(StorageError::InvalidStoredLocalChangeEventKind),
         }
     }
 }
@@ -116,6 +126,67 @@ impl std::fmt::Debug for LocalChangeEventInput {
             .field("current_kind", &self.current_kind)
             .finish()
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalChangeEventRecord {
+    pub id: i64,
+    pub baseline_generation: u64,
+    relative_path: String,
+    pub kind: LocalChangeEventKind,
+    pub baseline_kind: Option<LocalItemKind>,
+    pub current_kind: Option<LocalItemKind>,
+}
+
+impl LocalChangeEventRecord {
+    pub fn new(
+        id: i64,
+        baseline_generation: u64,
+        relative_path: impl Into<String>,
+        kind: LocalChangeEventKind,
+        baseline_kind: Option<LocalItemKind>,
+        current_kind: Option<LocalItemKind>,
+    ) -> Result<Self, StorageError> {
+        if id <= 0 || baseline_generation == 0 {
+            return Err(StorageError::InvalidStoredLocalChangeEvent);
+        }
+        let relative_path = relative_path.into();
+        let validated =
+            LocalChangeEventInput::new(relative_path.clone(), kind, baseline_kind, current_kind)?;
+        Ok(Self {
+            id,
+            baseline_generation,
+            relative_path: validated.relative_path,
+            kind,
+            baseline_kind,
+            current_kind,
+        })
+    }
+
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+}
+
+impl std::fmt::Debug for LocalChangeEventRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalChangeEventRecord")
+            .field("id", &self.id)
+            .field("baseline_generation", &self.baseline_generation)
+            .field("relative_path", &"[redacted]")
+            .field("kind", &self.kind)
+            .field("baseline_kind", &self.baseline_kind)
+            .field("current_kind", &self.current_kind)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteWriteAuthorityState {
+    pub change_cursor: ChangeCursor,
+    pub item_count: u64,
+    pub observed_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -794,6 +865,14 @@ impl Storage {
                     OR
                     (checksum_algorithm IS NOT NULL AND content_checksum IS NOT NULL)
                 ),
+                FOREIGN KEY (sync_root_id) REFERENCES sync_roots(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_root_remote_write_authority_state (
+                sync_root_id TEXT PRIMARY KEY,
+                change_cursor TEXT NOT NULL,
+                item_count INTEGER NOT NULL CHECK (item_count >= 0),
+                observed_at_unix_ms INTEGER NOT NULL,
                 FOREIGN KEY (sync_root_id) REFERENCES sync_roots(id) ON DELETE CASCADE
             );
 
@@ -1664,6 +1743,192 @@ impl Storage {
         query_remote_write_authority(&self.connection, sync_root_id, remote_id)
     }
 
+    pub fn list_sync_root_remote_write_authorities(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<Vec<RemoteWriteAuthoritySnapshot>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT remote_id, remote_version, checksum_algorithm, content_checksum,
+                    can_edit, can_trash, can_add_children, observed_at_unix_ms
+             FROM sync_root_remote_write_authority
+             WHERE sync_root_id=?1
+             ORDER BY remote_id",
+        )?;
+
+        let rows = statement.query_map(params![sync_root_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+
+        let mut authorities = Vec::new();
+        for row in rows {
+            let (
+                remote_id,
+                remote_version,
+                checksum_algorithm,
+                content_checksum,
+                can_edit,
+                can_trash,
+                can_add_children,
+                observed_at_unix_ms,
+            ) = row?;
+
+            let remote_version = remote_version
+                .parse::<u64>()
+                .map_err(|_| StorageError::InvalidStoredRemoteWriteAuthority)?;
+
+            authorities.push(RemoteWriteAuthoritySnapshot::new(
+                remote_id,
+                remote_version,
+                checksum_algorithm,
+                content_checksum,
+                can_edit != 0,
+                can_trash != 0,
+                can_add_children != 0,
+                observed_at_unix_ms,
+            )?);
+        }
+
+        Ok(authorities)
+    }
+
+    pub fn commit_sync_root_remote_write_authority_snapshot(
+        &mut self,
+        sync_root_id: &str,
+        expected_change_cursor: &ChangeCursor,
+        authorities: &[RemoteWriteAuthoritySnapshot],
+        observed_at_unix_ms: i64,
+    ) -> Result<usize, StorageError> {
+        let transaction = self.connection.transaction()?;
+
+        let catalog_state: Option<(i64, i64, i64, Option<String>)> = transaction
+            .query_row(
+                "SELECT snapshot_complete, catchup_complete, item_count, change_cursor
+                 FROM sync_root_remote_inventory_state
+                 WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+
+        let Some((snapshot_complete, catchup_complete, catalog_items, change_cursor)) =
+            catalog_state
+        else {
+            return Err(StorageError::RemoteWriteAuthorityCatalogNotReady);
+        };
+
+        if snapshot_complete == 0 || catchup_complete == 0 {
+            return Err(StorageError::RemoteWriteAuthorityCatalogNotReady);
+        }
+
+        if change_cursor.as_deref() != Some(expected_change_cursor.as_str()) {
+            return Err(StorageError::RemoteWriteAuthorityCursorMismatch);
+        }
+
+        let open_window: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_change_window_state WHERE sync_root_id=?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        if open_window != 0 {
+            return Err(StorageError::RemoteWriteAuthorityCatalogNotReady);
+        }
+
+        let expected_authorities = catalog_items
+            .checked_add(1)
+            .ok_or(StorageError::NumericOverflow)?;
+        let authority_count =
+            i64::try_from(authorities.len()).map_err(|_| StorageError::NumericOverflow)?;
+        if authority_count != expected_authorities {
+            return Err(StorageError::RemoteWriteAuthorityCountMismatch);
+        }
+
+        if authorities
+            .iter()
+            .any(|authority| authority.observed_at_unix_ms != observed_at_unix_ms)
+        {
+            return Err(StorageError::InvalidRemoteWriteAuthority);
+        }
+
+        transaction.execute(
+            "DELETE FROM sync_root_remote_write_authority WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+
+        for authority in authorities {
+            transaction.execute(
+                "INSERT INTO sync_root_remote_write_authority (
+                    sync_root_id, remote_id, remote_version,
+                    checksum_algorithm, content_checksum,
+                    can_edit, can_trash, can_add_children, observed_at_unix_ms
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    sync_root_id,
+                    authority.remote_id(),
+                    authority.remote_version.to_string(),
+                    authority.checksum_algorithm(),
+                    authority.content_checksum(),
+                    i64::from(authority.can_edit),
+                    i64::from(authority.can_trash),
+                    i64::from(authority.can_add_children),
+                    authority.observed_at_unix_ms,
+                ],
+            )?;
+        }
+
+        transaction.execute(
+            "INSERT INTO sync_root_remote_write_authority_state (
+                sync_root_id, change_cursor, item_count, observed_at_unix_ms
+             ) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(sync_root_id) DO UPDATE SET
+                change_cursor=excluded.change_cursor,
+                item_count=excluded.item_count,
+                observed_at_unix_ms=excluded.observed_at_unix_ms",
+            params![
+                sync_root_id,
+                expected_change_cursor.as_str(),
+                authority_count,
+                observed_at_unix_ms,
+            ],
+        )?;
+
+        transaction.commit()?;
+        Ok(authorities.len())
+    }
+
+    pub fn sync_root_remote_write_authority_state(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<Option<RemoteWriteAuthorityState>, StorageError> {
+        let row: Option<(String, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT change_cursor, item_count, observed_at_unix_ms
+                 FROM sync_root_remote_write_authority_state
+                 WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        row.map(|(change_cursor, item_count, observed_at_unix_ms)| {
+            Ok(RemoteWriteAuthorityState {
+                change_cursor: ChangeCursor::new(change_cursor)?,
+                item_count: u64::try_from(item_count).map_err(|_| StorageError::NumericOverflow)?,
+                observed_at_unix_ms,
+            })
+        })
+        .transpose()
+    }
+
     pub fn replace_sync_root_remote_write_authority_snapshot(
         &mut self,
         sync_root_id: &str,
@@ -1965,6 +2230,62 @@ impl Storage {
             |row| row.get(0),
         )?;
         u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn list_pending_sync_root_local_change_events(
+        &self,
+        sync_root_id: &str,
+        baseline_generation: u64,
+    ) -> Result<Vec<LocalChangeEventRecord>, StorageError> {
+        let baseline_generation_i64 =
+            i64::try_from(baseline_generation).map_err(|_| StorageError::NumericOverflow)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, event_kind, relative_path, baseline_kind, current_kind
+             FROM sync_root_local_change_events
+             WHERE sync_root_id=?1
+               AND baseline_generation=?2
+               AND status='pending'
+             ORDER BY relative_path ASC",
+        )?;
+
+        let rows = statement.query_map(params![sync_root_id, baseline_generation_i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let (id, kind, relative_path, baseline_kind, current_kind) = row?;
+            let kind = LocalChangeEventKind::parse(&kind)?;
+            let baseline_kind = baseline_kind
+                .map(|value| {
+                    LocalItemKind::parse(&value)
+                        .map_err(|_| StorageError::InvalidStoredLocalItemKind)
+                })
+                .transpose()?;
+            let current_kind = current_kind
+                .map(|value| {
+                    LocalItemKind::parse(&value)
+                        .map_err(|_| StorageError::InvalidStoredLocalItemKind)
+                })
+                .transpose()?;
+
+            events.push(LocalChangeEventRecord::new(
+                id,
+                baseline_generation,
+                relative_path,
+                kind,
+                baseline_kind,
+                current_kind,
+            )?);
+        }
+
+        Ok(events)
     }
 
     pub fn pending_sync_root_local_change_event_count(
@@ -4813,6 +5134,10 @@ pub enum StorageError {
     LocalChangeBaselineMismatch,
     #[error("local change journal pending count did not match the supplied diff")]
     LocalChangeJournalCountMismatch,
+    #[error("stored local change event kind is invalid")]
+    InvalidStoredLocalChangeEventKind,
+    #[error("stored local change event is invalid")]
+    InvalidStoredLocalChangeEvent,
     #[error("remote-write identifier is invalid")]
     InvalidRemoteWriteIdentifier,
     #[error("remote-write checksum is invalid")]
@@ -4833,6 +5158,12 @@ pub enum StorageError {
     RemoteWriteIntentRootNotWriteCapable,
     #[error("remote-write authority does not satisfy intent preconditions")]
     RemoteWriteIntentAuthorityMismatch,
+    #[error("remote-write authority requires a fully caught-up catalog with no open window")]
+    RemoteWriteAuthorityCatalogNotReady,
+    #[error("remote-write authority cursor does not match the durable catalog")]
+    RemoteWriteAuthorityCursorMismatch,
+    #[error("remote-write authority item count does not match the durable catalog")]
+    RemoteWriteAuthorityCountMismatch,
     #[error("SQLite schema version {found} is newer than supported version {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     #[error("remote catalog does not have a complete authoritative snapshot")]
@@ -7311,9 +7642,9 @@ mod phase5c10_directory_receipt_tests {
     }
 
     #[test]
-    fn schema_v15_contains_directory_receipts() {
+    fn schema_v16_contains_directory_receipts() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 15);
+        assert_eq!(storage.schema_version().unwrap(), 16);
 
         let exists: i64 = storage
             .connection
@@ -7864,9 +8195,9 @@ mod phase5f1_local_inventory_tests {
     }
 
     #[test]
-    fn phase5f1_schema_is_v15() {
+    fn phase5f1_schema_is_v16() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 15);
+        assert_eq!(storage.schema_version().unwrap(), 16);
     }
 }
 
@@ -8012,9 +8343,9 @@ mod phase5f4_local_journal_tests {
     }
 
     #[test]
-    fn phase5f4_schema_is_v15() {
+    fn phase5f4_schema_is_v16() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 15);
+        assert_eq!(storage.schema_version().unwrap(), 16);
     }
 }
 
@@ -8125,9 +8456,9 @@ mod phase5f5_observation_fence_tests {
     }
 
     #[test]
-    fn phase5f5_schema_is_v15() {
+    fn phase5f5_schema_is_v16() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 15);
+        assert_eq!(storage.schema_version().unwrap(), 16);
     }
 }
 
@@ -8220,9 +8551,9 @@ mod phase5h1_remote_write_intent_foundation_tests {
     }
 
     #[test]
-    fn phase5h1_schema_is_v15_and_tables_exist() {
+    fn phase5h1_schema_is_v16_and_tables_exist() {
         let storage = Storage::open_in_memory().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 15);
+        assert_eq!(storage.schema_version().unwrap(), 16);
         for table in [
             "sync_root_remote_write_authority",
             "sync_root_remote_write_intents",
@@ -8573,5 +8904,150 @@ mod phase5h2_remote_write_authority_observation_tests {
                 .unwrap()
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5h3_remote_write_planner_storage_tests {
+    use super::*;
+
+    fn ready_root() -> (Storage, SyncRoot, ChangeCursor) {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5h3-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h3-root",
+            provider,
+            account.subject,
+            "/tmp/phase5h3-root",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let item = RemoteItem {
+            remote_id: "remote-file".into(),
+            parent_remote_id: Some("remote-root".into()),
+            name: "file.txt".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(4),
+            modified_unix_ms: None,
+            trashed: false,
+        };
+
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(&root.id, &[item], 3)
+            .unwrap();
+        let bootstrap = ChangeCursor::new("phase5h3-bootstrap").unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(&root.id, &bootstrap, 4)
+            .unwrap();
+
+        let current = ChangeCursor::new("phase5h3-current").unwrap();
+        storage
+            .commit_sync_root_catalog_batch_and_cursor(&root.id, &bootstrap, &[], &current, 5)
+            .unwrap();
+
+        (storage, root, current)
+    }
+
+    #[test]
+    fn phase5h3_schema_is_v16_and_authority_state_is_cursor_bound() {
+        let (mut storage, root, cursor) = ready_root();
+        assert_eq!(storage.schema_version().unwrap(), 16);
+
+        let authorities = vec![
+            RemoteWriteAuthoritySnapshot::new("remote-root", 10, None, None, true, true, true, 20)
+                .unwrap(),
+            RemoteWriteAuthoritySnapshot::new(
+                "remote-file",
+                11,
+                Some("md5".into()),
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                true,
+                true,
+                false,
+                20,
+            )
+            .unwrap(),
+        ];
+
+        assert_eq!(
+            storage
+                .commit_sync_root_remote_write_authority_snapshot(
+                    &root.id,
+                    &cursor,
+                    &authorities,
+                    20,
+                )
+                .unwrap(),
+            2
+        );
+
+        let state = storage
+            .sync_root_remote_write_authority_state(&root.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.change_cursor, cursor);
+        assert_eq!(state.item_count, 2);
+        assert_eq!(
+            storage
+                .list_sync_root_remote_write_authorities(&root.id)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn phase5h3_pending_event_records_round_trip_with_redacted_debug() {
+        let (mut storage, root, _) = ready_root();
+
+        let baseline = vec![
+            LocalItemSnapshot::new("private.txt", LocalItemKind::File, Some(4), 10, 8, 9).unwrap(),
+        ];
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_local_inventory_items(&root.id, &baseline, 10)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 11)
+            .unwrap();
+
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        storage
+            .reconcile_sync_root_local_change_journal(
+                &root.id,
+                state.generation,
+                state.item_count,
+                state.snapshot_completed_at_unix_ms,
+                &[LocalChangeEventInput::new(
+                    "private.txt",
+                    LocalChangeEventKind::Modified,
+                    Some(LocalItemKind::File),
+                    Some(LocalItemKind::File),
+                )
+                .unwrap()],
+                12,
+            )
+            .unwrap();
+
+        let events = storage
+            .list_pending_sync_root_local_change_events(&root.id, state.generation)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, LocalChangeEventKind::Modified);
+        assert_eq!(events[0].relative_path(), "private.txt");
+        assert!(!format!("{:?}", events[0]).contains("private.txt"));
     }
 }

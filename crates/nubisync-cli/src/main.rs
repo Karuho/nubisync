@@ -23,11 +23,11 @@ use nubisync_daemon::{
     materialize_selected_root_missing_files, plan_selected_root_local_inventory_diff,
     plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
     plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
-    plan_selected_root_remote_replacement, plan_selected_root_stale_files,
-    plan_selected_root_unified_convergence_step, replace_selected_root_existing_file,
-    replace_selected_root_stale_files, try_acquire_selected_root_cross_process_execution_lock,
-    verify_selected_root_existing_file, verify_selected_root_existing_files,
-    verify_selected_root_local_receipts,
+    plan_selected_root_remote_replacement, plan_selected_root_remote_write_intents,
+    plan_selected_root_stale_files, plan_selected_root_unified_convergence_step,
+    replace_selected_root_existing_file, replace_selected_root_stale_files,
+    try_acquire_selected_root_cross_process_execution_lock, verify_selected_root_existing_file,
+    verify_selected_root_existing_files, verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
     GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
@@ -179,6 +179,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_observe_write_authority()
+        }
+        [sync, roots, remote_write_plan, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && remote_write_plan == "remote-write-plan"
+                && approve == "--approve" =>
+        {
+            sync_roots_remote_write_plan()
         }
         [sync, roots, convergence_plan, approve]
             if sync == "sync"
@@ -434,6 +442,7 @@ USAGE:
   nubisync sync roots local-diff --approve
   nubisync sync roots local-journal --approve
   nubisync sync roots observe-write-authority --approve
+  nubisync sync roots remote-write-plan --approve
   nubisync sync roots convergence-plan --approve
   nubisync sync roots converge --approve
   nubisync sync roots stale-files-plan --approve
@@ -959,13 +968,22 @@ fn sync_roots_observe_write_authority() -> Result<(), CliError> {
     }
 
     println!("SYNC_ROOT_WRITE_AUTHORITY_STAGE=commit_snapshot");
-    let persisted =
-        storage.replace_sync_root_remote_write_authority_snapshot(&root.id, &authorities)?;
+    let persisted = storage.commit_sync_root_remote_write_authority_snapshot(
+        &root.id,
+        &durable_cursor,
+        &authorities,
+        observed_at_unix_ms,
+    )?;
     let durable_count = storage.sync_root_remote_write_authority_count(&root.id)?;
+    let authority_state = storage
+        .sync_root_remote_write_authority_state(&root.id)?
+        .ok_or(CliError::SyncRootWriteAuthorityPersistenceMismatch)?;
 
     if persisted != authorities.len()
         || durable_count
             != u64::try_from(authorities.len()).map_err(|_| CliError::NumericOverflow)?
+        || authority_state.change_cursor != durable_cursor
+        || authority_state.item_count != durable_count
     {
         return Err(CliError::SyncRootWriteAuthorityPersistenceMismatch);
     }
@@ -998,8 +1016,79 @@ fn sync_roots_observe_write_authority() -> Result<(), CliError> {
     println!("CAN_ADD_CHILDREN={add_children}");
     println!("REMOTE_CURSOR_STABLE=yes");
     println!("CATALOG_CURSOR_MATCH=yes");
+    println!("AUTHORITY_CURSOR_BOUND=yes");
     println!("NETWORK_CHECK=performed");
     println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUES_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("OAUTH_FULLSYNC_ACTIVATED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    Ok(())
+}
+
+fn sync_roots_remote_write_plan() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootRemoteWritePlanSelectionFailed);
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootRemoteWritePlanSelectionFailed)?;
+
+    // Phase 5H3 intentionally has no FullSync credential activation path.
+    // Only the future supervised FullSync phase may set this gate true.
+    let full_sync_credential_present = false;
+
+    println!("SYNC_ROOT_REMOTE_WRITE_PLAN_STAGE=scan_and_validate");
+    let plan =
+        plan_selected_root_remote_write_intents(&storage, &root, full_sync_credential_present)?;
+
+    println!("SYNC_ROOT_REMOTE_WRITE_PLAN=PASS");
+    println!("MODE={}", root.mode.as_str());
+    println!("BASELINE_GENERATION={}", plan.baseline_generation);
+    println!("PENDING_EVENTS={}", plan.pending_events);
+    println!("CREATE_FILE_NEEDS_ID={}", plan.create_file_needs_id);
+    println!("CREATE_FOLDER_NEEDS_ID={}", plan.create_folder_needs_id);
+    println!("UPDATE_FILE_READY={}", plan.update_file_ready);
+    println!("TRASH_ITEM_READY={}", plan.trash_item_ready);
+    println!("CONFLICTS={}", plan.conflicts);
+    println!("BLOCKED_IDENTITY={}", plan.blocked_identity);
+    println!("BLOCKED_AUTHORITY={}", plan.blocked_authority);
+    println!("ROOT_WRITE_CAPABLE={}", yes_no(plan.root_write_capable));
+    println!(
+        "FULLSYNC_CREDENTIAL_PRESENT={}",
+        yes_no(plan.full_sync_credential_present)
+    );
+    println!(
+        "WRITE_GATES_SATISFIED={}",
+        yes_no(plan.write_gates_satisfied())
+    );
+    println!(
+        "PERSISTABLE_EXISTING_INTENTS={}",
+        plan.persistable_existing_intents()
+    );
+    println!("PREDETERMINED_CREATE_IDS_ALLOCATED=no");
+    println!("INTENTS_PERSISTED=0");
+    println!("NETWORK_CHECK=not_performed");
+    println!("DATABASE_MUTATION=no");
+    println!("FILESYSTEM_READ=metadata_only");
     println!("FILESYSTEM_MUTATION=no");
     println!("FILE_CONTENT_ACCESSED=no");
     println!("ROOT_PATH_PRINTED=no");
@@ -4987,6 +5076,7 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "local-diff"
                 | "local-journal"
                 | "observe-write-authority"
+                | "remote-write-plan"
                 | "convergence-plan"
                 | "converge"
                 | "stale-files-plan"
@@ -5084,6 +5174,15 @@ mod sync_root_cli_tests {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(!cli_requires_cross_process_execution_lock(&args));
         }
+    }
+
+    #[test]
+    fn phase5h3_execution_lock_policy_covers_remote_write_planner() {
+        let args = ["sync", "roots", "remote-write-plan", "--approve"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(cli_requires_cross_process_execution_lock(&args));
     }
 
     #[test]
@@ -5338,6 +5437,8 @@ enum CliError {
     SyncRootWriteAuthorityRemoteChangedDuringObservation,
     #[error("sync root write-authority snapshot persistence did not match observation")]
     SyncRootWriteAuthorityPersistenceMismatch,
+    #[error("sync root remote-write planner selection failed")]
+    SyncRootRemoteWritePlanSelectionFailed,
     #[error("sync root reconciliation-plan selection failed")]
     SyncRootReconcilePlanSelectionFailed,
     #[error("selected receive-only file is not ready for safe replacement")]
