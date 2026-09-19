@@ -96,7 +96,8 @@ fn print_help() {
     println!("  nubisyncd run --max-ticks <1..10000>");
     println!("  nubisyncd --version");
     println!();
-    println!("MODE=receive_only");
+    println!("SUPPORTED_RUNTIME_MODES=receive_only,two_way_standby");
+    println!("TWO_WAY_EXECUTION_ENABLED=no");
     println!("POLL_INTERVAL_SECONDS=30");
     println!("SINGLE_FLIGHT_SCOPE=in_process");
     println!("CROSS_PROCESS_LOCK_SCOPE=user_global_sync_execution");
@@ -120,6 +121,103 @@ struct DaemonRuntimeConfig {
     keyring: KeyringSecretStore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonRootExecutionMode {
+    ReceiveOnly,
+    WriteCapableStandby,
+}
+
+fn classify_daemon_root_execution_mode(
+    mode: SyncMode,
+) -> Result<DaemonRootExecutionMode, DaemonError> {
+    match mode {
+        SyncMode::ReceiveOnly => Ok(DaemonRootExecutionMode::ReceiveOnly),
+        SyncMode::TwoWay => Ok(DaemonRootExecutionMode::WriteCapableStandby),
+        SyncMode::MirrorLocalToRemote => Err(DaemonError::SyncRootModeUnsupported),
+    }
+}
+
+fn configured_root(storage: &Storage) -> Result<SyncRoot, DaemonError> {
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    match roots.len() {
+        0 => Err(DaemonError::NoConfiguredRoot),
+        1 => roots
+            .into_iter()
+            .next()
+            .ok_or(DaemonError::NoConfiguredRoot),
+        _ => Err(DaemonError::MultipleRootsUnsupported),
+    }
+}
+
+fn run_write_capable_standby(
+    storage: &Storage,
+    shutdown_requested: &Arc<AtomicBool>,
+    max_ticks: Option<usize>,
+) -> Result<(), DaemonError> {
+    const STANDBY_HEARTBEAT_MS: i64 = 1_000;
+    let mut heartbeats = 0usize;
+
+    println!("NUBISYNCD=STARTED");
+    println!("MODE=two_way");
+    println!("WRITE_CAPABLE_STANDBY=yes");
+    println!("REMOTE_WRITE_EXECUTION_ENABLED=no");
+    println!("FULLSYNC_CREDENTIAL_LOADED=no");
+    println!("NETWORK_CHECK=not_performed");
+    println!("FILESYSTEM_SCAN=not_performed");
+    println!("DATABASE_MUTATION=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
+
+    loop {
+        if shutdown_requested.load(Ordering::SeqCst) {
+            println!("NUBISYNCD=STOPPED");
+            println!("STOP_REASON=signal");
+            println!("STANDBY_HEARTBEATS={heartbeats}");
+            println!("DRIVE_WRITE_ACCESS=no");
+            return Ok(());
+        }
+
+        if max_ticks.is_some_and(|limit| heartbeats >= limit) {
+            println!("NUBISYNCD=STOPPED");
+            println!("STOP_REASON=bounded_standby_completed");
+            println!("STANDBY_HEARTBEATS={heartbeats}");
+            println!("DRIVE_WRITE_ACCESS=no");
+            return Ok(());
+        }
+
+        let root = configured_root(storage)?;
+        match classify_daemon_root_execution_mode(root.mode)? {
+            DaemonRootExecutionMode::WriteCapableStandby => {}
+            DaemonRootExecutionMode::ReceiveOnly => {
+                println!("NUBISYNCD=STOPPED");
+                println!("STOP_REASON=root_mode_changed_restart_required");
+                println!("STANDBY_HEARTBEATS={heartbeats}");
+                println!("DRIVE_WRITE_ACCESS=no");
+                return Ok(());
+            }
+        }
+
+        if sleep_interruptibly(STANDBY_HEARTBEAT_MS, shutdown_requested)? {
+            continue;
+        }
+
+        heartbeats = heartbeats
+            .checked_add(1)
+            .ok_or(DaemonError::NumericOverflow)?;
+
+        if heartbeats == 1 {
+            println!("NUBISYNCD_STANDBY=PASS");
+            println!("MODE=two_way");
+            println!("NETWORK_CHECK=not_performed");
+            println!("FILESYSTEM_SCAN=not_performed");
+            println!("REMOTE_WRITE_EXECUTION_ENABLED=no");
+            println!("DRIVE_WRITE_ACCESS=no");
+        }
+    }
+}
+
 fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
     let db_path = nubisync_database_path()?;
     if !db_path.exists() {
@@ -127,12 +225,21 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
     }
 
     let mut storage = Storage::open(&db_path)?;
+    let shutdown_requested = install_shutdown_handler()?;
+
+    let initial_root = configured_root(&storage)?;
+    match classify_daemon_root_execution_mode(initial_root.mode)? {
+        DaemonRootExecutionMode::WriteCapableStandby => {
+            return run_write_capable_standby(&storage, &shutdown_requested, max_ticks);
+        }
+        DaemonRootExecutionMode::ReceiveOnly => {}
+    }
+
     let mut config = load_runtime_config(&storage)?;
     let mut session: Option<DriveSession> = None;
     let now = unix_time_ms()?;
     let mut scheduler = SelectedRootReceiveOnlyPeriodicState::new_immediate(now);
     let execution_lock_path = nubisync_execution_lock_path()?;
-    let shutdown_requested = install_shutdown_handler()?;
     let mut executed_ticks = 0usize;
 
     println!("NUBISYNCD=STARTED");
@@ -155,6 +262,17 @@ fn run_periodic_daemon(max_ticks: Option<usize>) -> Result<(), DaemonError> {
     loop {
         if shutdown_requested.load(Ordering::SeqCst) {
             scheduler.request_shutdown();
+        }
+
+        let current_root = configured_root(&storage)?;
+        match classify_daemon_root_execution_mode(current_root.mode)? {
+            DaemonRootExecutionMode::ReceiveOnly => {}
+            DaemonRootExecutionMode::WriteCapableStandby => {
+                println!("NUBISYNCD_MODE_TRANSITION=two_way_standby");
+                println!("REMOTE_WRITE_EXECUTION_ENABLED=no");
+                println!("DRIVE_WRITE_ACCESS=no");
+                return run_write_capable_standby(&storage, &shutdown_requested, max_ticks);
+            }
         }
 
         if max_ticks.is_some_and(|limit| executed_ticks >= limit) {
@@ -679,6 +797,27 @@ impl DaemonError {
             Self::Drive(_) => "drive_error",
             Self::Executor(_) => "receive_only_executor_error",
         }
+    }
+}
+
+#[cfg(test)]
+mod phase5h5_write_capable_standby_tests {
+    use super::*;
+
+    #[test]
+    fn phase5h5_runtime_mode_classification_never_routes_two_way_to_receive_only() {
+        assert_eq!(
+            classify_daemon_root_execution_mode(SyncMode::ReceiveOnly).unwrap(),
+            DaemonRootExecutionMode::ReceiveOnly
+        );
+        assert_eq!(
+            classify_daemon_root_execution_mode(SyncMode::TwoWay).unwrap(),
+            DaemonRootExecutionMode::WriteCapableStandby
+        );
+        assert!(matches!(
+            classify_daemon_root_execution_mode(SyncMode::MirrorLocalToRemote),
+            Err(DaemonError::SyncRootModeUnsupported)
+        ));
     }
 }
 

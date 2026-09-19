@@ -198,6 +198,22 @@ fn run() -> Result<(), CliError> {
         {
             sync_roots_remote_write_plan()
         }
+        [sync, roots, activate_two_way, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && activate_two_way == "activate-two-way"
+                && approve == "--approve" =>
+        {
+            sync_roots_activate_two_way()
+        }
+        [sync, roots, deactivate_two_way, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && deactivate_two_way == "deactivate-two-way"
+                && approve == "--approve" =>
+        {
+            sync_roots_deactivate_two_way()
+        }
         [sync, roots, convergence_plan, approve]
             if sync == "sync"
                 && roots == "roots"
@@ -454,6 +470,8 @@ USAGE:
   nubisync sync roots local-journal --approve
   nubisync sync roots observe-write-authority --approve
   nubisync sync roots remote-write-plan --approve
+  nubisync sync roots activate-two-way --approve
+  nubisync sync roots deactivate-two-way --approve
   nubisync sync roots convergence-plan --approve
   nubisync sync roots converge --approve
   nubisync sync roots stale-files-plan --approve
@@ -1072,9 +1090,11 @@ fn sync_roots_remote_write_plan() -> Result<(), CliError> {
         .next()
         .ok_or(CliError::SyncRootRemoteWritePlanSelectionFailed)?;
 
-    // Phase 5H3 intentionally has no FullSync credential activation path.
-    // Only the future supervised FullSync phase may set this gate true.
-    let full_sync_credential_present = false;
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let full_sync_credential_present = keyring
+        .get(&fullsync_refresh_token_key(&account.subject)?)?
+        .is_some();
 
     println!("SYNC_ROOT_REMOTE_WRITE_PLAN_STAGE=scan_and_validate");
     let plan =
@@ -1120,6 +1140,213 @@ fn sync_roots_remote_write_plan() -> Result<(), CliError> {
     println!("OAUTH_FULLSYNC_ACTIVATED=no");
     println!("DRIVE_WRITE_ACCESS=no");
 
+    Ok(())
+}
+
+fn sync_roots_activate_two_way() -> Result<(), CliError> {
+    ensure_keyring_available()?;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootTwoWayActivationSelectionFailed);
+    }
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootTwoWayActivationSelectionFailed)?;
+
+    if root.mode == SyncMode::TwoWay {
+        println!("SYNC_ROOT_TWO_WAY_ACTIVATION=ALREADY_ACTIVE");
+        println!("MODE=two_way");
+        println!("DATABASE_MUTATION=no");
+        println!("PROVIDER_WRITE_METHOD_CALLED=no");
+        println!("REMOTE_WRITE_EXECUTION_ENABLED=no");
+        println!("DRIVE_WRITE_ACCESS=credential_only");
+        return Ok(());
+    }
+    if root.mode != SyncMode::ReceiveOnly {
+        return Err(CliError::SyncRootTwoWayActivationModeUnsupported);
+    }
+
+    println!("SYNC_ROOT_TWO_WAY_ACTIVATION_STAGE=validate_receive_only_state");
+    let convergence = plan_selected_root_receive_only_convergence(&storage, &root)?;
+    if convergence.blocked() || convergence.action_count() != 0 {
+        return Err(CliError::SyncRootTwoWayActivationReceiveOnlyNotConverged);
+    }
+
+    let local_state = storage.sync_root_local_inventory_state(&root.id)?;
+    if !local_state.snapshot_complete || !local_state.observation_valid {
+        return Err(CliError::SyncRootTwoWayActivationLocalStateNotReady);
+    }
+    if storage.pending_sync_root_local_change_event_count(&root.id, local_state.generation)? != 0 {
+        return Err(CliError::SyncRootTwoWayActivationLocalJournalNotClean);
+    }
+
+    let remote_state = storage.sync_root_remote_inventory_state(&root.id)?;
+    if !remote_state.ready_for_reconciliation()
+        || storage.sync_root_change_window_state(&root.id)?.is_some()
+    {
+        return Err(CliError::SyncRootTwoWayActivationRemoteStateNotReady);
+    }
+    let remote_cursor = storage
+        .sync_root_change_cursor(&root.id)?
+        .ok_or(CliError::SyncRootTwoWayActivationRemoteStateNotReady)?;
+
+    let authority_state = storage
+        .sync_root_remote_write_authority_state(&root.id)?
+        .ok_or(CliError::SyncRootTwoWayActivationAuthorityNotReady)?;
+    if authority_state.change_cursor != remote_cursor {
+        return Err(CliError::SyncRootTwoWayActivationAuthorityNotReady);
+    }
+    let expected_authority_count = remote_state
+        .item_count
+        .checked_add(1)
+        .ok_or(CliError::NumericOverflow)?;
+    if authority_state.item_count != expected_authority_count
+        || storage.sync_root_remote_write_authority_count(&root.id)? != expected_authority_count
+    {
+        return Err(CliError::SyncRootTwoWayActivationAuthorityNotReady);
+    }
+
+    if storage.sync_root_remote_write_intent_count(&root.id)? != 0 {
+        return Err(CliError::SyncRootTwoWayActivationExistingIntents);
+    }
+
+    let keyring = KeyringSecretStore::default();
+    let fullsync_key = fullsync_refresh_token_key(&account.subject)?;
+    let fullsync_refresh_token = required_secret_utf8(
+        keyring.get(&fullsync_key)?,
+        CliError::MissingStoredFullSyncRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+
+    println!("SYNC_ROOT_TWO_WAY_ACTIVATION_STAGE=verify_fullsync_credential");
+    let tokens = oauth.refresh_access_token(&fullsync_refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_FULL_SCOPE)
+    {
+        return Err(CliError::GoogleFullSyncScopeNotGranted);
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &fullsync_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("SYNC_ROOT_TWO_WAY_ACTIVATION_STAGE=validate_write_plan");
+    let plan = plan_selected_root_remote_write_intents(&storage, &root, true)?;
+    if plan.pending_events != 0
+        || plan.create_file_needs_id != 0
+        || plan.create_folder_needs_id != 0
+        || plan.update_file_ready != 0
+        || plan.trash_item_ready != 0
+        || plan.conflicts != 0
+        || plan.blocked_identity != 0
+        || plan.blocked_authority != 0
+    {
+        return Err(CliError::SyncRootTwoWayActivationPlannerNotClean);
+    }
+
+    println!("SYNC_ROOT_TWO_WAY_ACTIVATION_STAGE=activate_mode_gate");
+    if !storage.update_sync_root_mode_if_expected(
+        &root.id,
+        SyncMode::ReceiveOnly,
+        SyncMode::TwoWay,
+    )? {
+        return Err(CliError::SyncRootTwoWayActivationCompareAndSetFailed);
+    }
+
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 || roots[0].mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootTwoWayActivationPostconditionFailed);
+    }
+
+    println!("SYNC_ROOT_TWO_WAY_ACTIVATION=PASS");
+    println!("PREVIOUS_MODE=receive_only");
+    println!("MODE=two_way");
+    println!("FULLSYNC_CREDENTIAL_VERIFIED=yes");
+    println!("ACCOUNT_SUBJECT_MATCH=yes");
+    println!("RECEIVE_ONLY_CONVERGED=yes");
+    println!("LOCAL_JOURNAL_PENDING=0");
+    println!("REMOTE_CATALOG_CURRENT=yes");
+    println!("AUTHORITY_CURSOR_MATCH=yes");
+    println!("REMOTE_WRITE_INTENTS_EXISTING=0");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("PROVIDER_WRITE_METHOD_CALLED=no");
+    println!("REMOTE_WRITE_INTENT_PERSISTED=no");
+    println!("REMOTE_WRITE_EXECUTION_ENABLED=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=credential_and_root_gate_only");
+
+    Ok(())
+}
+
+fn sync_roots_deactivate_two_way() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootTwoWayActivationSelectionFailed);
+    }
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootTwoWayActivationSelectionFailed)?;
+
+    if root.mode == SyncMode::ReceiveOnly {
+        println!("SYNC_ROOT_TWO_WAY_DEACTIVATION=ALREADY_RECEIVE_ONLY");
+        println!("MODE=receive_only");
+        println!("DATABASE_MUTATION=no");
+        println!("DRIVE_WRITE_ACCESS=no");
+        return Ok(());
+    }
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootTwoWayActivationModeUnsupported);
+    }
+
+    if !storage.update_sync_root_mode_if_expected(
+        &root.id,
+        SyncMode::TwoWay,
+        SyncMode::ReceiveOnly,
+    )? {
+        return Err(CliError::SyncRootTwoWayActivationCompareAndSetFailed);
+    }
+
+    println!("SYNC_ROOT_TWO_WAY_DEACTIVATION=PASS");
+    println!("PREVIOUS_MODE=two_way");
+    println!("MODE=receive_only");
+    println!("DATABASE_MUTATION=yes");
+    println!("PROVIDER_WRITE_METHOD_CALLED=no");
+    println!("REMOTE_WRITE_EXECUTION_ENABLED=no");
+    println!("DRIVE_WRITE_ACCESS=no");
     Ok(())
 }
 
@@ -5266,6 +5493,8 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "local-journal"
                 | "observe-write-authority"
                 | "remote-write-plan"
+                | "activate-two-way"
+                | "deactivate-two-way"
                 | "convergence-plan"
                 | "converge"
                 | "stale-files-plan"
@@ -5367,6 +5596,17 @@ mod sync_root_cli_tests {
         ] {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(!cli_requires_cross_process_execution_lock(&args));
+        }
+    }
+
+    #[test]
+    fn phase5h5_execution_lock_covers_two_way_mode_gate_changes() {
+        for args in [
+            ["sync", "roots", "activate-two-way", "--approve"],
+            ["sync", "roots", "deactivate-two-way", "--approve"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(cli_requires_cross_process_execution_lock(&args));
         }
     }
 
@@ -5676,6 +5916,30 @@ enum CliError {
     SyncRootWriteAuthorityPersistenceMismatch,
     #[error("sync root remote-write planner selection failed")]
     SyncRootRemoteWritePlanSelectionFailed,
+    #[error("sync root two-way activation selection failed")]
+    SyncRootTwoWayActivationSelectionFailed,
+    #[error("sync root mode is not eligible for two-way activation")]
+    SyncRootTwoWayActivationModeUnsupported,
+    #[error("receive-only state is not fully converged")]
+    SyncRootTwoWayActivationReceiveOnlyNotConverged,
+    #[error("local baseline is not ready for two-way activation")]
+    SyncRootTwoWayActivationLocalStateNotReady,
+    #[error("local change journal is not clean for two-way activation")]
+    SyncRootTwoWayActivationLocalJournalNotClean,
+    #[error("remote catalog is not ready for two-way activation")]
+    SyncRootTwoWayActivationRemoteStateNotReady,
+    #[error("remote write-authority snapshot is not current for two-way activation")]
+    SyncRootTwoWayActivationAuthorityNotReady,
+    #[error("existing remote-write intents block two-way activation")]
+    SyncRootTwoWayActivationExistingIntents,
+    #[error("stored FullSync refresh token is missing")]
+    MissingStoredFullSyncRefreshToken,
+    #[error("remote-write planner is not clean for two-way activation")]
+    SyncRootTwoWayActivationPlannerNotClean,
+    #[error("two-way mode compare-and-set failed")]
+    SyncRootTwoWayActivationCompareAndSetFailed,
+    #[error("two-way mode activation postcondition failed")]
+    SyncRootTwoWayActivationPostconditionFailed,
     #[error("sync root reconciliation-plan selection failed")]
     SyncRootReconcilePlanSelectionFailed,
     #[error("selected receive-only file is not ready for safe replacement")]

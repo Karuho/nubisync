@@ -1371,6 +1371,21 @@ impl Storage {
         Ok(roots)
     }
 
+    pub fn update_sync_root_mode_if_expected(
+        &self,
+        sync_root_id: &str,
+        expected_mode: SyncMode,
+        new_mode: SyncMode,
+    ) -> Result<bool, StorageError> {
+        let changed = self.connection.execute(
+            "UPDATE sync_roots
+             SET mode=?1
+             WHERE id=?2 AND mode=?3",
+            params![new_mode.as_str(), sync_root_id, expected_mode.as_str()],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn sync_root_count(
         &self,
         provider: &ProviderId,
@@ -2217,6 +2232,19 @@ impl Storage {
             relative_path,
             status: RemoteWriteIntentStatus::parse(&status)?,
         }))
+    }
+
+    pub fn sync_root_remote_write_intent_count(
+        &self,
+        sync_root_id: &str,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM sync_root_remote_write_intents
+             WHERE sync_root_id=?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
     }
 
     pub fn planned_sync_root_remote_write_intent_count(
@@ -9049,5 +9077,81 @@ mod phase5h3_remote_write_planner_storage_tests {
         assert_eq!(events[0].kind, LocalChangeEventKind::Modified);
         assert_eq!(events[0].relative_path(), "private.txt");
         assert!(!format!("{:?}", events[0]).contains("private.txt"));
+    }
+}
+
+#[cfg(test)]
+mod phase5h5_root_authority_storage_tests {
+    use super::*;
+
+    #[test]
+    fn phase5h5_sync_root_mode_change_is_compare_and_set() {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5h5-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h5-root",
+            provider.clone(),
+            account.subject.clone(),
+            "/tmp/phase5h5-root",
+            Some("remote-root".into()),
+            SyncMode::ReceiveOnly,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        assert!(
+            storage
+                .update_sync_root_mode_if_expected(
+                    &root.id,
+                    SyncMode::ReceiveOnly,
+                    SyncMode::TwoWay,
+                )
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .update_sync_root_mode_if_expected(
+                    &root.id,
+                    SyncMode::ReceiveOnly,
+                    SyncMode::TwoWay,
+                )
+                .unwrap()
+        );
+
+        let roots = storage
+            .list_sync_roots(&provider, &account.subject)
+            .unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].mode, SyncMode::TwoWay);
+
+        assert!(
+            storage
+                .update_sync_root_mode_if_expected(
+                    &root.id,
+                    SyncMode::TwoWay,
+                    SyncMode::ReceiveOnly,
+                )
+                .unwrap()
+        );
+        let roots = storage
+            .list_sync_roots(&provider, &account.subject)
+            .unwrap();
+        assert_eq!(roots[0].mode, SyncMode::ReceiveOnly);
+    }
+
+    #[test]
+    fn phase5h5_total_remote_write_intent_count_starts_zero() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert_eq!(
+            storage
+                .sync_root_remote_write_intent_count("missing-root")
+                .unwrap(),
+            0
+        );
     }
 }
