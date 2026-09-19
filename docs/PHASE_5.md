@@ -499,3 +499,30 @@ metadata, hashes, cursors or token values.
 
 Phase 5D4 deliberately does not execute replacement or deletion. Batch mutation is
 designed only after this multi-file stale-state planner is owner-proven.
+
+## Phase 5H — Remote-write boundary design audit
+
+Phase 5H freezes the safety contract for future local-to-remote synchronization.
+It does not add any Drive write method or stronger OAuth grant.
+
+The detailed frozen design is in:
+
+`docs/PHASE_5H_REMOTE_WRITE_BOUNDARY.md`
+
+Key decisions:
+
+- arbitrary selected-root full sync uses explicit `drive` authority rather than
+  silently assuming `drive.file` covers arbitrary existing descendants;
+- ReceiveOnly and FullSync credentials remain separate capabilities;
+- obtaining FullSync OAuth authority never changes root mode automatically;
+- local events must first become durable remote-write intents;
+- existing-target intents bind to fresh Drive `version` and remote identity;
+- creates use pre-generated Drive IDs for retry-safe identity;
+- initial deletion means Drive trash, never permanent `files.delete`;
+- HTTP success does not apply a local event until the Drive change stream
+  confirms the intended remote postcondition;
+- type changes, rename coalescing, Shared Drives, native Google documents,
+  permissions, and permanent deletion remain outside the first write boundary;
+- cross-process execution ownership remains mandatory.
+
+Phase 5H is documentation/design only and keeps `DRIVE_WRITE_ACCESS=no`.

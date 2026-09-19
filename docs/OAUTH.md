@@ -40,15 +40,25 @@ Used for the first real Phase 2 connection.
 
 `https://www.googleapis.com/auth/drive.readonly`
 
-Reserved for a later phase when actual file downloads are implemented.
+Active for ReceiveOnly content download/materialization. Existing ReceiveOnly
+installations remain valid without any Drive write grant.
 
 ### FullSync
 
 `https://www.googleapis.com/auth/drive`
 
-Reserved for the phase that implements and validates remote mutations.
+Reserved for an explicit later upgrade that implements and validates remote
+mutations. Phase 5H freezes the upgrade contract but does not activate it.
 
-NubiSync must not request a stronger access level merely because future code may need it.
+For the current arbitrary selected-root synchronization model, FullSync uses the
+restricted `drive` scope. `drive.file` is not treated as an equivalent drop-in
+replacement because its authority is limited to files specifically opened with
+or shared with the app.
+
+The future FullSync refresh token must use a distinct OS-keyring purpose from the
+ReceiveOnly refresh token. A failed FullSync authorization must leave the
+ReceiveOnly credential untouched. FullSync authorization must also remain
+separate from changing a root into a write-capable mode.
 
 ## Identity scopes
 
@@ -127,3 +137,19 @@ The resulting access token remains memory-only.
 Before accepting a refreshed session, NubiSync calls OpenID Connect UserInfo and verifies that the returned stable `sub` is identical to the account subject stored in SQLite. A mismatch fails closed.
 
 Development OAuth client configuration is also kept in the OS credential store so subsequent launches do not depend on shell environment variables.
+
+## FullSync upgrade boundary
+
+The frozen Phase 5H design requires two independent gates before remote writes:
+
+1. an explicitly authorized FullSync credential with exact `drive` scope and
+   matching Google subject;
+2. a separately owner-approved write-capable sync-root mode.
+
+Neither gate implies the other.
+
+A future supervised upgrade command must require a fresh refresh token, validate
+the exact scope and stable account subject, and only then store the FullSync
+refresh token under its own keyring purpose. Access tokens remain memory-only.
+
+See `docs/PHASE_5H_REMOTE_WRITE_BOUNDARY.md`.
