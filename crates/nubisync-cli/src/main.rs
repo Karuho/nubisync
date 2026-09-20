@@ -271,6 +271,14 @@ fn run() -> Result<(), CliError> {
         {
             sync_roots_confirm_folder_create()
         }
+        [sync, roots, confirm_file_create, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && confirm_file_create == "confirm-file-create"
+                && approve == "--approve" =>
+        {
+            sync_roots_confirm_file_create()
+        }
         [sync, roots, settle_confirmed_folder_create, approve]
             if sync == "sync"
                 && roots == "roots"
@@ -559,6 +567,7 @@ USAGE:
   nubisync sync roots submit-file-create --approve
   nubisync sync roots recover-file-create-submission --approve
   nubisync sync roots confirm-folder-create --approve
+  nubisync sync roots confirm-file-create --approve
   nubisync sync roots settle-confirmed-folder-create --approve
   nubisync sync roots activate-two-way --approve
   nubisync sync roots deactivate-two-way --approve
@@ -1631,6 +1640,26 @@ fn file_create_leaf_name(relative_path: &str) -> Result<&str, CliError> {
         .ok_or(CliError::SyncRootFileCreateLocalIdentityMismatch)
 }
 
+fn file_create_target_change_exact(
+    change: &RemoteChange,
+    target_remote_id: &str,
+    expected_name: &str,
+    expected_parent_remote_id: &str,
+    expected_size_bytes: u64,
+) -> Option<bool> {
+    match change {
+        RemoteChange::Upsert(item) if item.remote_id == target_remote_id => Some(
+            item.name == expected_name
+                && item.kind == RemoteItemKind::File
+                && item.parent_remote_id.as_deref() == Some(expected_parent_remote_id)
+                && item.size_bytes == Some(expected_size_bytes)
+                && !item.trashed,
+        ),
+        RemoteChange::Delete { remote_id } if remote_id == target_remote_id => Some(false),
+        _ => None,
+    }
+}
+
 fn sync_roots_submit_file_create() -> Result<(), CliError> {
     let db_path = nubisync_database_path()?;
     if !db_path.exists() {
@@ -2583,6 +2612,350 @@ fn sync_roots_settle_confirmed_folder_create() -> Result<(), CliError> {
     println!("REMOTE_IDS_PRINTED=no");
     println!("TOKEN_VALUES_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=no_remote_call");
+    Ok(())
+}
+
+fn sync_roots_confirm_file_create() -> Result<(), CliError> {
+    const MAX_CONFIRMATION_PAGES_PER_APPROVAL: usize = 64;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootFileCreateConfirmationSelectionFailed);
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootFileCreateConfirmationSelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootFileCreateConfirmationModeUnsupported);
+    }
+
+    let candidates = storage.list_sync_root_file_create_candidates(
+        &root.id,
+        RemoteWriteIntentStatus::AwaitingConfirmation,
+    )?;
+
+    if candidates.is_empty() {
+        println!("SYNC_ROOT_FILE_CREATE_CONFIRMATION=PASS");
+        println!("MODE=two_way");
+        println!("AWAITING_CONFIRMATION_INTENTS=0");
+        println!("SELECTED_INTENTS=0");
+        println!("CHANGE_STREAM_SCAN=not_performed");
+        println!("PROVIDER_METADATA_CHECK=not_performed");
+        println!("TARGET_CHANGE_OBSERVED=no");
+        println!("CURSOR_ADVANCED=no");
+        println!("INTENT_STATUS_AFTER=none");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILESYSTEM_READ=not_performed");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("PROVIDER_WRITE_METHOD_CALLED=no");
+        println!("REMOTE_OBJECT_MUTATION=no");
+        println!("LOCAL_EVENT_APPLIED=no");
+        println!("BASELINE_ADVANCED=no");
+        println!("REMOTE_IDS_PRINTED=no");
+        println!("REMOTE_METADATA_PRINTED=no");
+        println!("HASH_VALUE_PRINTED=no");
+        println!("CURSOR_VALUES_PRINTED=no");
+        println!("TOKEN_VALUES_PRINTED=no");
+        println!("DRIVE_WRITE_ACCESS=no_remote_call");
+        return Ok(());
+    }
+
+    if candidates.len() != 1 {
+        return Err(CliError::SyncRootFileCreateConfirmationSelectionFailed);
+    }
+
+    let candidate = candidates
+        .first()
+        .cloned()
+        .ok_or(CliError::SyncRootFileCreateConfirmationSelectionFailed)?;
+
+    let execution_state = storage
+        .sync_root_remote_write_intent_execution_state(candidate.intent_id)?
+        .ok_or(CliError::SyncRootFileCreateConfirmationStateMismatch)?;
+    if execution_state.status != RemoteWriteIntentStatus::AwaitingConfirmation
+        || execution_state.execution_generation != candidate.execution_generation
+    {
+        return Err(CliError::SyncRootFileCreateConfirmationStateMismatch);
+    }
+
+    let pre_submit_cursor = execution_state
+        .pre_submit_change_cursor()
+        .cloned()
+        .ok_or(CliError::SyncRootFileCreateConfirmationFenceMissing)?;
+
+    let evidence = storage
+        .sync_root_file_create_content_evidence(candidate.intent_id)?
+        .ok_or(CliError::SyncRootFileCreateConfirmationEvidenceMissing)?;
+    let expected_remote_version = evidence
+        .remote_version
+        .ok_or(CliError::SyncRootFileCreateConfirmationEvidenceMissing)?;
+    if evidence.size_bytes != candidate.local_size_bytes {
+        return Err(CliError::SyncRootFileCreateConfirmationEvidenceMismatch);
+    }
+
+    let local_state_before = storage.sync_root_local_inventory_state(&root.id)?;
+    if !local_state_before.snapshot_complete
+        || !local_state_before.observation_valid
+        || local_state_before.generation != candidate.baseline_generation
+    {
+        return Err(CliError::SyncRootFileCreateConfirmationLocalStateChanged);
+    }
+
+    let pending_before = storage
+        .list_pending_sync_root_local_change_events(&root.id, candidate.baseline_generation)?;
+    if !pending_before
+        .iter()
+        .any(|event| event.id == candidate.source_local_event_id)
+    {
+        return Err(CliError::SyncRootFileCreateConfirmationLocalStateChanged);
+    }
+
+    match storage.sync_root_change_window_state(&root.id)? {
+        Some(window) => {
+            if window.base_cursor != pre_submit_cursor {
+                return Err(CliError::SyncRootFileCreateConfirmationFenceMismatch);
+            }
+        }
+        None => {
+            let durable_cursor = storage
+                .sync_root_change_cursor(&root.id)?
+                .ok_or(CliError::SyncRootFileCreateConfirmationFenceMissing)?;
+            if durable_cursor != pre_submit_cursor {
+                return Err(CliError::SyncRootFileCreateConfirmationFenceMismatch);
+            }
+        }
+    }
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+
+    println!("SYNC_ROOT_FILE_CREATE_CONFIRMATION_STAGE=refresh_readonly_access_token");
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &refresh_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_CONFIRMATION_STAGE=collect_change_window");
+    let mut pages_collected = 0usize;
+    loop {
+        let result = collect_selected_root_change_window_page(&api, &mut storage, &root)?;
+        pages_collected = pages_collected
+            .checked_add(1)
+            .ok_or(CliError::NumericOverflow)?;
+        if result.complete {
+            break;
+        }
+        if pages_collected >= MAX_CONFIRMATION_PAGES_PER_APPROVAL {
+            return Err(CliError::SyncRootFileCreateConfirmationPageLimitExceeded);
+        }
+    }
+
+    let window = storage
+        .sync_root_change_window_state(&root.id)?
+        .ok_or(CliError::SyncRootFileCreateConfirmationWindowMismatch)?;
+    if !window.is_complete() || window.base_cursor != pre_submit_cursor {
+        return Err(CliError::SyncRootFileCreateConfirmationWindowMismatch);
+    }
+
+    let expected_name = file_create_leaf_name(candidate.relative_path())?;
+    let target_id = candidate.predetermined_remote_id();
+    let expected_parent = candidate.expected_parent_remote_id();
+    let changes = storage.sync_root_change_window_changes(&root.id)?;
+
+    let mut target_changes = 0usize;
+    let mut last_target_exact = None;
+    for change in &changes {
+        if let Some(exact) = file_create_target_change_exact(
+            change,
+            target_id,
+            expected_name,
+            expected_parent,
+            evidence.size_bytes,
+        ) {
+            target_changes = target_changes
+                .checked_add(1)
+                .ok_or(CliError::NumericOverflow)?;
+            last_target_exact = Some(exact);
+        }
+    }
+
+    if target_changes == 0 {
+        println!("SYNC_ROOT_FILE_CREATE_CONFIRMATION_STAGE=discard_unobserved_window");
+        if !storage.discard_sync_root_change_window(&root.id, &pre_submit_cursor)? {
+            return Err(CliError::SyncRootFileCreateConfirmationWindowMismatch);
+        }
+
+        let local_state_after = storage.sync_root_local_inventory_state(&root.id)?;
+        let pending_after = storage
+            .list_pending_sync_root_local_change_events(&root.id, candidate.baseline_generation)?;
+        if local_state_after.generation != local_state_before.generation
+            || local_state_after.item_count != local_state_before.item_count
+            || local_state_after.snapshot_completed_at_unix_ms
+                != local_state_before.snapshot_completed_at_unix_ms
+            || local_state_after.observation_valid != local_state_before.observation_valid
+            || !pending_after
+                .iter()
+                .any(|event| event.id == candidate.source_local_event_id)
+        {
+            return Err(CliError::SyncRootFileCreateConfirmationLocalStateChanged);
+        }
+
+        println!("SYNC_ROOT_FILE_CREATE_CONFIRMATION=PASS");
+        println!("MODE=two_way");
+        println!("AWAITING_CONFIRMATION_INTENTS=1");
+        println!("SELECTED_INTENTS=1");
+        println!("CHANGE_STREAM_SCAN=performed");
+        println!("WINDOW_PAGES_COLLECTED={pages_collected}");
+        println!("TARGET_CHANGE_OBSERVED=no");
+        println!("STAGED_WINDOW_DISCARDED=yes");
+        println!("PROVIDER_METADATA_CHECK=not_performed");
+        println!("CURSOR_ADVANCED=no");
+        println!("INTENT_STATUS_AFTER=awaiting_confirmation");
+        println!("NETWORK_CHECK=performed");
+        println!("DATABASE_MUTATION=yes");
+        println!("FILESYSTEM_READ=not_performed");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("PROVIDER_WRITE_METHOD_CALLED=no");
+        println!("REMOTE_OBJECT_MUTATION=no");
+        println!("LOCAL_EVENT_APPLIED=no");
+        println!("BASELINE_ADVANCED=no");
+        println!("REMOTE_IDS_PRINTED=no");
+        println!("REMOTE_METADATA_PRINTED=no");
+        println!("HASH_VALUE_PRINTED=no");
+        println!("CURSOR_VALUES_PRINTED=no");
+        println!("TOKEN_VALUES_PRINTED=no");
+        println!("DRIVE_WRITE_ACCESS=readonly_confirmation_only");
+        return Ok(());
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_CONFIRMATION_STAGE=verify_current_provider_metadata");
+    let provider_exact = match api.inspect_expected_file(
+        target_id,
+        expected_name,
+        expected_parent,
+        SUPERVISED_FILE_CREATE_MIME_TYPE,
+        evidence.size_bytes,
+        evidence.sha256_hex(),
+    )? {
+        DriveExpectedFileLookup::Exact { remote_version } => {
+            remote_version == expected_remote_version
+        }
+        DriveExpectedFileLookup::Missing | DriveExpectedFileLookup::Mismatch => false,
+    };
+
+    println!("SYNC_ROOT_FILE_CREATE_CONFIRMATION_STAGE=commit_change_window");
+    let execution =
+        execute_completed_selected_root_change_window(&api, &mut storage, &root, unix_time_ms()?)?;
+
+    let final_item = storage.sync_root_remote_item(&root.id, target_id)?;
+    let final_exact = final_item.as_ref().is_some_and(|item| {
+        item.name == expected_name
+            && item.kind == RemoteItemKind::File
+            && item.parent_remote_id.as_deref() == Some(expected_parent)
+            && item.size_bytes == Some(evidence.size_bytes)
+            && !item.trashed
+    });
+
+    let exact_change = last_target_exact == Some(true);
+    let new_status = if exact_change && final_exact && provider_exact {
+        RemoteWriteIntentStatus::Confirmed
+    } else {
+        RemoteWriteIntentStatus::Conflict
+    };
+
+    println!("SYNC_ROOT_FILE_CREATE_CONFIRMATION_STAGE=transition_intent");
+    let transitioned = storage.transition_sync_root_file_create_intent(
+        candidate.intent_id,
+        RemoteWriteIntentStatus::AwaitingConfirmation,
+        candidate.execution_generation,
+        new_status,
+        unix_time_ms()?,
+    )?;
+
+    let local_state_after = storage.sync_root_local_inventory_state(&root.id)?;
+    let pending_after = storage
+        .list_pending_sync_root_local_change_events(&root.id, candidate.baseline_generation)?;
+
+    if local_state_after.generation != local_state_before.generation
+        || local_state_after.item_count != local_state_before.item_count
+        || local_state_after.snapshot_completed_at_unix_ms
+            != local_state_before.snapshot_completed_at_unix_ms
+        || local_state_after.observation_valid != local_state_before.observation_valid
+        || !pending_after
+            .iter()
+            .any(|event| event.id == candidate.source_local_event_id)
+    {
+        return Err(CliError::SyncRootFileCreateConfirmationLocalStateChanged);
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_CONFIRMATION=PASS");
+    println!("MODE=two_way");
+    println!("AWAITING_CONFIRMATION_INTENTS=1");
+    println!("SELECTED_INTENTS=1");
+    println!("CHANGE_STREAM_SCAN=performed");
+    println!("WINDOW_PAGES_COLLECTED={pages_collected}");
+    println!("TARGET_CHANGE_OBSERVED=yes");
+    println!("TARGET_LAST_CHANGE_EXACT={}", yes_no(exact_change));
+    println!("FINAL_CATALOG_ITEM_EXACT={}", yes_no(final_exact));
+    println!("PROVIDER_CONTENT_EVIDENCE_EXACT={}", yes_no(provider_exact));
+    println!("CURSOR_ADVANCED=yes");
+    println!("CATALOG_MUTATIONS={}", execution.storage_mutations);
+    println!("INTENT_STATUS_AFTER={}", transitioned.status.as_str());
+    println!(
+        "CONFIRMED={}",
+        yes_no(transitioned.status == RemoteWriteIntentStatus::Confirmed)
+    );
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_READ=not_performed");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("PROVIDER_WRITE_METHOD_CALLED=no");
+    println!("REMOTE_OBJECT_MUTATION=no");
+    println!("LOCAL_EVENT_APPLIED=no");
+    println!("BASELINE_ADVANCED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("REMOTE_METADATA_PRINTED=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("CURSOR_VALUES_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=readonly_confirmation_only");
+
     Ok(())
 }
 
@@ -7349,6 +7722,7 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "submit-file-create"
                 | "recover-file-create-submission"
                 | "confirm-folder-create"
+                | "confirm-file-create"
                 | "settle-confirmed-folder-create"
                 | "activate-two-way"
                 | "deactivate-two-way"
@@ -7426,6 +7800,62 @@ mod sync_root_cli_tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn phase5h18_file_create_change_matching_requires_exact_file_identity() {
+        let exact = RemoteChange::Upsert(nubisync_core::RemoteItem {
+            remote_id: "target".into(),
+            parent_remote_id: Some("parent".into()),
+            name: "file.bin".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(7),
+            modified_unix_ms: None,
+            trashed: false,
+        });
+        assert_eq!(
+            file_create_target_change_exact(&exact, "target", "file.bin", "parent", 7),
+            Some(true)
+        );
+
+        let wrong_size = RemoteChange::Upsert(nubisync_core::RemoteItem {
+            remote_id: "target".into(),
+            parent_remote_id: Some("parent".into()),
+            name: "file.bin".into(),
+            kind: RemoteItemKind::File,
+            size_bytes: Some(8),
+            modified_unix_ms: None,
+            trashed: false,
+        });
+        assert_eq!(
+            file_create_target_change_exact(&wrong_size, "target", "file.bin", "parent", 7),
+            Some(false)
+        );
+
+        let deleted = RemoteChange::Delete {
+            remote_id: "target".into(),
+        };
+        assert_eq!(
+            file_create_target_change_exact(&deleted, "target", "file.bin", "parent", 7),
+            Some(false)
+        );
+
+        let unrelated = RemoteChange::Delete {
+            remote_id: "other".into(),
+        };
+        assert_eq!(
+            file_create_target_change_exact(&unrelated, "target", "file.bin", "parent", 7),
+            None
+        );
+    }
+
+    #[test]
+    fn phase5h18_file_create_confirmation_is_cross_process_locked() {
+        let args = ["sync", "roots", "confirm-file-create", "--approve"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(cli_requires_cross_process_execution_lock(&args));
     }
 
     #[test]
@@ -7904,6 +8334,26 @@ enum CliError {
     SyncRootFolderCreateSettlementModeUnsupported,
     #[error("sync root confirmed folder-create settlement postcondition failed")]
     SyncRootFolderCreateSettlementPostconditionFailed,
+    #[error("sync root ordinary-file create confirmation selection failed")]
+    SyncRootFileCreateConfirmationSelectionFailed,
+    #[error("sync root ordinary-file create confirmation requires two_way mode")]
+    SyncRootFileCreateConfirmationModeUnsupported,
+    #[error("sync root ordinary-file create confirmation execution state mismatched")]
+    SyncRootFileCreateConfirmationStateMismatch,
+    #[error("sync root ordinary-file create confirmation pre-submit fence is missing")]
+    SyncRootFileCreateConfirmationFenceMissing,
+    #[error("sync root ordinary-file create confirmation fence mismatched")]
+    SyncRootFileCreateConfirmationFenceMismatch,
+    #[error("sync root ordinary-file create confirmation durable content evidence is missing")]
+    SyncRootFileCreateConfirmationEvidenceMissing,
+    #[error("sync root ordinary-file create confirmation durable content evidence mismatched")]
+    SyncRootFileCreateConfirmationEvidenceMismatch,
+    #[error("sync root ordinary-file create confirmation local authority changed")]
+    SyncRootFileCreateConfirmationLocalStateChanged,
+    #[error("sync root ordinary-file create confirmation exceeded the supervised page limit")]
+    SyncRootFileCreateConfirmationPageLimitExceeded,
+    #[error("sync root ordinary-file create confirmation change window mismatched")]
+    SyncRootFileCreateConfirmationWindowMismatch,
     #[error("sync root folder-create confirmation selection failed")]
     SyncRootFolderCreateConfirmationSelectionFailed,
     #[error("sync root folder-create confirmation requires two_way mode")]
