@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
+use url::Url;
 
 const GOOGLE_USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 const GOOGLE_DRIVE_ABOUT_ENDPOINT: &str = "https://www.googleapis.com/drive/v3/about";
@@ -18,9 +19,15 @@ const GOOGLE_DRIVE_START_PAGE_TOKEN_ENDPOINT: &str =
     "https://www.googleapis.com/drive/v3/changes/startPageToken";
 const GOOGLE_DRIVE_CHANGES_ENDPOINT: &str = "https://www.googleapis.com/drive/v3/changes";
 const GOOGLE_DRIVE_FILES_ENDPOINT: &str = "https://www.googleapis.com/drive/v3/files";
+const GOOGLE_DRIVE_UPLOAD_FILES_ENDPOINT: &str = "https://www.googleapis.com/upload/drive/v3/files";
 const GOOGLE_DRIVE_GENERATE_IDS_ENDPOINT: &str =
     "https://www.googleapis.com/drive/v3/files/generateIds";
 const GOOGLE_DRIVE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
+const GOOGLE_DRIVE_FILE_UPLOAD_FIELDS: &str =
+    "id,name,mimeType,parents,size,trashed,version,md5Checksum,sha256Checksum";
+
+pub const DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES: u64 = 256 * 1024;
+pub const DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 const GOOGLE_DRIVE_INVENTORY_FIELDS: &str =
     "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,trashed)";
 const GOOGLE_DRIVE_CHANGES_FIELDS: &str = concat!(
@@ -540,6 +547,109 @@ impl GoogleDriveApi {
         copy_bounded_download(&mut response, writer, max_bytes)
     }
 
+    /// Starts an ordinary-file resumable create with a predetermined Drive ID.
+    ///
+    /// The returned session URI is capability-sensitive: it is retained only
+    /// inside the opaque session object and is redacted from Debug output.
+    pub fn initiate_resumable_file_create(
+        &self,
+        remote_id: &str,
+        name: &str,
+        parent_remote_id: &str,
+        mime_type: &str,
+        total_bytes: u64,
+    ) -> Result<DriveResumableUploadSession, DriveApiError> {
+        validate_drive_file_id(remote_id)?;
+        validate_drive_file_id(parent_remote_id)?;
+        validate_ordinary_file_create_name(name)?;
+        validate_ordinary_upload_mime_type(mime_type)?;
+        if total_bytes == 0 {
+            return Err(DriveApiError::ResumableUploadEmptyFileUnsupported);
+        }
+
+        let body = DriveResumableFileCreateRequest {
+            id: remote_id,
+            name,
+            mime_type,
+            parents: [parent_remote_id],
+        };
+
+        let response = self
+            .client
+            .post(GOOGLE_DRIVE_UPLOAD_FILES_ENDPOINT)
+            .bearer_auth(self.access_token.as_str())
+            .query(&[
+                ("uploadType", "resumable"),
+                ("fields", GOOGLE_DRIVE_FILE_UPLOAD_FIELDS),
+            ])
+            .header("X-Upload-Content-Type", mime_type)
+            .header("X-Upload-Content-Length", total_bytes.to_string())
+            .json(&body)
+            .send()?
+            .error_for_status()?;
+
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(DriveApiError::ResumableUploadLocationMissing)?;
+        let session_uri = validate_resumable_session_uri(location)?;
+
+        Ok(DriveResumableUploadSession {
+            session_uri,
+            remote_id: remote_id.to_owned(),
+            expected_name: name.to_owned(),
+            expected_parent_remote_id: parent_remote_id.to_owned(),
+            expected_mime_type: mime_type.to_owned(),
+            total_bytes,
+        })
+    }
+
+    /// Sends one provider-confirmed resumable chunk.
+    pub fn upload_resumable_file_chunk(
+        &self,
+        session: &DriveResumableUploadSession,
+        start_offset: u64,
+        chunk: Vec<u8>,
+    ) -> Result<DriveResumableUploadProgress, DriveApiError> {
+        let content_range =
+            build_resumable_chunk_content_range(session.total_bytes, start_offset, chunk.len())?;
+
+        let response = self
+            .client
+            .put(session.session_uri.as_str())
+            .bearer_auth(self.access_token.as_str())
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                session.expected_mime_type.as_str(),
+            )
+            .header(reqwest::header::CONTENT_LENGTH, chunk.len().to_string())
+            .header(reqwest::header::CONTENT_RANGE, content_range)
+            .body(chunk)
+            .send()?;
+
+        parse_resumable_upload_response(session, response)
+    }
+
+    /// Queries an interrupted resumable session without uploading content.
+    pub fn query_resumable_file_upload_status(
+        &self,
+        session: &DriveResumableUploadSession,
+    ) -> Result<DriveResumableUploadProgress, DriveApiError> {
+        let response = self
+            .client
+            .put(session.session_uri.as_str())
+            .bearer_auth(self.access_token.as_str())
+            .header(reqwest::header::CONTENT_LENGTH, "0")
+            .header(
+                reqwest::header::CONTENT_RANGE,
+                format!("bytes */{}", session.total_bytes),
+            )
+            .send()?;
+
+        parse_resumable_upload_response(session, response)
+    }
+
     /// Reads one page of the user's My Drive change stream.
     ///
     /// The caller supplies the durable cursor for the first page and the
@@ -667,6 +777,106 @@ pub enum DriveExpectedFolderLookup {
     Exact,
     Missing,
     Mismatch,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct DriveResumableUploadSession {
+    session_uri: String,
+    remote_id: String,
+    expected_name: String,
+    expected_parent_remote_id: String,
+    expected_mime_type: String,
+    total_bytes: u64,
+}
+
+impl DriveResumableUploadSession {
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+}
+
+impl fmt::Debug for DriveResumableUploadSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriveResumableUploadSession")
+            .field("session_uri", &"[redacted]")
+            .field("remote_id", &"[redacted]")
+            .field("expected_name", &"[redacted]")
+            .field("expected_parent_remote_id", &"[redacted]")
+            .field("expected_mime_type", &self.expected_mime_type)
+            .field("total_bytes", &self.total_bytes)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct DriveOrdinaryFileUploadCompletion {
+    pub size_bytes: u64,
+    pub remote_version: u64,
+    md5_checksum: Option<String>,
+    sha256_checksum: Option<String>,
+}
+
+impl DriveOrdinaryFileUploadCompletion {
+    pub fn md5_checksum(&self) -> Option<&str> {
+        self.md5_checksum.as_deref()
+    }
+
+    pub fn sha256_checksum(&self) -> Option<&str> {
+        self.sha256_checksum.as_deref()
+    }
+}
+
+impl fmt::Debug for DriveOrdinaryFileUploadCompletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriveOrdinaryFileUploadCompletion")
+            .field("size_bytes", &self.size_bytes)
+            .field("remote_version", &self.remote_version)
+            .field(
+                "md5_checksum",
+                &self.md5_checksum.as_deref().map(|_| "[redacted]"),
+            )
+            .field(
+                "sha256_checksum",
+                &self.sha256_checksum.as_deref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveResumableUploadProgress {
+    Incomplete { next_offset: u64 },
+    Complete(DriveOrdinaryFileUploadCompletion),
+    Expired,
+}
+
+#[derive(Serialize)]
+struct DriveResumableFileCreateRequest<'a> {
+    id: &'a str,
+    name: &'a str,
+    #[serde(rename = "mimeType")]
+    mime_type: &'a str,
+    parents: [&'a str; 1],
+}
+
+#[derive(Deserialize)]
+struct DriveOrdinaryFileUploadResponse {
+    id: String,
+    name: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    #[serde(default)]
+    parents: Vec<String>,
+    size: Option<String>,
+    #[serde(default)]
+    trashed: bool,
+    version: Option<String>,
+    #[serde(rename = "md5Checksum")]
+    md5_checksum: Option<String>,
+    #[serde(rename = "sha256Checksum")]
+    sha256_checksum: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1119,6 +1329,180 @@ struct GoogleFile {
     trashed: bool,
 }
 
+fn validate_ordinary_file_create_name(name: &str) -> Result<(), DriveApiError> {
+    if name.is_empty() || name.contains('/') || name.contains('\0') {
+        return Err(DriveApiError::InvalidOrdinaryFileCreateName);
+    }
+    Ok(())
+}
+
+fn validate_ordinary_upload_mime_type(mime_type: &str) -> Result<(), DriveApiError> {
+    if mime_type.is_empty()
+        || mime_type.len() > 255
+        || mime_type.chars().any(char::is_whitespace)
+        || mime_type.chars().any(char::is_control)
+        || !mime_type.contains('/')
+        || mime_type == GOOGLE_DRIVE_FOLDER_MIME_TYPE
+        || mime_type.starts_with("application/vnd.google-apps.")
+    {
+        return Err(DriveApiError::InvalidOrdinaryFileUploadMimeType);
+    }
+    Ok(())
+}
+
+fn validate_resumable_session_uri(value: &str) -> Result<String, DriveApiError> {
+    let parsed = Url::parse(value).map_err(|_| DriveApiError::InvalidResumableSessionUri)?;
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("www.googleapis.com")
+        || parsed.port_or_known_default() != Some(443)
+        || parsed.fragment().is_some()
+        || !parsed.path().starts_with("/upload/drive/v3/files")
+    {
+        return Err(DriveApiError::InvalidResumableSessionUri);
+    }
+    Ok(parsed.to_string())
+}
+
+fn build_resumable_chunk_content_range(
+    total_bytes: u64,
+    start_offset: u64,
+    chunk_len: usize,
+) -> Result<String, DriveApiError> {
+    if total_bytes == 0 || chunk_len == 0 {
+        return Err(DriveApiError::InvalidResumableUploadChunk);
+    }
+
+    let chunk_len =
+        u64::try_from(chunk_len).map_err(|_| DriveApiError::InvalidResumableUploadChunk)?;
+    let end_exclusive = start_offset
+        .checked_add(chunk_len)
+        .ok_or(DriveApiError::InvalidResumableUploadChunk)?;
+    if start_offset >= total_bytes || end_exclusive > total_bytes {
+        return Err(DriveApiError::InvalidResumableUploadChunk);
+    }
+
+    let final_chunk = end_exclusive == total_bytes;
+    if !final_chunk && chunk_len % DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES != 0 {
+        return Err(DriveApiError::InvalidResumableUploadChunkAlignment);
+    }
+
+    Ok(format!(
+        "bytes {start_offset}-{}/{}",
+        end_exclusive - 1,
+        total_bytes
+    ))
+}
+
+fn parse_resumable_next_offset(
+    range_header: Option<&str>,
+    total_bytes: u64,
+) -> Result<u64, DriveApiError> {
+    let Some(value) = range_header else {
+        return Ok(0);
+    };
+    let suffix = value
+        .strip_prefix("bytes=0-")
+        .ok_or(DriveApiError::InvalidResumableUploadRange)?;
+    let last = suffix
+        .parse::<u64>()
+        .map_err(|_| DriveApiError::InvalidResumableUploadRange)?;
+    let next = last
+        .checked_add(1)
+        .ok_or(DriveApiError::InvalidResumableUploadRange)?;
+    if next >= total_bytes {
+        return Err(DriveApiError::InvalidResumableUploadRange);
+    }
+    Ok(next)
+}
+
+fn normalize_optional_hex_checksum(
+    value: Option<String>,
+    expected_len: usize,
+) -> Result<Option<String>, DriveApiError> {
+    value
+        .map(|value| {
+            if value.len() != expected_len || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(DriveApiError::InvalidOrdinaryFileUploadChecksum);
+            }
+            Ok(value.to_ascii_lowercase())
+        })
+        .transpose()
+}
+
+fn validate_ordinary_file_upload_completion(
+    session: &DriveResumableUploadSession,
+    metadata: DriveOrdinaryFileUploadResponse,
+) -> Result<DriveOrdinaryFileUploadCompletion, DriveApiError> {
+    if metadata.id != session.remote_id
+        || metadata.name != session.expected_name
+        || metadata.mime_type != session.expected_mime_type
+        || metadata.parents.len() != 1
+        || metadata.parents.first().map(String::as_str)
+            != Some(session.expected_parent_remote_id.as_str())
+        || metadata.trashed
+    {
+        return Err(DriveApiError::OrdinaryFileUploadPostconditionMismatch);
+    }
+
+    let size_bytes = metadata
+        .size
+        .as_deref()
+        .ok_or(DriveApiError::OrdinaryFileUploadSizeMissing)?
+        .parse::<u64>()
+        .map_err(|_| DriveApiError::OrdinaryFileUploadSizeInvalid)?;
+    if size_bytes != session.total_bytes {
+        return Err(DriveApiError::OrdinaryFileUploadPostconditionMismatch);
+    }
+
+    let remote_version = metadata
+        .version
+        .as_deref()
+        .ok_or(DriveApiError::OrdinaryFileUploadVersionMissing)?
+        .parse::<u64>()
+        .map_err(|_| DriveApiError::OrdinaryFileUploadVersionInvalid)?;
+    if remote_version == 0 {
+        return Err(DriveApiError::OrdinaryFileUploadVersionInvalid);
+    }
+
+    let md5_checksum = normalize_optional_hex_checksum(metadata.md5_checksum, 32)?;
+    let sha256_checksum = normalize_optional_hex_checksum(metadata.sha256_checksum, 64)?;
+
+    Ok(DriveOrdinaryFileUploadCompletion {
+        size_bytes,
+        remote_version,
+        md5_checksum,
+        sha256_checksum,
+    })
+}
+
+fn parse_resumable_upload_response(
+    session: &DriveResumableUploadSession,
+    response: reqwest::blocking::Response,
+) -> Result<DriveResumableUploadProgress, DriveApiError> {
+    match response.status() {
+        StatusCode::OK | StatusCode::CREATED => {
+            let metadata: DriveOrdinaryFileUploadResponse = response.json()?;
+            Ok(DriveResumableUploadProgress::Complete(
+                validate_ordinary_file_upload_completion(session, metadata)?,
+            ))
+        }
+        StatusCode::PERMANENT_REDIRECT => {
+            let range = response
+                .headers()
+                .get(reqwest::header::RANGE)
+                .and_then(|value| value.to_str().ok());
+            Ok(DriveResumableUploadProgress::Incomplete {
+                next_offset: parse_resumable_next_offset(range, session.total_bytes)?,
+            })
+        }
+        StatusCode::NOT_FOUND => Ok(DriveResumableUploadProgress::Expired),
+        _ => {
+            response.error_for_status()?;
+            Err(DriveApiError::UnexpectedResumableUploadStatus)
+        }
+    }
+}
+
 fn validate_folder_create_name(name: &str) -> Result<(), DriveApiError> {
     if name.is_empty() || name.contains('/') || name.contains('\0') {
         return Err(DriveApiError::InvalidFolderCreateName);
@@ -1476,6 +1860,36 @@ pub enum DriveApiError {
     InvalidFolderCreateName,
     #[error("Google Drive folder-create response did not match the durable intent")]
     FolderCreatePostconditionMismatch,
+    #[error("Google Drive ordinary-file create name is invalid")]
+    InvalidOrdinaryFileCreateName,
+    #[error("Google Drive ordinary-file upload MIME type is invalid")]
+    InvalidOrdinaryFileUploadMimeType,
+    #[error("zero-byte ordinary files are not yet admitted by the resumable provider primitive")]
+    ResumableUploadEmptyFileUnsupported,
+    #[error("Google Drive resumable upload response is missing the session Location header")]
+    ResumableUploadLocationMissing,
+    #[error("Google Drive resumable session URI is invalid")]
+    InvalidResumableSessionUri,
+    #[error("Google Drive resumable upload chunk is invalid")]
+    InvalidResumableUploadChunk,
+    #[error("Google Drive non-final resumable chunks must align to 256 KiB")]
+    InvalidResumableUploadChunkAlignment,
+    #[error("Google Drive resumable upload Range header is invalid")]
+    InvalidResumableUploadRange,
+    #[error("Google Drive resumable upload returned an unexpected successful status")]
+    UnexpectedResumableUploadStatus,
+    #[error("Google Drive ordinary-file upload response did not match the session intent")]
+    OrdinaryFileUploadPostconditionMismatch,
+    #[error("Google Drive ordinary-file upload response is missing byte size")]
+    OrdinaryFileUploadSizeMissing,
+    #[error("Google Drive ordinary-file upload response byte size is invalid")]
+    OrdinaryFileUploadSizeInvalid,
+    #[error("Google Drive ordinary-file upload response is missing version")]
+    OrdinaryFileUploadVersionMissing,
+    #[error("Google Drive ordinary-file upload response version is invalid")]
+    OrdinaryFileUploadVersionInvalid,
+    #[error("Google Drive ordinary-file upload checksum metadata is invalid")]
+    InvalidOrdinaryFileUploadChecksum,
     #[error("Google Drive write-authority metadata ID does not match the requested item")]
     WriteAuthorityMetadataIdMismatch,
     #[error("Google Drive write-authority target is trashed")]
@@ -1535,6 +1949,192 @@ pub enum DriveApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn phase5h16_session() -> DriveResumableUploadSession {
+        DriveResumableUploadSession {
+            session_uri: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=secret-session".into(),
+            remote_id: "generated-file-id".into(),
+            expected_name: "example.bin".into(),
+            expected_parent_remote_id: "parent-id".into(),
+            expected_mime_type: "application/octet-stream".into(),
+            total_bytes: DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES + 7,
+        }
+    }
+
+    #[test]
+    fn phase5h16_resumable_constants_are_aligned() {
+        assert_eq!(DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES, 256 * 1024);
+        assert_eq!(DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES, 8 * 1024 * 1024);
+        assert_eq!(
+            DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES % DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES,
+            0
+        );
+    }
+
+    #[test]
+    fn phase5h16_session_uri_is_google_https_only_and_debug_redacts_capability() {
+        let valid = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=secret-session";
+        assert_eq!(validate_resumable_session_uri(valid).unwrap(), valid);
+
+        for invalid in [
+            "http://www.googleapis.com/upload/drive/v3/files?upload_id=x",
+            "https://evil.example/upload/drive/v3/files?upload_id=x",
+            "https://www.googleapis.com/drive/v3/files?upload_id=x",
+            "https://www.googleapis.com/upload/drive/v3/files?upload_id=x#fragment",
+        ] {
+            assert!(matches!(
+                validate_resumable_session_uri(invalid),
+                Err(DriveApiError::InvalidResumableSessionUri)
+            ));
+        }
+
+        let session = phase5h16_session();
+        let debug = format!("{session:?}");
+        assert!(!debug.contains("secret-session"));
+        assert!(!debug.contains("generated-file-id"));
+        assert!(!debug.contains("example.bin"));
+        assert!(!debug.contains("parent-id"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn phase5h16_chunk_ranges_require_alignment_except_final_chunk() {
+        let total = DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES + 7;
+        assert_eq!(
+            build_resumable_chunk_content_range(
+                total,
+                0,
+                DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES as usize,
+            )
+            .unwrap(),
+            format!(
+                "bytes 0-{}/{}",
+                DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES - 1,
+                total
+            )
+        );
+        assert_eq!(
+            build_resumable_chunk_content_range(total, DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES, 7,)
+                .unwrap(),
+            format!(
+                "bytes {}-{}/{}",
+                DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES,
+                total - 1,
+                total
+            )
+        );
+
+        assert!(matches!(
+            build_resumable_chunk_content_range(total, 0, 1),
+            Err(DriveApiError::InvalidResumableUploadChunkAlignment)
+        ));
+        assert!(matches!(
+            build_resumable_chunk_content_range(total, 0, 0),
+            Err(DriveApiError::InvalidResumableUploadChunk)
+        ));
+        assert!(matches!(
+            build_resumable_chunk_content_range(total, total, 1),
+            Err(DriveApiError::InvalidResumableUploadChunk)
+        ));
+    }
+
+    #[test]
+    fn phase5h16_range_header_controls_resume_offset() {
+        let total = 1_000;
+        assert_eq!(parse_resumable_next_offset(None, total).unwrap(), 0);
+        assert_eq!(
+            parse_resumable_next_offset(Some("bytes=0-42"), total).unwrap(),
+            43
+        );
+        for invalid in ["bytes=1-42", "bytes=0-x", "0-42", "bytes=0-999"] {
+            assert!(matches!(
+                parse_resumable_next_offset(Some(invalid), total),
+                Err(DriveApiError::InvalidResumableUploadRange)
+            ));
+        }
+    }
+
+    #[test]
+    fn phase5h16_completion_requires_exact_identity_size_and_redacts_hashes() {
+        let session = phase5h16_session();
+        let completion = validate_ordinary_file_upload_completion(
+            &session,
+            DriveOrdinaryFileUploadResponse {
+                id: "generated-file-id".into(),
+                name: "example.bin".into(),
+                mime_type: "application/octet-stream".into(),
+                parents: vec!["parent-id".into()],
+                size: Some(session.total_bytes.to_string()),
+                trashed: false,
+                version: Some("7".into()),
+                md5_checksum: Some("A".repeat(32)),
+                sha256_checksum: Some("B".repeat(64)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(completion.size_bytes, session.total_bytes);
+        assert_eq!(completion.remote_version, 7);
+        let expected_md5 = "a".repeat(32);
+        let expected_sha256 = "b".repeat(64);
+        assert_eq!(completion.md5_checksum(), Some(expected_md5.as_str()));
+        assert_eq!(completion.sha256_checksum(), Some(expected_sha256.as_str()));
+
+        let debug = format!("{completion:?}");
+        assert!(!debug.contains(&expected_md5));
+        assert!(!debug.contains(&expected_sha256));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn phase5h16_completion_fails_closed_on_mismatch_and_bad_checksum() {
+        let session = phase5h16_session();
+        let mismatched = DriveOrdinaryFileUploadResponse {
+            id: "different-id".into(),
+            name: "example.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            parents: vec!["parent-id".into()],
+            size: Some(session.total_bytes.to_string()),
+            trashed: false,
+            version: Some("7".into()),
+            md5_checksum: None,
+            sha256_checksum: None,
+        };
+        assert!(matches!(
+            validate_ordinary_file_upload_completion(&session, mismatched),
+            Err(DriveApiError::OrdinaryFileUploadPostconditionMismatch)
+        ));
+
+        let bad_hash = DriveOrdinaryFileUploadResponse {
+            id: "generated-file-id".into(),
+            name: "example.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            parents: vec!["parent-id".into()],
+            size: Some(session.total_bytes.to_string()),
+            trashed: false,
+            version: Some("7".into()),
+            md5_checksum: Some("not-a-valid-md5".into()),
+            sha256_checksum: None,
+        };
+        assert!(matches!(
+            validate_ordinary_file_upload_completion(&session, bad_hash),
+            Err(DriveApiError::InvalidOrdinaryFileUploadChecksum)
+        ));
+    }
+
+    #[test]
+    fn phase5h16_file_name_and_mime_are_fail_closed() {
+        assert!(validate_ordinary_file_create_name("example.bin").is_ok());
+        assert!(validate_ordinary_upload_mime_type("application/octet-stream").is_ok());
+        assert!(matches!(
+            validate_ordinary_file_create_name("bad/name"),
+            Err(DriveApiError::InvalidOrdinaryFileCreateName)
+        ));
+        assert!(matches!(
+            validate_ordinary_upload_mime_type("application/vnd.google-apps.document"),
+            Err(DriveApiError::InvalidOrdinaryFileUploadMimeType)
+        ));
+    }
 
     #[test]
     fn phase5h9_folder_create_postcondition_requires_exact_identity() {

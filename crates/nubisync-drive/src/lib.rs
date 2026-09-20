@@ -6,8 +6,10 @@ mod api;
 mod oauth;
 
 pub use api::{
-    DriveApiError, DriveBlobFingerprint, DriveExpectedFolderLookup, DriveFolderCreateSubmission,
-    DriveFolderRoot, DriveGeneratedIds, DriveInventoryPage, DriveProbe, DriveRootMembership,
+    DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES, DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES, DriveApiError,
+    DriveBlobFingerprint, DriveExpectedFolderLookup, DriveFolderCreateSubmission, DriveFolderRoot,
+    DriveGeneratedIds, DriveInventoryPage, DriveOrdinaryFileUploadCompletion, DriveProbe,
+    DriveResumableUploadProgress, DriveResumableUploadSession, DriveRootMembership,
     DriveWriteAuthorityObservation, GoogleDriveApi, GoogleUserInfo,
 };
 pub use oauth::{
