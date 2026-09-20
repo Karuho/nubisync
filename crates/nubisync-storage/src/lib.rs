@@ -4114,6 +4114,64 @@ impl Storage {
             .ok_or(StorageError::RemoteWriteIntentExecutionStateMissing)
     }
 
+    pub fn recover_sync_root_file_create_confirmation_conflict(
+        &self,
+        intent_id: i64,
+        expected_execution_generation: u64,
+        expected_attempt_count: u64,
+        confirmed_at_unix_ms: i64,
+    ) -> Result<RemoteWriteIntentExecutionState, StorageError> {
+        if intent_id <= 0
+            || expected_execution_generation == 0
+            || expected_attempt_count == 0
+            || confirmed_at_unix_ms <= 0
+        {
+            return Err(StorageError::InvalidRemoteWriteIntentExecutionTransition);
+        }
+
+        let execution_generation = i64::try_from(expected_execution_generation)
+            .map_err(|_| StorageError::NumericOverflow)?;
+        let attempt_count =
+            i64::try_from(expected_attempt_count).map_err(|_| StorageError::NumericOverflow)?;
+
+        let changed = self.connection.execute(
+            "UPDATE sync_root_remote_write_intents
+             SET status='confirmed',
+                 execution_generation=execution_generation+1,
+                 confirmed_at_unix_ms=?1,
+                 terminal_at_unix_ms=NULL
+             WHERE id=?2
+               AND operation_kind='create_file'
+               AND status='conflict'
+               AND execution_generation=?3
+               AND attempt_count=?4
+               AND pre_submit_change_cursor IS NOT NULL
+               AND expected_remote_kind='file'
+               AND expected_remote_version IS NOT NULL
+               AND expected_remote_size_bytes IS NOT NULL
+               AND expected_checksum_algorithm='sha256'
+               AND expected_content_checksum IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM sync_root_remote_write_settlements
+                   WHERE intent_id=?2
+               )",
+            params![
+                confirmed_at_unix_ms,
+                intent_id,
+                execution_generation,
+                attempt_count,
+            ],
+        )?;
+
+        if changed != 1 {
+            return Err(StorageError::RemoteWriteIntentExecutionCompareAndSetFailed);
+        }
+
+        self.sync_root_remote_write_intent_execution_state(intent_id)?
+            .ok_or(StorageError::RemoteWriteIntentExecutionStateMissing)
+    }
+
     pub fn transition_sync_root_file_create_intent(
         &self,
         intent_id: i64,
@@ -12353,6 +12411,91 @@ mod phase5h10_confirmation_window_tests {
             storage.sync_root_change_cursor(&root.id).unwrap().unwrap(),
             durable
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5h20a_file_create_confirmation_conflict_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn phase5h20a_conflict_recovery_is_narrow_cas_and_clears_terminal_marker() {
+        let storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5h20a-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h20a-root",
+            provider,
+            account.subject,
+            "/tmp/phase5h20a-root",
+            Some("remote-root".into()),
+            SyncMode::TwoWay,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_local_change_events (
+                sync_root_id, baseline_generation, baseline_item_count,
+                baseline_snapshot_completed_at_unix_ms, event_kind, relative_path,
+                baseline_kind, current_kind, observed_at_unix_ms, status
+             ) VALUES (?1,1,0,10,'created','proof.bin',NULL,'file',11,'pending')",
+                params![root.id],
+            )
+            .unwrap();
+        let event_id = storage.connection.last_insert_rowid();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_remote_write_intents (
+                sync_root_id, source_local_event_id, baseline_generation, operation_kind,
+                relative_path, local_kind, local_size_bytes, local_modified_unix_ns,
+                local_device_id, local_inode, predetermined_remote_id,
+                expected_parent_remote_id, expected_remote_kind, expected_remote_version,
+                expected_remote_size_bytes, expected_checksum_algorithm,
+                expected_content_checksum, planned_at_unix_ms, status,
+                attempt_count, execution_generation, pre_submit_change_cursor,
+                submitted_at_unix_ms, awaiting_confirmation_at_unix_ms,
+                terminal_at_unix_ms
+             ) VALUES (
+                ?1,?2,1,'create_file','proof.bin','file',7,100,'8','55',
+                'generated-file-id','remote-root','file','9',7,'sha256',?3,
+                12,'conflict',1,3,'cursor-before',13,14,15
+             )",
+                params![root.id, event_id, "a".repeat(64)],
+            )
+            .unwrap();
+        let intent_id = storage.connection.last_insert_rowid();
+
+        let recovered = storage
+            .recover_sync_root_file_create_confirmation_conflict(intent_id, 3, 1, 20)
+            .unwrap();
+        assert_eq!(recovered.status, RemoteWriteIntentStatus::Confirmed);
+        assert_eq!(recovered.execution_generation, 4);
+        assert_eq!(recovered.attempt_count, 1);
+        assert_eq!(recovered.confirmed_at_unix_ms, Some(20));
+
+        let terminal: Option<i64> = storage
+            .connection
+            .query_row(
+                "SELECT terminal_at_unix_ms FROM sync_root_remote_write_intents WHERE id=?1",
+                params![intent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal, None);
+
+        assert!(matches!(
+            storage.recover_sync_root_file_create_confirmation_conflict(intent_id, 3, 1, 21),
+            Err(StorageError::RemoteWriteIntentExecutionCompareAndSetFailed)
+        ));
     }
 }
 

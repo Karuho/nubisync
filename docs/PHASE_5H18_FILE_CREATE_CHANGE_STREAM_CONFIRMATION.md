@@ -74,11 +74,16 @@ That inspection must match:
 - expected parent;
 - ordinary MIME type;
 - uploaded byte size;
-- durable SHA-256;
-- durable upload remote version.
+- durable SHA-256.
+
+The current Drive `version` must be greater than or equal to the version
+observed at upload completion. Equality is not required: Drive defines
+`version` as monotonically increasing and it can advance for server-side changes
+that are not visible to the user.
 
 This prevents a same-ID metadata event from being accepted as proof of the
-specific uploaded content.
+specific uploaded content while avoiding a false conflict caused only by a
+legitimate server-side version increment.
 
 ## Commit and transition
 
