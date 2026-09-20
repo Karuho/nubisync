@@ -236,6 +236,48 @@ impl GoogleDriveApi {
         )
     }
 
+    /// Inspects one predetermined ordinary-file ID without mutating Drive.
+    pub fn inspect_expected_file(
+        &self,
+        remote_id: &str,
+        expected_name: &str,
+        expected_parent_remote_id: &str,
+        expected_mime_type: &str,
+        expected_size_bytes: u64,
+        expected_sha256_hex: &str,
+    ) -> Result<DriveExpectedFileLookup, DriveApiError> {
+        validate_drive_file_id(remote_id)?;
+        validate_drive_file_id(expected_parent_remote_id)?;
+        validate_ordinary_file_create_name(expected_name)?;
+        validate_ordinary_upload_mime_type(expected_mime_type)?;
+        validate_expected_sha256(expected_sha256_hex)?;
+        let response = self
+            .client
+            .get(format!("{GOOGLE_DRIVE_FILES_ENDPOINT}/{remote_id}"))
+            .bearer_auth(self.access_token.as_str())
+            .query(&[("fields", GOOGLE_DRIVE_FILE_UPLOAD_FIELDS)])
+            .send()?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(DriveExpectedFileLookup::Missing);
+        }
+        let metadata: DriveOrdinaryFileUploadResponse = response.error_for_status()?.json()?;
+        Ok(
+            if expected_ordinary_file_matches(
+                remote_id,
+                expected_name,
+                expected_parent_remote_id,
+                expected_mime_type,
+                expected_size_bytes,
+                expected_sha256_hex,
+                &metadata,
+            )? {
+                DriveExpectedFileLookup::Exact
+            } else {
+                DriveExpectedFileLookup::Mismatch
+            },
+        )
+    }
+
     /// Observes metadata-only remote authority for later write planning.
     pub fn observe_write_authority(
         &self,
@@ -774,6 +816,13 @@ pub enum DriveFolderCreateSubmission {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveExpectedFolderLookup {
+    Exact,
+    Missing,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveExpectedFileLookup {
     Exact,
     Missing,
     Mismatch,
@@ -1503,6 +1552,62 @@ fn parse_resumable_upload_response(
     }
 }
 
+fn validate_expected_sha256(value: &str) -> Result<(), DriveApiError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(DriveApiError::InvalidExpectedOrdinaryFileSha256);
+    }
+    Ok(())
+}
+fn expected_ordinary_file_matches(
+    expected_remote_id: &str,
+    expected_name: &str,
+    expected_parent_remote_id: &str,
+    expected_mime_type: &str,
+    expected_size_bytes: u64,
+    expected_sha256_hex: &str,
+    metadata: &DriveOrdinaryFileUploadResponse,
+) -> Result<bool, DriveApiError> {
+    validate_expected_sha256(expected_sha256_hex)?;
+    if metadata.id != expected_remote_id
+        || metadata.name != expected_name
+        || metadata.mime_type != expected_mime_type
+        || metadata.parents.len() != 1
+        || metadata.parents.first().map(String::as_str) != Some(expected_parent_remote_id)
+        || metadata.trashed
+    {
+        return Ok(false);
+    }
+    let Some(size) = metadata.size.as_deref() else {
+        return Ok(false);
+    };
+    if size
+        .parse::<u64>()
+        .map_err(|_| DriveApiError::OrdinaryFileUploadSizeInvalid)?
+        != expected_size_bytes
+    {
+        return Ok(false);
+    }
+    let Some(version) = metadata.version.as_deref() else {
+        return Ok(false);
+    };
+    if version
+        .parse::<u64>()
+        .map_err(|_| DriveApiError::OrdinaryFileUploadVersionInvalid)?
+        == 0
+    {
+        return Ok(false);
+    }
+    let Some(remote_sha) = normalize_optional_hex_checksum(metadata.sha256_checksum.clone(), 64)?
+    else {
+        return Ok(false);
+    };
+    Ok(remote_sha == expected_sha256_hex)
+}
+
 fn validate_folder_create_name(name: &str) -> Result<(), DriveApiError> {
     if name.is_empty() || name.contains('/') || name.contains('\0') {
         return Err(DriveApiError::InvalidFolderCreateName);
@@ -1890,6 +1995,8 @@ pub enum DriveApiError {
     OrdinaryFileUploadVersionInvalid,
     #[error("Google Drive ordinary-file upload checksum metadata is invalid")]
     InvalidOrdinaryFileUploadChecksum,
+    #[error("expected ordinary-file SHA-256 is invalid")]
+    InvalidExpectedOrdinaryFileSha256,
     #[error("Google Drive write-authority metadata ID does not match the requested item")]
     WriteAuthorityMetadataIdMismatch,
     #[error("Google Drive write-authority target is trashed")]
@@ -2133,6 +2240,87 @@ mod tests {
         assert!(matches!(
             validate_ordinary_upload_mime_type("application/vnd.google-apps.document"),
             Err(DriveApiError::InvalidOrdinaryFileUploadMimeType)
+        ));
+    }
+
+    #[test]
+    fn phase5h17a_expected_file_recovery_requires_exact_content_identity() {
+        let m = DriveOrdinaryFileUploadResponse {
+            id: "generated-file-id".into(),
+            name: "example.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            parents: vec!["parent-id".into()],
+            size: Some("7".into()),
+            trashed: false,
+            version: Some("9".into()),
+            md5_checksum: None,
+            sha256_checksum: Some("a".repeat(64)),
+        };
+        assert!(
+            expected_ordinary_file_matches(
+                "generated-file-id",
+                "example.bin",
+                "parent-id",
+                "application/octet-stream",
+                7,
+                &"a".repeat(64),
+                &m
+            )
+            .unwrap()
+        );
+        assert!(
+            !expected_ordinary_file_matches(
+                "generated-file-id",
+                "example.bin",
+                "parent-id",
+                "application/octet-stream",
+                8,
+                &"a".repeat(64),
+                &m
+            )
+            .unwrap()
+        );
+        assert!(
+            !expected_ordinary_file_matches(
+                "generated-file-id",
+                "example.bin",
+                "parent-id",
+                "application/octet-stream",
+                7,
+                &"b".repeat(64),
+                &m
+            )
+            .unwrap()
+        );
+    }
+    #[test]
+    fn phase5h17a_expected_file_recovery_fails_closed_without_sha256() {
+        let m = DriveOrdinaryFileUploadResponse {
+            id: "generated-file-id".into(),
+            name: "example.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            parents: vec!["parent-id".into()],
+            size: Some("7".into()),
+            trashed: false,
+            version: Some("9".into()),
+            md5_checksum: None,
+            sha256_checksum: None,
+        };
+        assert!(
+            !expected_ordinary_file_matches(
+                "generated-file-id",
+                "example.bin",
+                "parent-id",
+                "application/octet-stream",
+                7,
+                &"a".repeat(64),
+                &m
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            validate_expected_sha256(&"A".repeat(64)),
+            Err(DriveApiError::InvalidExpectedOrdinaryFileSha256)
         ));
     }
 
