@@ -959,8 +959,15 @@ fn sync_roots_refresh_two_way_metadata() -> Result<(), CliError> {
     if root.mode != SyncMode::TwoWay {
         return Err(CliError::SyncRootTwoWayMetadataRefreshModeUnsupported);
     }
-    if storage.sync_root_remote_write_intent_count(&root.id)? != 0 {
-        return Err(CliError::SyncRootTwoWayMetadataRefreshExistingIntents);
+    let intent_count_before = storage.sync_root_remote_write_intent_count(&root.id)?;
+    let submitted_before = storage
+        .sync_root_remote_write_intent_status_count(&root.id, RemoteWriteIntentStatus::Submitted)?;
+    let awaiting_before = storage.sync_root_remote_write_intent_status_count(
+        &root.id,
+        RemoteWriteIntentStatus::AwaitingConfirmation,
+    )?;
+    if submitted_before != 0 || awaiting_before != 0 {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshConfirmationFenceActive);
     }
 
     let local_before = storage.sync_root_local_inventory_state(&root.id)?;
@@ -1036,6 +1043,11 @@ fn sync_roots_refresh_two_way_metadata() -> Result<(), CliError> {
         return Err(CliError::SyncRootTwoWayMetadataRefreshWindowNotCleared);
     }
 
+    let intent_count_after = storage.sync_root_remote_write_intent_count(&root.id)?;
+    if intent_count_after != intent_count_before {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshIntentStateChanged);
+    }
+
     let remote_after = storage.sync_root_remote_inventory_state(&root.id)?;
     if !remote_after.ready_for_reconciliation() {
         return Err(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady);
@@ -1054,6 +1066,9 @@ fn sync_roots_refresh_two_way_metadata() -> Result<(), CliError> {
     println!("LOCAL_BASELINE_UNCHANGED=yes");
     println!("LOCAL_PENDING_EVENTS_PRESERVED=yes");
     println!("LOCAL_PENDING_EVENTS={pending_after}");
+    println!("REMOTE_WRITE_INTENTS_PRESERVED=yes");
+    println!("REMOTE_WRITE_INTENTS_TOTAL={intent_count_after}");
+    println!("CONFIRMATION_FENCE_INTENTS=0");
     println!("NETWORK_CHECK=performed");
     println!("DATABASE_MUTATION=yes");
     println!("FILESYSTEM_READ=not_performed");
@@ -7333,8 +7348,10 @@ enum CliError {
     SyncRootTwoWayMetadataRefreshSelectionFailed,
     #[error("sync root two-way metadata refresh requires two_way mode")]
     SyncRootTwoWayMetadataRefreshModeUnsupported,
-    #[error("existing remote-write intents block two-way metadata refresh")]
-    SyncRootTwoWayMetadataRefreshExistingIntents,
+    #[error("submitted or awaiting-confirmation intents block two-way metadata refresh")]
+    SyncRootTwoWayMetadataRefreshConfirmationFenceActive,
+    #[error("two-way metadata refresh changed the durable remote-write intent population")]
+    SyncRootTwoWayMetadataRefreshIntentStateChanged,
     #[error("local baseline is not ready for two-way metadata refresh")]
     SyncRootTwoWayMetadataRefreshLocalStateNotReady,
     #[error("remote catalog is not ready for two-way metadata refresh")]

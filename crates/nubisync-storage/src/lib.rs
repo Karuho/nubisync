@@ -3164,17 +3164,28 @@ impl Storage {
         u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
     }
 
+    pub fn sync_root_remote_write_intent_status_count(
+        &self,
+        sync_root_id: &str,
+        status: RemoteWriteIntentStatus,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM sync_root_remote_write_intents
+             WHERE sync_root_id=?1 AND status=?2",
+            params![sync_root_id, status.as_str()],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
     pub fn planned_sync_root_remote_write_intent_count(
         &self,
         sync_root_id: &str,
     ) -> Result<u64, StorageError> {
-        let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM sync_root_remote_write_intents
-             WHERE sync_root_id=?1 AND status='planned'",
-            params![sync_root_id],
-            |row| row.get(0),
-        )?;
-        u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+        self.sync_root_remote_write_intent_status_count(
+            sync_root_id,
+            RemoteWriteIntentStatus::Planned,
+        )
     }
 
     pub fn list_pending_sync_root_local_change_events(
@@ -9967,6 +9978,100 @@ mod phase5h1_remote_write_intent_foundation_tests {
         assert!(!debug.contains("predetermined-id"));
         assert!(!debug.contains("parent-id"));
         assert!(!format!("{record:?}").contains("docs/new.txt"));
+    }
+
+    #[test]
+    fn phase5h14b_remote_write_intent_status_count_is_generic() {
+        let (mut storage, root) = setup(SyncMode::TwoWay);
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        storage
+            .upsert_sync_root_remote_write_authority(
+                &root.id,
+                &RemoteWriteAuthoritySnapshot::new(
+                    "parent-id",
+                    5,
+                    None,
+                    None,
+                    true,
+                    false,
+                    true,
+                    30,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let input = RemoteWriteIntentInput::new(
+            event_id(&storage, &root.id, "docs/new.txt"),
+            state.generation,
+            RemoteWriteIntentOperation::CreateFile,
+            "docs/new.txt",
+            LocalItemKind::File,
+            Some(7),
+            Some(200),
+            Some(8),
+            Some(55),
+            None,
+            Some("predetermined-id".into()),
+            Some("parent-id".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            40,
+        )
+        .unwrap();
+
+        let id = storage
+            .create_sync_root_remote_write_intent(&root.id, &input)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .sync_root_remote_write_intent_status_count(
+                    &root.id,
+                    RemoteWriteIntentStatus::Planned,
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_write_intent_status_count(
+                    &root.id,
+                    RemoteWriteIntentStatus::Submitted,
+                )
+                .unwrap(),
+            0
+        );
+
+        storage
+            .connection
+            .execute(
+                "UPDATE sync_root_remote_write_intents SET status='confirmed' WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .sync_root_remote_write_intent_status_count(
+                    &root.id,
+                    RemoteWriteIntentStatus::Planned,
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .sync_root_remote_write_intent_status_count(
+                    &root.id,
+                    RemoteWriteIntentStatus::Confirmed,
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
