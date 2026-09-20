@@ -571,6 +571,147 @@ impl std::fmt::Debug for RemoteWriteIntentInput {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct RemoteWriteFileCreateSettlementInput {
+    pub intent_id: i64,
+    pub source_local_event_id: i64,
+    pub expected_intent_execution_generation: u64,
+    pub expected_from_generation: u64,
+    pub expected_item_count: u64,
+    pub expected_snapshot_completed_at_unix_ms: Option<i64>,
+    promoted_file: LocalItemSnapshot,
+    residual_events: Vec<LocalChangeEventInput>,
+    predetermined_remote_id: String,
+    expected_parent_remote_id: String,
+    sha256_hex: String,
+    pub expected_remote_version: u64,
+    pub settled_at_unix_ms: i64,
+}
+
+impl RemoteWriteFileCreateSettlementInput {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        intent_id: i64,
+        source_local_event_id: i64,
+        expected_intent_execution_generation: u64,
+        expected_from_generation: u64,
+        expected_item_count: u64,
+        expected_snapshot_completed_at_unix_ms: Option<i64>,
+        promoted_file: LocalItemSnapshot,
+        residual_events: Vec<LocalChangeEventInput>,
+        predetermined_remote_id: impl Into<String>,
+        expected_parent_remote_id: impl Into<String>,
+        sha256_hex: impl Into<String>,
+        expected_remote_version: u64,
+        settled_at_unix_ms: i64,
+    ) -> Result<Self, StorageError> {
+        let predetermined_remote_id = predetermined_remote_id.into();
+        let expected_parent_remote_id = expected_parent_remote_id.into();
+        let sha256_hex = sha256_hex.into();
+
+        if intent_id <= 0
+            || source_local_event_id <= 0
+            || expected_from_generation == 0
+            || expected_remote_version == 0
+            || settled_at_unix_ms <= 0
+            || promoted_file.kind() != LocalItemKind::File
+            || promoted_file.size_bytes().is_none_or(|size| size == 0)
+            || !is_safe_local_event_relative_path(promoted_file.relative_path())
+        {
+            return Err(StorageError::InvalidRemoteWriteSettlement);
+        }
+
+        validate_remote_write_identifier(&expected_parent_remote_id)?;
+        validate_materialization_receipt_values(
+            &predetermined_remote_id,
+            promoted_file.relative_path(),
+            &sha256_hex,
+        )?;
+
+        let mut residual_paths = std::collections::HashSet::new();
+        for event in &residual_events {
+            if !residual_paths.insert(event.relative_path()) {
+                return Err(StorageError::InvalidRemoteWriteSettlement);
+            }
+        }
+
+        Ok(Self {
+            intent_id,
+            source_local_event_id,
+            expected_intent_execution_generation,
+            expected_from_generation,
+            expected_item_count,
+            expected_snapshot_completed_at_unix_ms,
+            promoted_file,
+            residual_events,
+            predetermined_remote_id,
+            expected_parent_remote_id,
+            sha256_hex,
+            expected_remote_version,
+            settled_at_unix_ms,
+        })
+    }
+
+    pub fn promoted_file(&self) -> &LocalItemSnapshot {
+        &self.promoted_file
+    }
+
+    pub fn residual_events(&self) -> &[LocalChangeEventInput] {
+        &self.residual_events
+    }
+
+    pub fn predetermined_remote_id(&self) -> &str {
+        &self.predetermined_remote_id
+    }
+
+    pub fn expected_parent_remote_id(&self) -> &str {
+        &self.expected_parent_remote_id
+    }
+
+    pub fn sha256_hex(&self) -> &str {
+        &self.sha256_hex
+    }
+}
+
+impl std::fmt::Debug for RemoteWriteFileCreateSettlementInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteWriteFileCreateSettlementInput")
+            .field("intent_id", &self.intent_id)
+            .field("source_local_event_id", &self.source_local_event_id)
+            .field(
+                "expected_intent_execution_generation",
+                &self.expected_intent_execution_generation,
+            )
+            .field("expected_from_generation", &self.expected_from_generation)
+            .field("expected_item_count", &self.expected_item_count)
+            .field(
+                "expected_snapshot_completed_at_unix_ms",
+                &self.expected_snapshot_completed_at_unix_ms,
+            )
+            .field("promoted_file", &"[redacted]")
+            .field("residual_event_count", &self.residual_events.len())
+            .field("predetermined_remote_id", &"[redacted]")
+            .field("expected_parent_remote_id", &"[redacted]")
+            .field("sha256_hex", &"[redacted]")
+            .field("expected_remote_version", &self.expected_remote_version)
+            .field("settled_at_unix_ms", &self.settled_at_unix_ms)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteWriteFileCreateSettlementResult {
+    pub settled_from_generation: u64,
+    pub settled_to_generation: u64,
+    pub baseline_item_count: u64,
+    pub residual_pending_events: u64,
+    pub superseded_old_events: u64,
+    pub source_event_applied: bool,
+    pub content_ownership_receipt_created: bool,
+    pub settlement_recorded: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct RemoteWriteFolderCreateSettlementInput {
     pub intent_id: i64,
     pub source_local_event_id: i64,
@@ -2460,6 +2601,472 @@ impl Storage {
             |row| row.get(0),
         )?;
         u64::try_from(count).map_err(|_| StorageError::NumericOverflow)
+    }
+
+    pub fn settle_confirmed_sync_root_file_create(
+        &mut self,
+        sync_root_id: &str,
+        input: &RemoteWriteFileCreateSettlementInput,
+    ) -> Result<RemoteWriteFileCreateSettlementResult, StorageError> {
+        let expected_generation = i64::try_from(input.expected_from_generation)
+            .map_err(|_| StorageError::NumericOverflow)?;
+        let expected_item_count =
+            i64::try_from(input.expected_item_count).map_err(|_| StorageError::NumericOverflow)?;
+        let expected_execution_generation =
+            i64::try_from(input.expected_intent_execution_generation)
+                .map_err(|_| StorageError::NumericOverflow)?;
+        let promoted = input.promoted_file();
+        let promoted_size_u64 = promoted
+            .size_bytes()
+            .ok_or(StorageError::RemoteWriteSettlementPreconditionFailed)?;
+        let promoted_size =
+            i64::try_from(promoted_size_u64).map_err(|_| StorageError::NumericOverflow)?;
+        let next_generation = expected_generation
+            .checked_add(1)
+            .ok_or(StorageError::NumericOverflow)?;
+        let next_item_count = expected_item_count
+            .checked_add(1)
+            .ok_or(StorageError::NumericOverflow)?;
+
+        let transaction = self.connection.transaction()?;
+
+        let already_settled: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_remote_write_settlements WHERE intent_id=?1",
+            params![input.intent_id],
+            |row| row.get(0),
+        )?;
+        if already_settled != 0 {
+            return Err(StorageError::RemoteWriteSettlementAlreadyExists);
+        }
+
+        let mode: Option<String> = transaction
+            .query_row(
+                "SELECT mode FROM sync_roots WHERE id=?1",
+                params![sync_root_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(mode) = mode else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+        if SyncMode::parse(&mode)? != SyncMode::TwoWay {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let state: Option<(i64, i64, Option<i64>, i64, i64)> = transaction
+            .query_row(
+                "SELECT snapshot_complete, item_count, snapshot_completed_at_unix_ms,
+                        generation, observation_valid
+                 FROM sync_root_local_inventory_state
+                 WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((snapshot_complete, item_count, completed_at, generation, observation_valid)) =
+            state
+        else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+
+        if snapshot_complete == 0
+            || observation_valid == 0
+            || item_count != expected_item_count
+            || generation != expected_generation
+            || completed_at != input.expected_snapshot_completed_at_unix_ms
+        {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let intent: Option<(
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        )> = transaction
+            .query_row(
+                "SELECT source_local_event_id, baseline_generation, operation_kind, status,
+                        relative_path, local_kind, local_size_bytes, local_modified_unix_ns,
+                        local_device_id, local_inode, predetermined_remote_id,
+                        expected_parent_remote_id, execution_generation
+                 FROM sync_root_remote_write_intents
+                 WHERE id=?1 AND sync_root_id=?2",
+                params![input.intent_id, sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((
+            source_local_event_id,
+            baseline_generation,
+            operation_kind,
+            status,
+            relative_path,
+            local_kind,
+            local_size_bytes,
+            local_modified_unix_ns,
+            local_device_id,
+            local_inode,
+            predetermined_remote_id,
+            expected_parent_remote_id,
+            execution_generation,
+        )) = intent
+        else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+
+        let expected_device_id = local_device_id
+            .as_deref()
+            .ok_or(StorageError::RemoteWriteSettlementPreconditionFailed)?
+            .parse::<u64>()
+            .map_err(|_| StorageError::RemoteWriteSettlementPreconditionFailed)?;
+        let expected_inode = local_inode
+            .as_deref()
+            .ok_or(StorageError::RemoteWriteSettlementPreconditionFailed)?
+            .parse::<u64>()
+            .map_err(|_| StorageError::RemoteWriteSettlementPreconditionFailed)?;
+
+        if source_local_event_id != input.source_local_event_id
+            || baseline_generation != expected_generation
+            || operation_kind != "create_file"
+            || status != "confirmed"
+            || relative_path != promoted.relative_path()
+            || local_kind != "file"
+            || local_size_bytes != Some(promoted_size)
+            || local_modified_unix_ns != Some(promoted.modified_unix_ns())
+            || expected_device_id != promoted.device_id()
+            || expected_inode != promoted.inode()
+            || predetermined_remote_id.as_deref() != Some(input.predetermined_remote_id())
+            || expected_parent_remote_id.as_deref() != Some(input.expected_parent_remote_id())
+            || execution_generation != expected_execution_generation
+        {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let evidence: Option<(
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        )> = transaction
+            .query_row(
+                "SELECT expected_remote_kind, expected_remote_version,
+                        expected_remote_size_bytes, expected_checksum_algorithm,
+                        expected_content_checksum
+                 FROM sync_root_remote_write_intents
+                 WHERE id=?1 AND sync_root_id=?2",
+                params![input.intent_id, sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((
+            expected_remote_kind,
+            expected_remote_version,
+            expected_remote_size,
+            checksum_algorithm,
+            content_checksum,
+        )) = evidence
+        else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+
+        let durable_remote_version = expected_remote_version
+            .as_deref()
+            .ok_or(StorageError::RemoteWriteSettlementPreconditionFailed)?
+            .parse::<u64>()
+            .map_err(|_| StorageError::RemoteWriteSettlementPreconditionFailed)?;
+
+        if expected_remote_kind.as_deref() != Some("file")
+            || durable_remote_version != input.expected_remote_version
+            || durable_remote_version == 0
+            || expected_remote_size != Some(promoted_size)
+            || checksum_algorithm.as_deref() != Some("sha256")
+            || content_checksum.as_deref() != Some(input.sha256_hex())
+        {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let source_event: Option<(String, String, Option<String>, String, i64)> = transaction
+            .query_row(
+                "SELECT event_kind, relative_path, current_kind, status, baseline_generation
+                 FROM sync_root_local_change_events
+                 WHERE id=?1 AND sync_root_id=?2",
+                params![input.source_local_event_id, sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((event_kind, event_path, current_kind, event_status, event_generation)) =
+            source_event
+        else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+
+        if event_kind != "created"
+            || event_path != promoted.relative_path()
+            || current_kind.as_deref() != Some("file")
+            || event_status != "pending"
+            || event_generation != expected_generation
+        {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let expected_name = promoted
+            .relative_path()
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .ok_or(StorageError::RemoteWriteSettlementPreconditionFailed)?;
+
+        let remote: Option<(Option<String>, String, String, Option<i64>, i64)> = transaction
+            .query_row(
+                "SELECT parent_remote_id, name, item_kind, size_bytes, trashed
+                 FROM sync_root_remote_items
+                 WHERE sync_root_id=?1 AND remote_id=?2",
+                params![sync_root_id, input.predetermined_remote_id()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((remote_parent, remote_name, remote_kind, remote_size, remote_trashed)) = remote
+        else {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        };
+
+        if remote_parent.as_deref() != Some(input.expected_parent_remote_id())
+            || remote_name != expected_name
+            || remote_kind != "file"
+            || remote_size != Some(promoted_size)
+            || remote_trashed != 0
+        {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let existing_baseline: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_local_items
+             WHERE sync_root_id=?1 AND relative_path=?2",
+            params![sync_root_id, promoted.relative_path()],
+            |row| row.get(0),
+        )?;
+        if existing_baseline != 0 {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        let receipt_conflicts: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_file_materialization_receipts
+             WHERE sync_root_id=?1
+               AND (remote_id=?2 OR relative_path=?3)",
+            params![
+                sync_root_id,
+                input.predetermined_remote_id(),
+                promoted.relative_path()
+            ],
+            |row| row.get(0),
+        )?;
+        if receipt_conflicts != 0 {
+            return Err(StorageError::RemoteWriteSettlementPreconditionFailed);
+        }
+
+        transaction.execute(
+            "INSERT INTO sync_root_local_items (
+                sync_root_id, relative_path, item_kind, size_bytes, modified_unix_ns,
+                device_id, inode, observed_at_unix_ms
+             ) VALUES (?1,?2,'file',?3,?4,?5,?6,?7)",
+            params![
+                sync_root_id,
+                promoted.relative_path(),
+                promoted_size,
+                promoted.modified_unix_ns(),
+                promoted.device_id().to_string(),
+                promoted.inode().to_string(),
+                input.settled_at_unix_ms
+            ],
+        )?;
+
+        let updated_state = transaction.execute(
+            "UPDATE sync_root_local_inventory_state
+             SET item_count=?2, snapshot_completed_at_unix_ms=?3, generation=?4, observation_valid=1
+             WHERE sync_root_id=?1 AND snapshot_complete=1 AND item_count=?5
+               AND generation=?6 AND observation_valid=1",
+            params![
+                sync_root_id,
+                next_item_count,
+                input.settled_at_unix_ms,
+                next_generation,
+                expected_item_count,
+                expected_generation
+            ],
+        )?;
+        if updated_state != 1 {
+            return Err(StorageError::RemoteWriteSettlementCompareAndSetFailed);
+        }
+
+        let source_applied = transaction.execute(
+            "UPDATE sync_root_local_change_events SET status='applied'
+             WHERE id=?1 AND sync_root_id=?2 AND baseline_generation=?3 AND status='pending'",
+            params![
+                input.source_local_event_id,
+                sync_root_id,
+                expected_generation
+            ],
+        )?;
+        if source_applied != 1 {
+            return Err(StorageError::RemoteWriteSettlementCompareAndSetFailed);
+        }
+
+        let superseded = transaction.execute(
+            "UPDATE sync_root_local_change_events SET status='superseded'
+             WHERE sync_root_id=?1 AND baseline_generation=?2 AND status='pending'",
+            params![sync_root_id, expected_generation],
+        )?;
+
+        for event in input.residual_events() {
+            transaction.execute(
+                "INSERT INTO sync_root_local_change_events (
+                    sync_root_id, baseline_generation, baseline_item_count,
+                    baseline_snapshot_completed_at_unix_ms, event_kind, relative_path,
+                    baseline_kind, current_kind, observed_at_unix_ms, status
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending')",
+                params![
+                    sync_root_id,
+                    next_generation,
+                    next_item_count,
+                    input.settled_at_unix_ms,
+                    event.kind.as_str(),
+                    event.relative_path(),
+                    event.baseline_kind.map(LocalItemKind::as_str),
+                    event.current_kind.map(LocalItemKind::as_str),
+                    input.settled_at_unix_ms
+                ],
+            )?;
+        }
+
+        let pending_residual: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_local_change_events
+             WHERE sync_root_id=?1 AND baseline_generation=?2 AND status='pending'",
+            params![sync_root_id, next_generation],
+            |row| row.get(0),
+        )?;
+        let expected_residual = i64::try_from(input.residual_events().len())
+            .map_err(|_| StorageError::NumericOverflow)?;
+        if pending_residual != expected_residual {
+            return Err(StorageError::RemoteWriteSettlementResidualMismatch);
+        }
+
+        transaction.execute(
+            "INSERT INTO sync_root_file_materialization_receipts (
+                sync_root_id, remote_id, relative_path, size_bytes, sha256_hex,
+                materialized_at_unix_ms, receipt_state
+             ) VALUES (?1,?2,?3,?4,?5,?6,'current')",
+            params![
+                sync_root_id,
+                input.predetermined_remote_id(),
+                promoted.relative_path(),
+                promoted_size,
+                input.sha256_hex(),
+                input.settled_at_unix_ms
+            ],
+        )?;
+
+        transaction.execute(
+            "INSERT INTO sync_root_remote_write_settlements (
+                intent_id, sync_root_id, source_local_event_id,
+                settled_from_generation, settled_to_generation, settled_at_unix_ms
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                input.intent_id,
+                sync_root_id,
+                input.source_local_event_id,
+                expected_generation,
+                next_generation,
+                input.settled_at_unix_ms
+            ],
+        )?;
+
+        let durable_baseline_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_local_items WHERE sync_root_id=?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        if durable_baseline_count != next_item_count {
+            return Err(StorageError::RemoteWriteSettlementBaselineCountMismatch);
+        }
+
+        transaction.commit()?;
+
+        Ok(RemoteWriteFileCreateSettlementResult {
+            settled_from_generation: input.expected_from_generation,
+            settled_to_generation: u64::try_from(next_generation)
+                .map_err(|_| StorageError::NumericOverflow)?,
+            baseline_item_count: u64::try_from(next_item_count)
+                .map_err(|_| StorageError::NumericOverflow)?,
+            residual_pending_events: u64::try_from(pending_residual)
+                .map_err(|_| StorageError::NumericOverflow)?,
+            superseded_old_events: u64::try_from(superseded)
+                .map_err(|_| StorageError::NumericOverflow)?,
+            source_event_applied: true,
+            content_ownership_receipt_created: true,
+            settlement_recorded: true,
+        })
     }
 
     pub fn settle_confirmed_sync_root_folder_create(
@@ -11746,6 +12353,212 @@ mod phase5h10_confirmation_window_tests {
             storage.sync_root_change_cursor(&root.id).unwrap().unwrap(),
             durable
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5h19_file_create_settlement_tests {
+    use super::*;
+
+    fn fixture() -> (Storage, SyncRoot, RemoteWriteFileCreateSettlementInput, i64) {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider.clone(), "phase5h19-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h19-root",
+            provider,
+            account.subject,
+            "/tmp/phase5h19-root",
+            Some("remote-root".into()),
+            SyncMode::TwoWay,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        let baseline =
+            LocalItemSnapshot::new("base", LocalItemKind::Directory, None, 10, 8, 40).unwrap();
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_local_inventory_items(&root.id, &[baseline], 10)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 11)
+            .unwrap();
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+
+        let events = vec![
+            LocalChangeEventInput::new(
+                "new.bin",
+                LocalChangeEventKind::Created,
+                None,
+                Some(LocalItemKind::File),
+            )
+            .unwrap(),
+        ];
+        storage
+            .reconcile_sync_root_local_change_journal(
+                &root.id,
+                state.generation,
+                state.item_count,
+                state.snapshot_completed_at_unix_ms,
+                &events,
+                12,
+            )
+            .unwrap();
+
+        let source_event_id: i64 = storage
+            .connection
+            .query_row(
+                "SELECT id FROM sync_root_local_change_events
+                 WHERE sync_root_id=?1 AND relative_path='new.bin'
+                   AND baseline_generation=?2 AND status='pending'",
+                params![root.id, state.generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_remote_items (
+                    sync_root_id, remote_id, parent_remote_id, name, item_kind,
+                    size_bytes, trashed, observed_at_unix_ms
+                 ) VALUES (?1,'generated-file-id','remote-root','new.bin','file',7,0,20)",
+                params![root.id],
+            )
+            .unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO sync_root_remote_write_intents (
+                    sync_root_id, source_local_event_id, baseline_generation, operation_kind,
+                    relative_path, local_kind, local_size_bytes, local_modified_unix_ns,
+                    local_device_id, local_inode, predetermined_remote_id,
+                    expected_parent_remote_id, expected_remote_kind, expected_remote_version,
+                    expected_remote_size_bytes, expected_checksum_algorithm,
+                    expected_content_checksum, planned_at_unix_ms, status,
+                    execution_generation, confirmed_at_unix_ms
+                 ) VALUES (
+                    ?1,?2,?3,'create_file','new.bin','file',7,100,'8','55',
+                    'generated-file-id','remote-root','file','9',7,'sha256',?4,
+                    13,'confirmed',3,22
+                 )",
+                params![root.id, source_event_id, state.generation, "a".repeat(64)],
+            )
+            .unwrap();
+        let intent_id = storage.connection.last_insert_rowid();
+
+        let promoted =
+            LocalItemSnapshot::new("new.bin", LocalItemKind::File, Some(7), 100, 8, 55).unwrap();
+        let residual = vec![
+            LocalChangeEventInput::new(
+                "new.bin",
+                LocalChangeEventKind::Modified,
+                Some(LocalItemKind::File),
+                Some(LocalItemKind::File),
+            )
+            .unwrap(),
+        ];
+
+        let input = RemoteWriteFileCreateSettlementInput::new(
+            intent_id,
+            source_event_id,
+            3,
+            state.generation,
+            state.item_count,
+            state.snapshot_completed_at_unix_ms,
+            promoted,
+            residual,
+            "generated-file-id",
+            "remote-root",
+            "a".repeat(64),
+            9,
+            30,
+        )
+        .unwrap();
+
+        (storage, root, input, source_event_id)
+    }
+
+    #[test]
+    fn phase5h19_file_settlement_is_atomic_and_preserves_source_residual() {
+        let (mut storage, root, input, source_event_id) = fixture();
+
+        let result = storage
+            .settle_confirmed_sync_root_file_create(&root.id, &input)
+            .unwrap();
+
+        assert_eq!(
+            result.settled_to_generation,
+            result.settled_from_generation + 1
+        );
+        assert_eq!(result.residual_pending_events, 1);
+        assert!(result.source_event_applied);
+        assert!(result.content_ownership_receipt_created);
+        assert!(result.settlement_recorded);
+
+        let state = storage.sync_root_local_inventory_state(&root.id).unwrap();
+        assert_eq!(state.generation, result.settled_to_generation);
+
+        let baseline = storage.list_sync_root_local_items(&root.id).unwrap();
+        let promoted = baseline
+            .iter()
+            .find(|item| item.relative_path() == "new.bin")
+            .unwrap();
+        assert_eq!(promoted.kind(), LocalItemKind::File);
+        assert_eq!(promoted.size_bytes(), Some(7));
+        assert_eq!(promoted.modified_unix_ns(), 100);
+        assert_eq!(promoted.device_id(), 8);
+        assert_eq!(promoted.inode(), 55);
+
+        let receipts = storage
+            .list_sync_root_file_materialization_receipts(&root.id)
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].size_bytes, 7);
+        assert_eq!(receipts[0].sha256_hex, "a".repeat(64));
+
+        let source_status: String = storage
+            .connection
+            .query_row(
+                "SELECT status FROM sync_root_local_change_events WHERE id=?1",
+                params![source_event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_status, "applied");
+
+        let residual: (String, String, i64) = storage
+            .connection
+            .query_row(
+                "SELECT event_kind, relative_path, baseline_generation
+                 FROM sync_root_local_change_events
+                 WHERE sync_root_id=?1 AND status='pending'",
+                params![root.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(residual.0, "modified");
+        assert_eq!(residual.1, "new.bin");
+        assert_eq!(u64::try_from(residual.2).unwrap(), state.generation);
+
+        assert!(
+            storage
+                .sync_root_remote_write_settlement_exists(input.intent_id)
+                .unwrap()
+        );
+
+        assert!(matches!(
+            storage.settle_confirmed_sync_root_file_create(&root.id, &input),
+            Err(StorageError::RemoteWriteSettlementAlreadyExists)
+        ));
     }
 }
 

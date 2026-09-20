@@ -23,6 +23,7 @@ use nubisync_daemon::{
     journal_selected_root_two_way_local_inventory_diff, materialize_selected_root_directories,
     materialize_selected_root_missing_file, materialize_selected_root_missing_files,
     open_selected_root_file_create_local_source,
+    plan_selected_root_confirmed_file_create_settlement,
     plan_selected_root_confirmed_folder_create_settlement, plan_selected_root_local_inventory_diff,
     plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
     plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
@@ -286,6 +287,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_settle_confirmed_folder_create()
+        }
+        [sync, roots, settle_confirmed_file_create, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && settle_confirmed_file_create == "settle-confirmed-file-create"
+                && approve == "--approve" =>
+        {
+            sync_roots_settle_confirmed_file_create()
         }
         [sync, roots, activate_two_way, approve]
             if sync == "sync"
@@ -569,6 +578,7 @@ USAGE:
   nubisync sync roots confirm-folder-create --approve
   nubisync sync roots confirm-file-create --approve
   nubisync sync roots settle-confirmed-folder-create --approve
+  nubisync sync roots settle-confirmed-file-create --approve
   nubisync sync roots activate-two-way --approve
   nubisync sync roots deactivate-two-way --approve
   nubisync sync roots convergence-plan --approve
@@ -2499,6 +2509,133 @@ fn sync_roots_recover_folder_create_submission() -> Result<(), CliError> {
     println!("TOKEN_VALUES_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=metadata_recovery_only");
 
+    Ok(())
+}
+
+fn sync_roots_settle_confirmed_file_create() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootFileCreateSettlementSelectionFailed);
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootFileCreateSettlementSelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootFileCreateSettlementModeUnsupported);
+    }
+
+    let confirmed = storage
+        .list_sync_root_file_create_candidates(&root.id, RemoteWriteIntentStatus::Confirmed)?;
+    let mut candidates = Vec::new();
+    for candidate in confirmed {
+        if !storage.sync_root_remote_write_settlement_exists(candidate.intent_id)? {
+            candidates.push(candidate);
+        }
+    }
+
+    if candidates.is_empty() {
+        println!("SYNC_ROOT_CONFIRMED_FILE_CREATE_SETTLEMENT=PASS");
+        println!("MODE=two_way");
+        println!("UNSETTLED_CONFIRMED_FILE_INTENTS=0");
+        println!("SELECTED_INTENTS=0");
+        println!("LOCAL_DOUBLE_SCAN=not_performed");
+        println!("SOURCE_CONTENT_RECHECK=not_performed");
+        println!("SELECTIVE_BASELINE_PROMOTION=not_performed");
+        println!("RESIDUAL_DIFF_REBASED=not_performed");
+        println!("GENERATION_ADVANCED=no");
+        println!("SOURCE_EVENT_APPLIED=no");
+        println!("CONTENT_OWNERSHIP_RECEIPT_CREATED=no");
+        println!("SETTLEMENT_EVIDENCE_RECORDED=no");
+        println!("SETTLEMENT_DATABASE_MUTATION=no");
+        println!("NETWORK_CHECK=not_performed");
+        println!("PROVIDER_METHOD_CALLED=no");
+        println!("REMOTE_OBJECT_MUTATION=no");
+        println!("FILESYSTEM_READ=not_performed");
+        println!("FILESYSTEM_MUTATION=no");
+        println!("HASH_VALUE_PRINTED=no");
+        println!("REMOTE_IDS_PRINTED=no");
+        println!("TOKEN_VALUES_PRINTED=no");
+        println!("DRIVE_WRITE_ACCESS=no_remote_call");
+        return Ok(());
+    }
+
+    let candidate = candidates
+        .first()
+        .ok_or(CliError::SyncRootFileCreateSettlementSelectionFailed)?;
+    let settled_at_unix_ms = unix_time_ms()?;
+
+    println!("SYNC_ROOT_CONFIRMED_FILE_CREATE_SETTLEMENT_STAGE=derive_selective_baseline");
+    let plan = plan_selected_root_confirmed_file_create_settlement(
+        &storage,
+        &root,
+        candidate,
+        settled_at_unix_ms,
+    )?;
+
+    println!("SYNC_ROOT_CONFIRMED_FILE_CREATE_SETTLEMENT_STAGE=atomic_commit");
+    let result = storage.settle_confirmed_sync_root_file_create(&root.id, &plan)?;
+
+    let intent = storage
+        .sync_root_remote_write_intent_execution_state(candidate.intent_id)?
+        .ok_or(CliError::SyncRootFileCreateSettlementPostconditionFailed)?;
+    if intent.status != RemoteWriteIntentStatus::Confirmed
+        || !storage.sync_root_remote_write_settlement_exists(candidate.intent_id)?
+    {
+        return Err(CliError::SyncRootFileCreateSettlementPostconditionFailed);
+    }
+
+    let receipts = storage.list_sync_root_file_materialization_receipts(&root.id)?;
+    let receipt_ok = receipts.iter().any(|receipt| {
+        receipt.remote_id == candidate.predetermined_remote_id()
+            && receipt.relative_path == candidate.relative_path()
+            && receipt.size_bytes == plan.promoted_file().size_bytes().unwrap_or(0)
+            && receipt.sha256_hex == plan.sha256_hex()
+    });
+    if !receipt_ok {
+        return Err(CliError::SyncRootFileCreateSettlementPostconditionFailed);
+    }
+
+    println!("SYNC_ROOT_CONFIRMED_FILE_CREATE_SETTLEMENT=PASS");
+    println!("MODE=two_way");
+    println!("UNSETTLED_CONFIRMED_FILE_INTENTS={}", candidates.len());
+    println!("SELECTED_INTENTS=1");
+    println!("LOCAL_DOUBLE_SCAN=performed");
+    println!("SOURCE_CONTENT_RECHECK=conditional_when_metadata_matches_uploaded_snapshot");
+    println!("SELECTIVE_BASELINE_PROMOTION=performed");
+    println!("PROMOTED_SNAPSHOT=uploaded_source_not_current_path");
+    println!("RESIDUAL_DIFF_REBASED=yes");
+    println!("RESIDUAL_PENDING_EVENTS={}", result.residual_pending_events);
+    println!(
+        "OLD_PENDING_EVENTS_SUPERSEDED={}",
+        result.superseded_old_events
+    );
+    println!("GENERATION_FROM={}", result.settled_from_generation);
+    println!("GENERATION_TO={}", result.settled_to_generation);
+    println!("GENERATION_ADVANCED=yes");
+    println!("SOURCE_EVENT_APPLIED=yes");
+    println!("CONTENT_OWNERSHIP_RECEIPT_CREATED=yes");
+    println!("SETTLEMENT_EVIDENCE_RECORDED=yes");
+    println!("REMOTE_WRITE_INTENT_STATUS=confirmed");
+    println!("SETTLEMENT_DATABASE_MUTATION=yes");
+    println!("NETWORK_CHECK=not_performed");
+    println!("PROVIDER_METHOD_CALLED=no");
+    println!("REMOTE_OBJECT_MUTATION=no");
+    println!("FILESYSTEM_READ=metadata_plus_conditional_content_hash");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=no_remote_call");
     Ok(())
 }
 
@@ -7724,6 +7861,7 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "confirm-folder-create"
                 | "confirm-file-create"
                 | "settle-confirmed-folder-create"
+                | "settle-confirmed-file-create"
                 | "activate-two-way"
                 | "deactivate-two-way"
                 | "convergence-plan"
@@ -7852,6 +7990,15 @@ mod sync_root_cli_tests {
     #[test]
     fn phase5h18_file_create_confirmation_is_cross_process_locked() {
         let args = ["sync", "roots", "confirm-file-create", "--approve"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(cli_requires_cross_process_execution_lock(&args));
+    }
+
+    #[test]
+    fn phase5h19_file_create_settlement_is_cross_process_locked() {
+        let args = ["sync", "roots", "settle-confirmed-file-create", "--approve"]
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
@@ -8328,6 +8475,12 @@ enum CliError {
     SyncRootFileCreateStreamFingerprintMismatch,
     #[error("sync root folder-create submission selection failed")]
     SyncRootFolderCreateSubmissionSelectionFailed,
+    #[error("sync root confirmed ordinary-file create settlement selection failed")]
+    SyncRootFileCreateSettlementSelectionFailed,
+    #[error("sync root confirmed ordinary-file create settlement requires two_way mode")]
+    SyncRootFileCreateSettlementModeUnsupported,
+    #[error("sync root confirmed ordinary-file create settlement postcondition failed")]
+    SyncRootFileCreateSettlementPostconditionFailed,
     #[error("sync root confirmed folder-create settlement selection failed")]
     SyncRootFolderCreateSettlementSelectionFailed,
     #[error("sync root confirmed folder-create settlement requires two_way mode")]

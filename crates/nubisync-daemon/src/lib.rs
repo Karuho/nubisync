@@ -11,7 +11,8 @@ use nubisync_drive::{
 };
 use nubisync_storage::{
     LocalChangeEventInput, LocalChangeEventKind, LocalChangeEventRecord, LocalChangeJournalCommit,
-    RemoteWriteAuthoritySnapshot, RemoteWriteFileCreateCandidate, RemoteWriteFolderCreateCandidate,
+    RemoteWriteAuthoritySnapshot, RemoteWriteFileCreateCandidate,
+    RemoteWriteFileCreateSettlementInput, RemoteWriteFolderCreateCandidate,
     RemoteWriteFolderCreateSettlementInput, RemoteWriteIntentInput, RemoteWriteIntentOperation,
     RemoteWriteIntentStatus, Storage, StorageError, SyncRootCatalogBatchCommit,
     SyncRootCatalogMutation, SyncRootDirectoryMaterializationReceipt,
@@ -5759,6 +5760,160 @@ pub struct SelectedRootLocalJournalResult {
     pub superseded_events: u64,
 }
 
+pub fn plan_selected_root_confirmed_file_create_settlement(
+    storage: &Storage,
+    sync_root: &SyncRoot,
+    candidate: &RemoteWriteFileCreateCandidate,
+    settled_at_unix_ms: i64,
+) -> Result<RemoteWriteFileCreateSettlementInput, SelectedRootExecutorError> {
+    const SETTLEMENT_HASH_CHUNK_BYTES: usize = 1024 * 1024;
+
+    if sync_root.mode != SyncMode::TwoWay {
+        return Err(SelectedRootExecutorError::RemoteWriteFileSettlementModeUnsupported);
+    }
+    if candidate.status != RemoteWriteIntentStatus::Confirmed || settled_at_unix_ms <= 0 {
+        return Err(SelectedRootExecutorError::RemoteWriteFileSettlementNotEligible);
+    }
+
+    let evidence = storage
+        .sync_root_file_create_content_evidence(candidate.intent_id)?
+        .ok_or(SelectedRootExecutorError::RemoteWriteFileSettlementEvidenceMismatch)?;
+    let remote_version = evidence
+        .remote_version
+        .ok_or(SelectedRootExecutorError::RemoteWriteFileSettlementEvidenceMismatch)?;
+    if evidence.size_bytes != candidate.local_size_bytes || evidence.size_bytes == 0 {
+        return Err(SelectedRootExecutorError::RemoteWriteFileSettlementEvidenceMismatch);
+    }
+
+    let state = storage.sync_root_local_inventory_state(&sync_root.id)?;
+    if !state.snapshot_complete
+        || !state.observation_valid
+        || state.generation != candidate.baseline_generation
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFileSettlementLocalAuthorityMismatch);
+    }
+
+    let baseline = storage.list_sync_root_local_items(&sync_root.id)?;
+    let baseline_count =
+        u64::try_from(baseline.len()).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+    if baseline_count != state.item_count
+        || baseline
+            .iter()
+            .any(|item| item.relative_path() == candidate.relative_path())
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFileSettlementLocalAuthorityMismatch);
+    }
+
+    let pending = storage
+        .list_pending_sync_root_local_change_events(&sync_root.id, candidate.baseline_generation)?;
+    let source_event = pending
+        .iter()
+        .find(|event| event.id == candidate.source_local_event_id)
+        .ok_or(SelectedRootExecutorError::RemoteWriteFileSettlementSourceEventMismatch)?;
+    if source_event.relative_path() != candidate.relative_path()
+        || source_event.kind != LocalChangeEventKind::Created
+        || source_event.baseline_kind.is_some()
+        || source_event.current_kind != Some(LocalItemKind::File)
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFileSettlementSourceEventMismatch);
+    }
+
+    let first = scan_selected_root_local_snapshot(sync_root)?;
+    let second = scan_selected_root_local_snapshot(sync_root)?;
+    if first != second {
+        return Err(SelectedRootExecutorError::LocalDiffScanRace);
+    }
+
+    let promoted = LocalItemSnapshot::new(
+        candidate.relative_path(),
+        LocalItemKind::File,
+        Some(candidate.local_size_bytes),
+        candidate.local_modified_unix_ns,
+        candidate.local_device_id,
+        candidate.local_inode,
+    )
+    .map_err(|_| SelectedRootExecutorError::RemoteWriteFileSettlementSnapshotInvalid)?;
+
+    if let Some(current) = first
+        .iter()
+        .find(|item| item.relative_path() == candidate.relative_path())
+    {
+        let metadata_matches_uploaded = current.kind() == LocalItemKind::File
+            && current.size_bytes() == Some(candidate.local_size_bytes)
+            && current.modified_unix_ns() == candidate.local_modified_unix_ns
+            && current.device_id() == candidate.local_device_id
+            && current.inode() == candidate.local_inode;
+
+        if metadata_matches_uploaded {
+            let mut source = open_selected_root_file_create_local_source(sync_root, candidate)?;
+            while source
+                .read_next_chunk(SETTLEMENT_HASH_CHUNK_BYTES)?
+                .is_some()
+            {}
+            let current_sha256 = source.completed_sha256_hex()?;
+            let finished = source.finish()?;
+            if !finished.source_stable || current_sha256 != evidence.sha256_hex() {
+                return Err(SelectedRootExecutorError::RemoteWriteFileSettlementContentMismatch);
+            }
+        }
+    }
+
+    let remote = storage
+        .sync_root_remote_item(&sync_root.id, candidate.predetermined_remote_id())?
+        .ok_or(SelectedRootExecutorError::RemoteWriteFileSettlementRemoteCatalogMismatch)?;
+    let expected_name = basename(candidate.relative_path());
+    if expected_name.is_empty()
+        || remote.name != expected_name
+        || remote.kind != RemoteItemKind::File
+        || remote.size_bytes != Some(evidence.size_bytes)
+        || remote.parent_remote_id.as_deref() != Some(candidate.expected_parent_remote_id())
+        || remote.trashed
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFileSettlementRemoteCatalogMismatch);
+    }
+
+    let mut proposed_baseline = baseline.clone();
+    proposed_baseline.push(promoted.clone());
+    proposed_baseline.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
+
+    let next_generation = state
+        .generation
+        .checked_add(1)
+        .ok_or(SelectedRootExecutorError::CountOverflow)?;
+    let residual_diff = build_selected_root_local_inventory_diff(
+        &proposed_baseline,
+        &first,
+        next_generation,
+        Some(settled_at_unix_ms),
+    )?;
+
+    let mut residual_events = Vec::with_capacity(residual_diff.entries().len());
+    for entry in residual_diff.entries() {
+        residual_events.push(LocalChangeEventInput::new(
+            entry.relative_path(),
+            local_change_event_kind(entry.kind),
+            entry.baseline_kind,
+            entry.current_kind,
+        )?);
+    }
+
+    Ok(RemoteWriteFileCreateSettlementInput::new(
+        candidate.intent_id,
+        candidate.source_local_event_id,
+        candidate.execution_generation,
+        state.generation,
+        state.item_count,
+        state.snapshot_completed_at_unix_ms,
+        promoted,
+        residual_events,
+        candidate.predetermined_remote_id(),
+        candidate.expected_parent_remote_id(),
+        evidence.sha256_hex(),
+        remote_version,
+        settled_at_unix_ms,
+    )?)
+}
+
 pub fn plan_selected_root_confirmed_folder_create_settlement(
     storage: &Storage,
     sync_root: &SyncRoot,
@@ -7819,6 +7974,22 @@ pub enum SelectedRootExecutorError {
     RemoteWritePlanOwnershipAmbiguous,
     #[error("two-way supervised local journal requires a two_way root")]
     TwoWayLocalJournalModeUnsupported,
+    #[error("confirmed ordinary-file create settlement requires a two_way root")]
+    RemoteWriteFileSettlementModeUnsupported,
+    #[error("confirmed ordinary-file create settlement candidate is not eligible")]
+    RemoteWriteFileSettlementNotEligible,
+    #[error("confirmed ordinary-file create settlement local authority mismatched")]
+    RemoteWriteFileSettlementLocalAuthorityMismatch,
+    #[error("confirmed ordinary-file create settlement source event mismatched")]
+    RemoteWriteFileSettlementSourceEventMismatch,
+    #[error("confirmed ordinary-file create settlement content evidence mismatched")]
+    RemoteWriteFileSettlementEvidenceMismatch,
+    #[error("confirmed ordinary-file create settlement remote catalog mismatched")]
+    RemoteWriteFileSettlementRemoteCatalogMismatch,
+    #[error("confirmed ordinary-file create settlement uploaded snapshot is invalid")]
+    RemoteWriteFileSettlementSnapshotInvalid,
+    #[error("current local content is ambiguous against the uploaded file snapshot")]
+    RemoteWriteFileSettlementContentMismatch,
     #[error("confirmed folder-create settlement requires a two_way root")]
     RemoteWriteFolderSettlementModeUnsupported,
     #[error("confirmed folder-create settlement candidate is not eligible")]
