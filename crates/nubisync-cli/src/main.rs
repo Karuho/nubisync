@@ -188,6 +188,14 @@ fn run() -> Result<(), CliError> {
         {
             sync_roots_local_journal()
         }
+        [sync, roots, refresh_two_way_metadata, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && refresh_two_way_metadata == "refresh-two-way-metadata"
+                && approve == "--approve" =>
+        {
+            sync_roots_refresh_two_way_metadata()
+        }
         [sync, roots, observe_write_authority, approve]
             if sync == "sync"
                 && roots == "roots"
@@ -522,6 +530,7 @@ USAGE:
   nubisync sync roots local-baseline --approve
   nubisync sync roots local-diff --approve
   nubisync sync roots local-journal --approve
+  nubisync sync roots refresh-two-way-metadata --approve
   nubisync sync roots observe-write-authority --approve
   nubisync sync roots remote-write-plan --approve
   nubisync sync roots allocate-create-ids --approve
@@ -925,6 +934,139 @@ fn sync_roots_metadata_step() -> Result<(), CliError> {
     println!("FILESYSTEM_MUTATION=no");
     println!("DRIVE_WRITE_ACCESS=no");
 
+    Ok(())
+}
+
+fn sync_roots_refresh_two_way_metadata() -> Result<(), CliError> {
+    const MAX_PAGES: usize = 64;
+
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshSelectionFailed);
+    }
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootTwoWayMetadataRefreshSelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshModeUnsupported);
+    }
+    if storage.sync_root_remote_write_intent_count(&root.id)? != 0 {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshExistingIntents);
+    }
+
+    let local_before = storage.sync_root_local_inventory_state(&root.id)?;
+    if !local_before.snapshot_complete || !local_before.observation_valid {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshLocalStateNotReady);
+    }
+    let pending_before =
+        storage.pending_sync_root_local_change_event_count(&root.id, local_before.generation)?;
+
+    let remote_before = storage.sync_root_remote_inventory_state(&root.id)?;
+    if !remote_before.ready_for_reconciliation() {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady);
+    }
+    let cursor_before = storage
+        .sync_root_change_cursor(&root.id)?
+        .ok_or(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady)?;
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_TWO_WAY_METADATA_REFRESH_STAGE=refresh_readonly_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+    if let Some(rotated) = tokens.refresh_token() {
+        keyring.put(&refresh_key, SecretValue::new(rotated.as_bytes().to_vec())?)?;
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    if api.user_info()?.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_TWO_WAY_METADATA_REFRESH_STAGE=collect_change_window");
+    let mut pages = 0usize;
+    loop {
+        let result = collect_selected_root_change_window_page(&api, &mut storage, &root)?;
+        pages = pages.checked_add(1).ok_or(CliError::NumericOverflow)?;
+        if result.complete {
+            break;
+        }
+        if pages >= MAX_PAGES {
+            return Err(CliError::SyncRootTwoWayMetadataRefreshPageLimitExceeded);
+        }
+    }
+
+    println!("SYNC_ROOT_TWO_WAY_METADATA_REFRESH_STAGE=commit_change_window");
+    let execution =
+        execute_completed_selected_root_change_window(&api, &mut storage, &root, unix_time_ms()?)?;
+
+    let local_after = storage.sync_root_local_inventory_state(&root.id)?;
+    let pending_after =
+        storage.pending_sync_root_local_change_event_count(&root.id, local_after.generation)?;
+    if local_after.generation != local_before.generation
+        || local_after.item_count != local_before.item_count
+        || local_after.snapshot_completed_at_unix_ms != local_before.snapshot_completed_at_unix_ms
+        || local_after.observation_valid != local_before.observation_valid
+        || pending_after != pending_before
+    {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshLocalStateChanged);
+    }
+    if storage.sync_root_change_window_state(&root.id)?.is_some() {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshWindowNotCleared);
+    }
+
+    let remote_after = storage.sync_root_remote_inventory_state(&root.id)?;
+    if !remote_after.ready_for_reconciliation() {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady);
+    }
+    let cursor_after = storage
+        .sync_root_change_cursor(&root.id)?
+        .ok_or(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady)?;
+
+    println!("SYNC_ROOT_TWO_WAY_METADATA_REFRESH=PASS");
+    println!("MODE=two_way");
+    println!("PAGES_COLLECTED={pages}");
+    println!("PROVIDER_CHANGES={}", execution.provider_changes);
+    println!("CATALOG_MUTATIONS={}", execution.storage_mutations);
+    println!("AUTHORITATIVE_ITEMS={}", execution.authoritative_items);
+    println!("CURSOR_ADVANCED={}", yes_no(cursor_after != cursor_before));
+    println!("LOCAL_BASELINE_UNCHANGED=yes");
+    println!("LOCAL_PENDING_EVENTS_PRESERVED=yes");
+    println!("LOCAL_PENDING_EVENTS={pending_after}");
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_READ=not_performed");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("PROVIDER_WRITE_METHOD_CALLED=no");
+    println!("REMOTE_OBJECT_MUTATION=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("CURSOR_VALUES_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=readonly_metadata_refresh");
     Ok(())
 }
 
@@ -6705,6 +6847,7 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "local-baseline"
                 | "local-diff"
                 | "local-journal"
+                | "refresh-two-way-metadata"
                 | "observe-write-authority"
                 | "remote-write-plan"
                 | "allocate-create-ids"
@@ -6817,6 +6960,15 @@ mod sync_root_cli_tests {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(!cli_requires_cross_process_execution_lock(&args));
         }
+    }
+
+    #[test]
+    fn phase5h14a_execution_lock_covers_two_way_metadata_refresh() {
+        let args = ["sync", "roots", "refresh-two-way-metadata", "--approve"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(cli_requires_cross_process_execution_lock(&args));
     }
 
     #[test]
@@ -7177,6 +7329,22 @@ enum CliError {
     SyncRootInventorySelectionFailed,
     #[error("sync root metadata-step selection failed")]
     SyncRootMetadataStepSelectionFailed,
+    #[error("sync root two-way metadata refresh selection failed")]
+    SyncRootTwoWayMetadataRefreshSelectionFailed,
+    #[error("sync root two-way metadata refresh requires two_way mode")]
+    SyncRootTwoWayMetadataRefreshModeUnsupported,
+    #[error("existing remote-write intents block two-way metadata refresh")]
+    SyncRootTwoWayMetadataRefreshExistingIntents,
+    #[error("local baseline is not ready for two-way metadata refresh")]
+    SyncRootTwoWayMetadataRefreshLocalStateNotReady,
+    #[error("remote catalog is not ready for two-way metadata refresh")]
+    SyncRootTwoWayMetadataRefreshRemoteStateNotReady,
+    #[error("two-way metadata refresh exceeded the supervised page limit")]
+    SyncRootTwoWayMetadataRefreshPageLimitExceeded,
+    #[error("two-way metadata refresh changed local baseline or pending events")]
+    SyncRootTwoWayMetadataRefreshLocalStateChanged,
+    #[error("two-way metadata refresh left an open change window")]
+    SyncRootTwoWayMetadataRefreshWindowNotCleared,
     #[error("sync root write-authority observation selection failed")]
     SyncRootWriteAuthoritySelectionFailed,
     #[error("sync root catalog is not ready for write-authority observation")]
