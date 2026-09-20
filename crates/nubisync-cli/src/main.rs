@@ -22,6 +22,7 @@ use nubisync_daemon::{
     execute_selected_root_unified_convergence_step, journal_selected_root_local_inventory_diff,
     journal_selected_root_two_way_local_inventory_diff, materialize_selected_root_directories,
     materialize_selected_root_missing_file, materialize_selected_root_missing_files,
+    open_selected_root_file_create_local_source,
     plan_selected_root_confirmed_folder_create_settlement, plan_selected_root_local_inventory_diff,
     plan_selected_root_local_materialization, plan_selected_root_receive_only_convergence,
     plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
@@ -33,7 +34,8 @@ use nubisync_daemon::{
     verify_selected_root_existing_files, verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
-    DriveExpectedFolderLookup, DriveFolderCreateSubmission, DriveRootMembership,
+    DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES, DriveExpectedFileLookup, DriveExpectedFolderLookup,
+    DriveFolderCreateSubmission, DriveResumableUploadProgress, DriveRootMembership,
     GOOGLE_DRIVE_FULL_SCOPE, GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi,
     GoogleOAuthConfig,
 };
@@ -56,6 +58,7 @@ const FULLSYNC_REFRESH_TOKEN_PURPOSE: &str = "full-sync-refresh-token";
 const OAUTH_CLIENT_SUBJECT: &str = "oauth-desktop-client";
 const OAUTH_CLIENT_ID_PURPOSE: &str = "client-id";
 const OAUTH_CLIENT_SECRET_PURPOSE: &str = "client-secret";
+const SUPERVISED_FILE_CREATE_MIME_TYPE: &str = "application/octet-stream";
 
 fn main() {
     if let Err(error) = run() {
@@ -243,6 +246,22 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_recover_folder_create_submission()
+        }
+        [sync, roots, submit_file_create, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && submit_file_create == "submit-file-create"
+                && approve == "--approve" =>
+        {
+            sync_roots_submit_file_create()
+        }
+        [sync, roots, recover_file_create, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && recover_file_create == "recover-file-create-submission"
+                && approve == "--approve" =>
+        {
+            sync_roots_recover_file_create_submission()
         }
         [sync, roots, confirm_folder_create, approve]
             if sync == "sync"
@@ -537,6 +556,8 @@ USAGE:
   nubisync sync roots folder-create-recovery-plan --approve
   nubisync sync roots submit-folder-create --approve
   nubisync sync roots recover-folder-create-submission --approve
+  nubisync sync roots submit-file-create --approve
+  nubisync sync roots recover-file-create-submission --approve
   nubisync sync roots confirm-folder-create --approve
   nubisync sync roots settle-confirmed-folder-create --approve
   nubisync sync roots activate-two-way --approve
@@ -1599,6 +1620,462 @@ fn sync_roots_allocate_create_ids() -> Result<(), CliError> {
     println!("DRIVE_WRITE_ACCESS=generate_ids_only");
     println!("DRIVE_WRITE_EXECUTION_ENABLED=no");
 
+    Ok(())
+}
+
+fn file_create_leaf_name(relative_path: &str) -> Result<&str, CliError> {
+    relative_path
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or(CliError::SyncRootFileCreateLocalIdentityMismatch)
+}
+
+fn sync_roots_submit_file_create() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootFileCreateSubmissionSelectionFailed);
+    }
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootFileCreateSubmissionSelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootFileCreateSubmissionModeUnsupported);
+    }
+
+    let candidates = storage
+        .list_sync_root_file_create_candidates(&root.id, RemoteWriteIntentStatus::Planned)?;
+    if candidates.is_empty() {
+        println!("SYNC_ROOT_FILE_CREATE_SUBMISSION=PASS");
+        println!("MODE=two_way");
+        println!("PLANNED_CREATE_FILE_INTENTS=0");
+        println!("SELECTED_INTENTS=0");
+        println!("UPLOAD_ATTEMPTED=no");
+        println!("NETWORK_CHECK=not_performed");
+        println!("DATABASE_MUTATION=no");
+        println!("FILE_CONTENT_ACCESSED=no");
+        println!("REMOTE_OBJECT_MUTATION=none");
+        return Ok(());
+    }
+    if candidates.len() != 1 {
+        return Err(CliError::SyncRootFileCreateSubmissionSelectionFailed);
+    }
+
+    let candidate = candidates
+        .first()
+        .ok_or(CliError::SyncRootFileCreateSubmissionSelectionFailed)?;
+
+    println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=open_local_source");
+    let mut local = open_selected_root_file_create_local_source(&root, candidate)?;
+    let leaf_name = local.leaf_name().to_owned();
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let fullsync_key = fullsync_refresh_token_key(&account.subject)?;
+    let fullsync_refresh_token = required_secret_utf8(
+        keyring.get(&fullsync_key)?,
+        CliError::MissingStoredFullSyncRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+
+    println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=refresh_fullsync_access_token");
+    let tokens = oauth.refresh_access_token(&fullsync_refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_FULL_SCOPE)
+    {
+        return Err(CliError::GoogleFullSyncScopeNotGranted);
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &fullsync_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    let durable_cursor = storage
+        .sync_root_change_cursor(&root.id)?
+        .ok_or(CliError::SyncRootFileCreateRemoteFenceMismatch)?;
+    let authority_state = storage
+        .sync_root_remote_write_authority_state(&root.id)?
+        .ok_or(CliError::SyncRootFileCreateRemoteFenceMismatch)?;
+    if authority_state.change_cursor != durable_cursor {
+        return Err(CliError::SyncRootFileCreateRemoteFenceMismatch);
+    }
+
+    let parent_remote_id = candidate.expected_parent_remote_id();
+    let durable_parent_authority = storage
+        .sync_root_remote_write_authority(&root.id, parent_remote_id)?
+        .ok_or(CliError::SyncRootFileCreateParentAuthorityMismatch)?;
+    if !durable_parent_authority.can_add_children {
+        return Err(CliError::SyncRootFileCreateParentAuthorityMismatch);
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=verify_fresh_parent");
+    let fresh_parent = api.observe_write_authority(parent_remote_id)?;
+    if fresh_parent.kind != RemoteItemKind::Folder
+        || !fresh_parent.can_add_children
+        || fresh_parent.remote_version != durable_parent_authority.remote_version
+    {
+        return Err(CliError::SyncRootFileCreateParentAuthorityMismatch);
+    }
+
+    let root_remote_id = root
+        .remote_root_id
+        .as_deref()
+        .ok_or(CliError::SyncRootFileCreateRemoteRootMissing)?;
+    let drive_root = api.resolve_folder_root(root_remote_id)?;
+    if parent_remote_id != root_remote_id {
+        let parent_item = storage
+            .sync_root_remote_item(&root.id, parent_remote_id)?
+            .ok_or(CliError::SyncRootFileCreateParentTopologyMismatch)?;
+        if parent_item.kind != RemoteItemKind::Folder || parent_item.trashed {
+            return Err(CliError::SyncRootFileCreateParentTopologyMismatch);
+        }
+        if api.resolve_item_membership(&parent_item, &drive_root)?
+            != DriveRootMembership::Descendant
+        {
+            return Err(CliError::SyncRootFileCreateParentTopologyMismatch);
+        }
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=establish_pre_submit_fence");
+    let provider_cursor = api.current_change_cursor()?;
+    if provider_cursor != durable_cursor {
+        return Err(CliError::SyncRootFileCreateRemoteFenceMismatch);
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=commit_submitted");
+    let submitted = storage.begin_sync_root_file_create_submission(
+        &root.id,
+        candidate.intent_id,
+        candidate.execution_generation,
+        &provider_cursor,
+        unix_time_ms()?,
+    )?;
+
+    println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=initiate_resumable");
+    let session = api.initiate_resumable_file_create(
+        candidate.predetermined_remote_id(),
+        &leaf_name,
+        parent_remote_id,
+        SUPERVISED_FILE_CREATE_MIME_TYPE,
+        local.total_bytes(),
+    )?;
+
+    let chunk_size = usize::try_from(DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES)
+        .map_err(|_| CliError::NumericOverflow)?;
+    let mut offset = 0_u64;
+    let mut chunks = 0_u64;
+    let mut final_sha256: Option<String> = None;
+    let mut completion = None;
+
+    while offset < local.total_bytes() {
+        let chunk = local
+            .read_next_chunk(chunk_size)?
+            .ok_or(CliError::SyncRootFileCreateStreamIncomplete)?;
+        let chunk_len = u64::try_from(chunk.len()).map_err(|_| CliError::NumericOverflow)?;
+        let expected_next = offset
+            .checked_add(chunk_len)
+            .ok_or(CliError::NumericOverflow)?;
+        let is_final = expected_next == local.total_bytes();
+
+        if is_final {
+            let sha256 = local.completed_sha256_hex()?;
+            storage.record_sync_root_file_create_stream_fingerprint(
+                candidate.intent_id,
+                submitted.execution_generation,
+                local.total_bytes(),
+                &sha256,
+            )?;
+            final_sha256 = Some(sha256);
+            println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=fingerprint_durable_before_final_put");
+        }
+
+        println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=upload_chunk");
+        let progress = match api.upload_resumable_file_chunk(&session, offset, chunk) {
+            Ok(progress) => progress,
+            Err(_) => {
+                println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=query_status_after_chunk_error");
+                api.query_resumable_file_upload_status(&session)?
+            }
+        };
+
+        chunks = chunks.checked_add(1).ok_or(CliError::NumericOverflow)?;
+
+        match progress {
+            DriveResumableUploadProgress::Incomplete { next_offset }
+                if !is_final && next_offset == expected_next =>
+            {
+                offset = next_offset;
+            }
+            DriveResumableUploadProgress::Complete(value) if is_final => {
+                completion = Some(value);
+                offset = expected_next;
+            }
+            DriveResumableUploadProgress::Expired => {
+                return Err(CliError::SyncRootFileCreateSessionExpired);
+            }
+            DriveResumableUploadProgress::Incomplete { .. }
+            | DriveResumableUploadProgress::Complete(_) => {
+                return Err(CliError::SyncRootFileCreateResumeOffsetMismatch);
+            }
+        }
+    }
+
+    let final_sha256 = final_sha256.ok_or(CliError::SyncRootFileCreateStreamIncomplete)?;
+    let completion = completion.ok_or(CliError::SyncRootFileCreateCompletionMissing)?;
+
+    let remote_version = match completion.sha256_checksum() {
+        Some(remote_sha256) if remote_sha256 == final_sha256 => completion.remote_version,
+        Some(_) => {
+            storage.transition_sync_root_file_create_intent(
+                candidate.intent_id,
+                RemoteWriteIntentStatus::Submitted,
+                submitted.execution_generation,
+                RemoteWriteIntentStatus::Conflict,
+                unix_time_ms()?,
+            )?;
+            return Err(CliError::SyncRootFileCreateProviderHashMismatch);
+        }
+        None => {
+            println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=verify_completed_id");
+            match api.inspect_expected_file(
+                candidate.predetermined_remote_id(),
+                &leaf_name,
+                parent_remote_id,
+                SUPERVISED_FILE_CREATE_MIME_TYPE,
+                local.total_bytes(),
+                &final_sha256,
+            )? {
+                DriveExpectedFileLookup::Exact { remote_version } => remote_version,
+                DriveExpectedFileLookup::Mismatch => {
+                    storage.transition_sync_root_file_create_intent(
+                        candidate.intent_id,
+                        RemoteWriteIntentStatus::Submitted,
+                        submitted.execution_generation,
+                        RemoteWriteIntentStatus::Conflict,
+                        unix_time_ms()?,
+                    )?;
+                    return Err(CliError::SyncRootFileCreateProviderHashMismatch);
+                }
+                DriveExpectedFileLookup::Missing => {
+                    return Err(CliError::SyncRootFileCreateCompletionMissing);
+                }
+            }
+        }
+    };
+
+    let streamed = local.finish()?;
+    if streamed.sha256_hex() != final_sha256 {
+        return Err(CliError::SyncRootFileCreateStreamFingerprintMismatch);
+    }
+
+    let awaiting = storage.complete_sync_root_file_create_upload(
+        candidate.intent_id,
+        submitted.execution_generation,
+        remote_version,
+        unix_time_ms()?,
+    )?;
+
+    println!("SYNC_ROOT_FILE_CREATE_SUBMISSION=PASS");
+    println!("MODE=two_way");
+    println!("PLANNED_CREATE_FILE_INTENTS=1");
+    println!("SELECTED_INTENTS=1");
+    println!("SUBMISSION_ATTEMPTED=yes");
+    println!("LOCAL_IDENTITY_VERIFIED=yes");
+    println!("FULLSYNC_CREDENTIAL_VERIFIED=yes");
+    println!("ACCOUNT_SUBJECT_MATCH=yes");
+    println!("PARENT_AUTHORITY_VERIFIED=yes");
+    println!("PARENT_TOPOLOGY_VERIFIED=yes");
+    println!("PRE_SUBMIT_CURSOR_MATCH=yes");
+    println!("DURABLE_SUBMITTED_BEFORE_UPLOAD=yes");
+    println!("RESUMABLE_SESSION_INITIATED=yes");
+    println!("UPLOAD_CHUNKS={chunks}");
+    println!("BYTES_STREAMED={}", streamed.bytes_streamed);
+    println!("STREAM_SHA256_DURABLE=yes");
+    println!("HASH_VALUE_PRINTED=no");
+    println!(
+        "SOURCE_STABLE_AFTER_STREAM={}",
+        yes_no(streamed.source_stable)
+    );
+    println!("INTENT_STATUS_AFTER={}", awaiting.status.as_str());
+    println!("CHANGE_STREAM_CONFIRMATION_REQUIRED=yes");
+    println!("CONFIRMED=no");
+    println!("LOCAL_EVENT_APPLIED=no");
+    println!("BASELINE_ADVANCED=no");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=yes");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("CURSOR_VALUES_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("SESSION_URI_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=file_create_resumable_only");
+    Ok(())
+}
+
+fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootFileCreateRecoverySelectionFailed);
+    }
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootFileCreateRecoverySelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootFileCreateSubmissionModeUnsupported);
+    }
+
+    let candidates = storage
+        .list_sync_root_file_create_candidates(&root.id, RemoteWriteIntentStatus::Submitted)?;
+    if candidates.is_empty() {
+        println!("SYNC_ROOT_FILE_CREATE_RECOVERY=PASS");
+        println!("MODE=two_way");
+        println!("SUBMITTED_CREATE_FILE_INTENTS=0");
+        println!("SELECTED_INTENTS=0");
+        println!("RECOVERY_OUTCOME=none");
+        println!("PROVIDER_WRITE=not_performed");
+        println!("FILE_CONTENT_ACCESSED=no");
+        return Ok(());
+    }
+    if candidates.len() != 1 {
+        return Err(CliError::SyncRootFileCreateRecoverySelectionFailed);
+    }
+
+    let candidate = candidates
+        .first()
+        .ok_or(CliError::SyncRootFileCreateRecoverySelectionFailed)?;
+    let leaf_name = file_create_leaf_name(candidate.relative_path())?.to_owned();
+
+    let evidence = match storage.sync_root_file_create_content_evidence(candidate.intent_id)? {
+        Some(evidence) => evidence,
+        None => {
+            println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=hash_current_exact_source");
+            let mut local = open_selected_root_file_create_local_source(&root, candidate)?;
+            let chunk_size = usize::try_from(DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES)
+                .map_err(|_| CliError::NumericOverflow)?;
+            while local.read_next_chunk(chunk_size)?.is_some() {}
+            let sha256 = local.completed_sha256_hex()?;
+            let streamed = local.finish()?;
+            if !streamed.source_stable {
+                return Err(CliError::SyncRootFileCreateLocalIdentityMismatch);
+            }
+            storage.record_sync_root_file_create_stream_fingerprint(
+                candidate.intent_id,
+                candidate.execution_generation,
+                candidate.local_size_bytes,
+                &sha256,
+            )?;
+            storage
+                .sync_root_file_create_content_evidence(candidate.intent_id)?
+                .ok_or(CliError::SyncRootFileCreateStreamFingerprintMismatch)?
+        }
+    };
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let fullsync_key = fullsync_refresh_token_key(&account.subject)?;
+    let fullsync_refresh_token = required_secret_utf8(
+        keyring.get(&fullsync_key)?,
+        CliError::MissingStoredFullSyncRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&fullsync_refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_FULL_SCOPE)
+    {
+        return Err(CliError::GoogleFullSyncScopeNotGranted);
+    }
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    let user = api.user_info()?;
+    if user.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+    if let Some(rotated_refresh_token) = tokens.refresh_token() {
+        keyring.put(
+            &fullsync_key,
+            SecretValue::new(rotated_refresh_token.as_bytes().to_vec())?,
+        )?;
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=inspect_predetermined_id");
+    let lookup = api.inspect_expected_file(
+        candidate.predetermined_remote_id(),
+        &leaf_name,
+        candidate.expected_parent_remote_id(),
+        SUPERVISED_FILE_CREATE_MIME_TYPE,
+        evidence.size_bytes,
+        evidence.sha256_hex(),
+    )?;
+
+    let (outcome, status_after, mutation) = match lookup {
+        DriveExpectedFileLookup::Exact { remote_version } => {
+            let next = storage.complete_sync_root_file_create_upload(
+                candidate.intent_id,
+                candidate.execution_generation,
+                remote_version,
+                unix_time_ms()?,
+            )?;
+            ("exact_id_content_match", next.status.as_str(), "yes")
+        }
+        DriveExpectedFileLookup::Mismatch => {
+            let next = storage.transition_sync_root_file_create_intent(
+                candidate.intent_id,
+                RemoteWriteIntentStatus::Submitted,
+                candidate.execution_generation,
+                RemoteWriteIntentStatus::Conflict,
+                unix_time_ms()?,
+            )?;
+            ("exact_id_mismatch", next.status.as_str(), "yes")
+        }
+        DriveExpectedFileLookup::Missing => (
+            "exact_id_missing_no_blind_replay",
+            RemoteWriteIntentStatus::Submitted.as_str(),
+            "no",
+        ),
+    };
+
+    println!("SYNC_ROOT_FILE_CREATE_RECOVERY=PASS");
+    println!("MODE=two_way");
+    println!("SUBMITTED_CREATE_FILE_INTENTS=1");
+    println!("SELECTED_INTENTS=1");
+    println!("RECOVERY_OUTCOME={outcome}");
+    println!("INTENT_STATUS_AFTER={status_after}");
+    println!("DATABASE_MUTATION={mutation}");
+    println!("PROVIDER_WRITE=not_performed");
+    println!("REMOTE_OBJECT_MUTATION=none");
+    println!("DURABLE_STREAM_FINGERPRINT=yes");
+    println!("HASH_VALUE_PRINTED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("SESSION_URI_PRINTED=no");
+    println!("BLIND_REPLAY=no");
+    println!("CHANGE_STREAM_CONFIRMATION_REQUIRED=yes");
     Ok(())
 }
 
@@ -6869,6 +7346,8 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "folder-create-recovery-plan"
                 | "submit-folder-create"
                 | "recover-folder-create-submission"
+                | "submit-file-create"
+                | "recover-file-create-submission"
                 | "confirm-folder-create"
                 | "settle-confirmed-folder-create"
                 | "activate-two-way"
@@ -6955,6 +7434,13 @@ mod sync_root_cli_tests {
             vec!["sync", "roots", "run-to-idle", "--approve"],
             vec!["sync", "roots", "local-baseline", "--approve"],
             vec!["sync", "roots", "local-journal", "--approve"],
+            vec!["sync", "roots", "submit-file-create", "--approve"],
+            vec![
+                "sync",
+                "roots",
+                "recover-file-create-submission",
+                "--approve",
+            ],
             vec!["sync", "roots", "materialize-file", "--approve"],
             vec!["sync", "roots", "delete-file", "--approve"],
             vec!["sync", "roots", "add", "--mode", "receive_only"],
@@ -7382,6 +7868,34 @@ enum CliError {
     SyncRootCreateIdAllocationSelectionFailed,
     #[error("sync root folder-create recovery-plan selection failed")]
     SyncRootFolderCreateRecoverySelectionFailed,
+    #[error("sync root ordinary-file create submission selection failed")]
+    SyncRootFileCreateSubmissionSelectionFailed,
+    #[error("sync root ordinary-file create recovery selection failed")]
+    SyncRootFileCreateRecoverySelectionFailed,
+    #[error("sync root ordinary-file create submission requires two_way mode")]
+    SyncRootFileCreateSubmissionModeUnsupported,
+    #[error("sync root ordinary-file create durable remote root is missing")]
+    SyncRootFileCreateRemoteRootMissing,
+    #[error("sync root ordinary-file create parent authority no longer matches")]
+    SyncRootFileCreateParentAuthorityMismatch,
+    #[error("sync root ordinary-file create parent topology is no longer valid")]
+    SyncRootFileCreateParentTopologyMismatch,
+    #[error("sync root ordinary-file create remote cursor fence no longer matches")]
+    SyncRootFileCreateRemoteFenceMismatch,
+    #[error("sync root ordinary-file create local identity is not stable")]
+    SyncRootFileCreateLocalIdentityMismatch,
+    #[error("sync root ordinary-file create content stream is incomplete")]
+    SyncRootFileCreateStreamIncomplete,
+    #[error("sync root ordinary-file create resumable session expired")]
+    SyncRootFileCreateSessionExpired,
+    #[error("sync root ordinary-file create provider resume offset mismatched")]
+    SyncRootFileCreateResumeOffsetMismatch,
+    #[error("sync root ordinary-file create provider completion metadata is missing")]
+    SyncRootFileCreateCompletionMissing,
+    #[error("sync root ordinary-file create provider SHA-256 mismatched")]
+    SyncRootFileCreateProviderHashMismatch,
+    #[error("sync root ordinary-file create stream fingerprint mismatched")]
+    SyncRootFileCreateStreamFingerprintMismatch,
     #[error("sync root folder-create submission selection failed")]
     SyncRootFolderCreateSubmissionSelectionFailed,
     #[error("sync root confirmed folder-create settlement selection failed")]

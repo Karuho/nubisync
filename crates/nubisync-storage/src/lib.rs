@@ -687,6 +687,30 @@ pub struct RemoteWriteFolderCreateSettlementResult {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct RemoteWriteFileCreateContentEvidence {
+    pub size_bytes: u64,
+    sha256_hex: String,
+    pub remote_version: Option<u64>,
+}
+
+impl RemoteWriteFileCreateContentEvidence {
+    pub fn sha256_hex(&self) -> &str {
+        &self.sha256_hex
+    }
+}
+
+impl std::fmt::Debug for RemoteWriteFileCreateContentEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteWriteFileCreateContentEvidence")
+            .field("size_bytes", &self.size_bytes)
+            .field("sha256_hex", &"[redacted]")
+            .field("remote_version", &self.remote_version)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct RemoteWriteFileCreateCandidate {
     pub intent_id: i64,
     pub source_local_event_id: i64,
@@ -702,6 +726,30 @@ pub struct RemoteWriteFileCreateCandidate {
     pub execution_generation: u64,
 }
 impl RemoteWriteFileCreateCandidate {
+    #[cfg(test)]
+    pub fn new_for_test(
+        relative_path: impl Into<String>,
+        local_size_bytes: u64,
+        local_modified_unix_ns: i64,
+        local_device_id: u64,
+        local_inode: u64,
+    ) -> Self {
+        Self {
+            intent_id: 1,
+            source_local_event_id: 1,
+            baseline_generation: 1,
+            relative_path: relative_path.into(),
+            local_size_bytes,
+            local_modified_unix_ns,
+            local_device_id,
+            local_inode,
+            predetermined_remote_id: "test-remote-id".into(),
+            expected_parent_remote_id: "test-parent-id".into(),
+            status: RemoteWriteIntentStatus::Planned,
+            execution_generation: 0,
+        }
+    }
+
     pub fn relative_path(&self) -> &str {
         &self.relative_path
     }
@@ -2982,6 +3030,163 @@ impl Storage {
         Ok(states)
     }
 
+    pub fn sync_root_file_create_content_evidence(
+        &self,
+        intent_id: i64,
+    ) -> Result<Option<RemoteWriteFileCreateContentEvidence>, StorageError> {
+        if intent_id <= 0 {
+            return Err(StorageError::InvalidRemoteWriteIntentExecutionTransition);
+        }
+
+        let row: Option<(
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = self
+            .connection
+            .query_row(
+                "SELECT operation_kind, expected_remote_size_bytes,
+                            expected_checksum_algorithm, expected_content_checksum,
+                            expected_remote_version
+                     FROM sync_root_remote_write_intents
+                     WHERE id=?1",
+                params![intent_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((operation, size, algorithm, checksum, remote_version)) = row else {
+            return Ok(None);
+        };
+        if operation != "create_file" {
+            return Err(StorageError::InvalidStoredRemoteWriteIntentExecutionState);
+        }
+
+        match (size, algorithm, checksum) {
+            (None, None, None) => Ok(None),
+            (Some(size), Some(algorithm), Some(checksum)) => {
+                if size <= 0 || algorithm != "sha256" {
+                    return Err(StorageError::InvalidStoredRemoteWriteIntentExecutionState);
+                }
+                validate_optional_checksum(Some(&algorithm), Some(&checksum))?;
+                let remote_version = remote_version
+                    .map(|value| {
+                        let parsed = value.parse::<u64>().map_err(|_| {
+                            StorageError::InvalidStoredRemoteWriteIntentExecutionState
+                        })?;
+                        if parsed == 0 {
+                            return Err(StorageError::InvalidStoredRemoteWriteIntentExecutionState);
+                        }
+                        Ok(parsed)
+                    })
+                    .transpose()?;
+                Ok(Some(RemoteWriteFileCreateContentEvidence {
+                    size_bytes: u64::try_from(size)
+                        .map_err(|_| StorageError::InvalidStoredRemoteWriteIntentExecutionState)?,
+                    sha256_hex: checksum,
+                    remote_version,
+                }))
+            }
+            _ => Err(StorageError::InvalidStoredRemoteWriteIntentExecutionState),
+        }
+    }
+
+    pub fn record_sync_root_file_create_stream_fingerprint(
+        &self,
+        intent_id: i64,
+        expected_execution_generation: u64,
+        size_bytes: u64,
+        sha256_hex: &str,
+    ) -> Result<RemoteWriteIntentExecutionState, StorageError> {
+        if intent_id <= 0 || size_bytes == 0 {
+            return Err(StorageError::InvalidRemoteWriteIntentExecutionTransition);
+        }
+        validate_optional_checksum(Some("sha256"), Some(sha256_hex))?;
+        let execution_generation = i64::try_from(expected_execution_generation)
+            .map_err(|_| StorageError::NumericOverflow)?;
+        let size_bytes = i64::try_from(size_bytes).map_err(|_| StorageError::NumericOverflow)?;
+
+        let changed = self.connection.execute(
+            "UPDATE sync_root_remote_write_intents
+             SET expected_remote_size_bytes=?1,
+                 expected_checksum_algorithm='sha256',
+                 expected_content_checksum=?2
+             WHERE id=?3
+               AND operation_kind='create_file'
+               AND status='submitted'
+               AND execution_generation=?4
+               AND (expected_remote_size_bytes IS NULL OR expected_remote_size_bytes=?1)
+               AND (expected_checksum_algorithm IS NULL OR expected_checksum_algorithm='sha256')
+               AND (expected_content_checksum IS NULL OR expected_content_checksum=?2)",
+            params![size_bytes, sha256_hex, intent_id, execution_generation],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::RemoteWriteIntentExecutionCompareAndSetFailed);
+        }
+
+        self.sync_root_remote_write_intent_execution_state(intent_id)?
+            .ok_or(StorageError::RemoteWriteIntentExecutionStateMissing)
+    }
+
+    pub fn complete_sync_root_file_create_upload(
+        &self,
+        intent_id: i64,
+        expected_execution_generation: u64,
+        remote_version: u64,
+        completed_at_unix_ms: i64,
+    ) -> Result<RemoteWriteIntentExecutionState, StorageError> {
+        if intent_id <= 0 || remote_version == 0 || completed_at_unix_ms <= 0 {
+            return Err(StorageError::InvalidRemoteWriteIntentExecutionTransition);
+        }
+
+        let execution_generation = i64::try_from(expected_execution_generation)
+            .map_err(|_| StorageError::NumericOverflow)?;
+        let evidence = self
+            .sync_root_file_create_content_evidence(intent_id)?
+            .ok_or(StorageError::RemoteWriteIntentExecutionPreconditionFailed)?;
+        if evidence.size_bytes == 0 {
+            return Err(StorageError::RemoteWriteIntentExecutionPreconditionFailed);
+        }
+
+        let changed = self.connection.execute(
+            "UPDATE sync_root_remote_write_intents
+             SET status='awaiting_confirmation',
+                 execution_generation=execution_generation+1,
+                 expected_remote_kind='file',
+                 expected_remote_version=?1,
+                 awaiting_confirmation_at_unix_ms=?2
+             WHERE id=?3
+               AND operation_kind='create_file'
+               AND status='submitted'
+               AND execution_generation=?4
+               AND expected_remote_size_bytes IS NOT NULL
+               AND expected_checksum_algorithm='sha256'
+               AND expected_content_checksum IS NOT NULL",
+            params![
+                remote_version.to_string(),
+                completed_at_unix_ms,
+                intent_id,
+                execution_generation,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::RemoteWriteIntentExecutionCompareAndSetFailed);
+        }
+
+        self.sync_root_remote_write_intent_execution_state(intent_id)?
+            .ok_or(StorageError::RemoteWriteIntentExecutionStateMissing)
+    }
+
     pub fn begin_sync_root_file_create_submission(
         &mut self,
         sync_root_id: &str,
@@ -3316,9 +3521,6 @@ impl Storage {
         let valid = matches!(
             (expected_status, new_status),
             (
-                RemoteWriteIntentStatus::Submitted,
-                RemoteWriteIntentStatus::AwaitingConfirmation
-            ) | (
                 RemoteWriteIntentStatus::Submitted,
                 RemoteWriteIntentStatus::Conflict
             ) | (
@@ -5967,6 +6169,14 @@ fn validate_optional_checksum(
         (None, None) => Ok(()),
         (Some("md5"), Some(value))
             if value.len() == 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) =>
+        {
+            Ok(())
+        }
+        (Some("sha256"), Some(value))
+            if value.len() == 64
                 && value
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) =>
@@ -11395,26 +11605,44 @@ mod phase5h17a_file_create_execution_foundation_tests {
     #[test]
     fn phase5h17a_file_submission_is_durable_and_cas_guarded() {
         let (mut storage, root, intent_id, cursor) = fixture();
-        let s = storage
+        let submitted = storage
             .begin_sync_root_file_create_submission(&root.id, intent_id, 0, &cursor, 20)
             .unwrap();
-        assert_eq!(s.operation, RemoteWriteIntentOperation::CreateFile);
-        assert_eq!(s.status, RemoteWriteIntentStatus::Submitted);
-        assert_eq!(s.attempt_count, 1);
-        assert_eq!(s.execution_generation, 1);
-        assert_eq!(s.pre_submit_change_cursor(), Some(&cursor));
-        let a = storage
-            .transition_sync_root_file_create_intent(
-                intent_id,
-                RemoteWriteIntentStatus::Submitted,
-                1,
-                RemoteWriteIntentStatus::AwaitingConfirmation,
-                22,
-            )
+        assert_eq!(submitted.operation, RemoteWriteIntentOperation::CreateFile);
+        assert_eq!(submitted.status, RemoteWriteIntentStatus::Submitted);
+        assert_eq!(submitted.attempt_count, 1);
+        assert_eq!(submitted.execution_generation, 1);
+        assert_eq!(submitted.pre_submit_change_cursor(), Some(&cursor));
+
+        storage
+            .record_sync_root_file_create_stream_fingerprint(intent_id, 1, 7, &"a".repeat(64))
             .unwrap();
-        assert_eq!(a.status, RemoteWriteIntentStatus::AwaitingConfirmation);
-        assert_eq!(a.execution_generation, 2);
+
+        let evidence = storage
+            .sync_root_file_create_content_evidence(intent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.size_bytes, 7);
+        assert_eq!(evidence.sha256_hex(), "a".repeat(64));
+        assert_eq!(evidence.remote_version, None);
+
+        let awaiting = storage
+            .complete_sync_root_file_create_upload(intent_id, 1, 9, 22)
+            .unwrap();
+        assert_eq!(
+            awaiting.status,
+            RemoteWriteIntentStatus::AwaitingConfirmation
+        );
+        assert_eq!(awaiting.execution_generation, 2);
+        assert_eq!(awaiting.awaiting_confirmation_at_unix_ms, Some(22));
+
+        let evidence = storage
+            .sync_root_file_create_content_evidence(intent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.remote_version, Some(9));
     }
+
     #[test]
     fn phase5h17a_direct_confirmation_fails_closed() {
         let (storage, _, intent_id, _) = fixture();
@@ -11427,6 +11655,24 @@ mod phase5h17a_file_create_execution_foundation_tests {
                 20
             ),
             Err(StorageError::InvalidRemoteWriteIntentExecutionTransition)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod phase5h17b_file_create_content_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn phase5h17b_sha256_checksum_validation_is_lowercase_and_exact_length() {
+        assert!(validate_optional_checksum(Some("sha256"), Some(&"a".repeat(64))).is_ok());
+        assert!(matches!(
+            validate_optional_checksum(Some("sha256"), Some(&"A".repeat(64))),
+            Err(StorageError::InvalidRemoteWriteChecksum)
+        ));
+        assert!(matches!(
+            validate_optional_checksum(Some("sha256"), Some(&"a".repeat(63))),
+            Err(StorageError::InvalidRemoteWriteChecksum)
         ));
     }
 }

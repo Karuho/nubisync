@@ -11,7 +11,7 @@ use nubisync_drive::{
 };
 use nubisync_storage::{
     LocalChangeEventInput, LocalChangeEventKind, LocalChangeEventRecord, LocalChangeJournalCommit,
-    RemoteWriteAuthoritySnapshot, RemoteWriteFolderCreateCandidate,
+    RemoteWriteAuthoritySnapshot, RemoteWriteFileCreateCandidate, RemoteWriteFolderCreateCandidate,
     RemoteWriteFolderCreateSettlementInput, RemoteWriteIntentInput, RemoteWriteIntentOperation,
     RemoteWriteIntentStatus, Storage, StorageError, SyncRootCatalogBatchCommit,
     SyncRootCatalogMutation, SyncRootDirectoryMaterializationReceipt,
@@ -57,6 +57,125 @@ impl fmt::Debug for SelectedRootFolderCreateLocalValidation {
         formatter
             .debug_struct("SelectedRootFolderCreateLocalValidation")
             .field("leaf_name", &"[redacted]")
+            .finish()
+    }
+}
+
+pub struct SelectedRootFileCreateLocalSource {
+    file: fs::File,
+    absolute_path: PathBuf,
+    leaf_name: String,
+    total_bytes: u64,
+    initial_metadata: fs::Metadata,
+    bytes_read: u64,
+    hasher: Sha256,
+}
+
+impl SelectedRootFileCreateLocalSource {
+    pub fn leaf_name(&self) -> &str {
+        &self.leaf_name
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    pub fn read_next_chunk(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, SelectedRootExecutorError> {
+        if max_bytes == 0 {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateChunkSizeInvalid);
+        }
+        let remaining = self
+            .total_bytes
+            .checked_sub(self.bytes_read)
+            .ok_or(SelectedRootExecutorError::RemoteWriteFileCreateStreamIncomplete)?;
+        if remaining == 0 {
+            return Ok(None);
+        }
+
+        let requested = remaining.min(max_bytes as u64);
+        let requested =
+            usize::try_from(requested).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+        let mut chunk = vec![0_u8; requested];
+        self.file
+            .read_exact(&mut chunk)
+            .map_err(|_| SelectedRootExecutorError::RemoteWriteFileCreateReadFailed)?;
+        self.hasher.update(&chunk);
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(requested as u64)
+            .ok_or(SelectedRootExecutorError::CountOverflow)?;
+        Ok(Some(chunk))
+    }
+
+    pub fn completed_sha256_hex(&self) -> Result<String, SelectedRootExecutorError> {
+        if self.bytes_read != self.total_bytes {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateStreamIncomplete);
+        }
+        Ok(digest_to_hex(self.hasher.clone().finalize().as_slice()))
+    }
+
+    pub fn finish(self) -> Result<SelectedRootFileCreateStreamResult, SelectedRootExecutorError> {
+        if self.bytes_read != self.total_bytes {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateStreamIncomplete);
+        }
+
+        let open_after = self
+            .file
+            .metadata()
+            .map_err(|_| SelectedRootExecutorError::RemoteWriteFileCreateReadFailed)?;
+        let path_after = fs::symlink_metadata(&self.absolute_path)
+            .map_err(|_| SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch)?;
+
+        let source_stable = same_local_file_state(&self.initial_metadata, &open_after)
+            && same_local_file_state(&self.initial_metadata, &path_after);
+
+        Ok(SelectedRootFileCreateStreamResult {
+            bytes_streamed: self.bytes_read,
+            sha256_hex: digest_to_hex(self.hasher.finalize().as_slice()),
+            source_stable,
+        })
+    }
+}
+
+impl fmt::Debug for SelectedRootFileCreateLocalSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedRootFileCreateLocalSource")
+            .field("absolute_path", &"[redacted]")
+            .field("leaf_name", &"[redacted]")
+            .field("total_bytes", &self.total_bytes)
+            .field("bytes_read", &self.bytes_read)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectedRootFileCreateStreamResult {
+    pub bytes_streamed: u64,
+    sha256_hex: String,
+    pub source_stable: bool,
+}
+
+impl SelectedRootFileCreateStreamResult {
+    pub fn sha256_hex(&self) -> &str {
+        &self.sha256_hex
+    }
+}
+
+impl fmt::Debug for SelectedRootFileCreateStreamResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedRootFileCreateStreamResult")
+            .field("bytes_streamed", &self.bytes_streamed)
+            .field("sha256_hex", &"[redacted]")
+            .field("source_stable", &self.source_stable)
             .finish()
     }
 }
@@ -5764,6 +5883,118 @@ pub fn plan_selected_root_confirmed_folder_create_settlement(
     )?)
 }
 
+pub fn open_selected_root_file_create_local_source(
+    sync_root: &SyncRoot,
+    candidate: &RemoteWriteFileCreateCandidate,
+) -> Result<SelectedRootFileCreateLocalSource, SelectedRootExecutorError> {
+    if sync_root.mode != SyncMode::TwoWay {
+        return Err(SelectedRootExecutorError::RemoteWriteFileCreateModeUnsupported);
+    }
+    if candidate.local_size_bytes == 0 {
+        return Err(SelectedRootExecutorError::RemoteWriteFileCreateEmptyUnsupported);
+    }
+
+    let first = scan_selected_root_local_snapshot(sync_root)?;
+    let second = scan_selected_root_local_snapshot(sync_root)?;
+    if first != second {
+        return Err(SelectedRootExecutorError::LocalDiffScanRace);
+    }
+
+    let item = first
+        .iter()
+        .find(|item| item.relative_path() == candidate.relative_path())
+        .ok_or(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch)?;
+
+    if item.kind() != LocalItemKind::File
+        || item.size_bytes() != Some(candidate.local_size_bytes)
+        || item.modified_unix_ns() != candidate.local_modified_unix_ns
+        || item.device_id() != candidate.local_device_id
+        || item.inode() != candidate.local_inode
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+    }
+
+    let root = validated_selected_root_path(sync_root)?;
+    let relative = Path::new(candidate.relative_path());
+    if relative.is_absolute() {
+        return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+    }
+
+    let mut absolute = root.clone();
+    let mut components = relative.components().peekable();
+    if components.peek().is_none() {
+        return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+    }
+
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+        };
+        absolute.push(name);
+        if !absolute.starts_with(&root) {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+        }
+
+        let metadata = fs::symlink_metadata(&absolute)
+            .map_err(|_| SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch)?;
+        if metadata.file_type().is_symlink() {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+        }
+
+        if components.peek().is_some() && !metadata.is_dir() {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+        }
+        if components.peek().is_none() && !metadata.is_file() {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+        }
+    }
+
+    let file = fs::File::open(&absolute)
+        .map_err(|_| SelectedRootExecutorError::RemoteWriteFileCreateReadFailed)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| SelectedRootExecutorError::RemoteWriteFileCreateReadFailed)?;
+
+    let modified_unix_ns = opened
+        .mtime()
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(opened.mtime_nsec()))
+        .ok_or(SelectedRootExecutorError::LocalMetadataTimestampOverflow)?;
+
+    if !opened.is_file()
+        || opened.len() != candidate.local_size_bytes
+        || modified_unix_ns != candidate.local_modified_unix_ns
+        || opened.dev() != candidate.local_device_id
+        || opened.ino() != candidate.local_inode
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+    }
+
+    let path_metadata = fs::symlink_metadata(&absolute)
+        .map_err(|_| SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch)?;
+    if path_metadata.file_type().is_symlink()
+        || path_metadata.dev() != opened.dev()
+        || path_metadata.ino() != opened.ino()
+    {
+        return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+    }
+
+    let leaf_name = basename(candidate.relative_path());
+    if leaf_name.is_empty() {
+        return Err(SelectedRootExecutorError::RemoteWriteFileCreateLocalIdentityMismatch);
+    }
+
+    Ok(SelectedRootFileCreateLocalSource {
+        file,
+        absolute_path: absolute,
+        leaf_name: leaf_name.to_owned(),
+        total_bytes: candidate.local_size_bytes,
+        initial_metadata: opened,
+        bytes_read: 0,
+        hasher: Sha256::new(),
+    })
+}
+
 pub fn validate_selected_root_folder_create_local_identity(
     sync_root: &SyncRoot,
     relative_path: &str,
@@ -7602,6 +7833,18 @@ pub enum SelectedRootExecutorError {
     RemoteWriteFolderSettlementRemoteCatalogMismatch,
     #[error("confirmed folder-create settlement residual diff contains the source")]
     RemoteWriteFolderSettlementResidualMismatch,
+    #[error("ordinary-file create local validation requires a two_way root")]
+    RemoteWriteFileCreateModeUnsupported,
+    #[error("ordinary-file create local identity no longer matches the durable intent")]
+    RemoteWriteFileCreateLocalIdentityMismatch,
+    #[error("zero-byte ordinary-file create is not enabled in this resumable phase")]
+    RemoteWriteFileCreateEmptyUnsupported,
+    #[error("ordinary-file create chunk size is invalid")]
+    RemoteWriteFileCreateChunkSizeInvalid,
+    #[error("ordinary-file create content read failed")]
+    RemoteWriteFileCreateReadFailed,
+    #[error("ordinary-file create content stream is incomplete")]
+    RemoteWriteFileCreateStreamIncomplete,
     #[error("folder-create local validation requires a two_way root")]
     RemoteWriteFolderCreateModeUnsupported,
     #[error("folder-create local directory identity no longer matches the durable intent")]

@@ -261,21 +261,29 @@ impl GoogleDriveApi {
             return Ok(DriveExpectedFileLookup::Missing);
         }
         let metadata: DriveOrdinaryFileUploadResponse = response.error_for_status()?.json()?;
-        Ok(
-            if expected_ordinary_file_matches(
-                remote_id,
-                expected_name,
-                expected_parent_remote_id,
-                expected_mime_type,
-                expected_size_bytes,
-                expected_sha256_hex,
-                &metadata,
-            )? {
-                DriveExpectedFileLookup::Exact
-            } else {
-                DriveExpectedFileLookup::Mismatch
-            },
-        )
+        if !expected_ordinary_file_matches(
+            remote_id,
+            expected_name,
+            expected_parent_remote_id,
+            expected_mime_type,
+            expected_size_bytes,
+            expected_sha256_hex,
+            &metadata,
+        )? {
+            return Ok(DriveExpectedFileLookup::Mismatch);
+        }
+
+        let remote_version = metadata
+            .version
+            .as_deref()
+            .ok_or(DriveApiError::OrdinaryFileUploadVersionMissing)?
+            .parse::<u64>()
+            .map_err(|_| DriveApiError::OrdinaryFileUploadVersionInvalid)?;
+        if remote_version == 0 {
+            return Err(DriveApiError::OrdinaryFileUploadVersionInvalid);
+        }
+
+        Ok(DriveExpectedFileLookup::Exact { remote_version })
     }
 
     /// Observes metadata-only remote authority for later write planning.
@@ -823,7 +831,7 @@ pub enum DriveExpectedFolderLookup {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveExpectedFileLookup {
-    Exact,
+    Exact { remote_version: u64 },
     Missing,
     Mismatch,
 }
