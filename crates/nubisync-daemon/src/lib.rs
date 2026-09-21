@@ -7645,6 +7645,119 @@ pub fn bootstrap_selected_root_snapshot<P: SelectedRootBootstrapProvider>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedRootRemoteRebaseline {
+    pub authoritative_items: u64,
+    pub folder_pages: u64,
+    pub unsupported_provider_native: u64,
+    pub abandoned_window_pages: u64,
+    pub abandoned_window_changes: u64,
+}
+
+pub fn rebaseline_selected_root_remote_snapshot<P: SelectedRootBootstrapProvider>(
+    provider: &P,
+    storage: &mut Storage,
+    sync_root: &SyncRoot,
+    observed_at_unix_ms: i64,
+) -> Result<SelectedRootRemoteRebaseline, SelectedRootExecutorError> {
+    if sync_root.mode != SyncMode::TwoWay {
+        return Err(SelectedRootExecutorError::RemoteRebaselineModeUnsupported);
+    }
+
+    let local = storage.sync_root_local_inventory_state(&sync_root.id)?;
+    if !local.snapshot_complete || !local.observation_valid {
+        return Err(SelectedRootExecutorError::RemoteRebaselineLocalStateNotReady);
+    }
+    if storage.pending_sync_root_local_change_event_count(&sync_root.id, local.generation)? != 0 {
+        return Err(SelectedRootExecutorError::RemoteRebaselinePendingLocalChanges);
+    }
+
+    let window = storage
+        .sync_root_change_window_state(&sync_root.id)?
+        .ok_or(SelectedRootExecutorError::RemoteRebaselineWindowNotEligible)?;
+    if window.is_complete() || window.page_count < 64 || window.continuation.is_none() {
+        return Err(SelectedRootExecutorError::RemoteRebaselineWindowNotEligible);
+    }
+
+    for status in [
+        RemoteWriteIntentStatus::Planned,
+        RemoteWriteIntentStatus::Submitted,
+        RemoteWriteIntentStatus::AwaitingConfirmation,
+        RemoteWriteIntentStatus::Conflict,
+    ] {
+        if storage.sync_root_remote_write_intent_status_count(&sync_root.id, status)? != 0 {
+            return Err(SelectedRootExecutorError::RemoteRebaselineWriteIntentActive);
+        }
+    }
+
+    let confirmed = storage.sync_root_remote_write_intent_status_count(
+        &sync_root.id,
+        RemoteWriteIntentStatus::Confirmed,
+    )?;
+    if confirmed != storage.sync_root_remote_write_settlement_count(&sync_root.id)? {
+        return Err(SelectedRootExecutorError::RemoteRebaselineUnsettledConfirmedIntent);
+    }
+
+    let configured_remote_root_id = sync_root
+        .remote_root_id
+        .as_deref()
+        .ok_or(SelectedRootExecutorError::MissingRemoteRoot)?;
+
+    let root_identity = provider.resolve_root(configured_remote_root_id)?;
+    let canonical_root_id = provider.canonical_root_id(&root_identity).to_owned();
+    if canonical_root_id.trim().is_empty() {
+        return Err(SelectedRootExecutorError::InvalidCanonicalRoot);
+    }
+
+    let fence = provider.current_change_cursor()?;
+    storage.begin_sync_root_remote_inventory_staging(&sync_root.id)?;
+
+    let result = (|| {
+        let traversal = stage_selected_root_inventory(
+            provider,
+            storage,
+            &sync_root.id,
+            &canonical_root_id,
+            observed_at_unix_ms,
+        )?;
+
+        let revalidated = provider.resolve_root(configured_remote_root_id)?;
+        if provider.canonical_root_id(&revalidated) != canonical_root_id {
+            return Err(SelectedRootExecutorError::RootIdentityChanged);
+        }
+
+        let staged_items = storage.staged_sync_root_remote_inventory_count(&sync_root.id)?;
+        if staged_items != traversal.supported_items {
+            return Err(SelectedRootExecutorError::BootstrapItemCountMismatch);
+        }
+
+        storage.commit_sync_root_remote_inventory_rebaseline(
+            &sync_root.id,
+            &window.base_cursor,
+            window.page_count,
+            window.change_count,
+            local.generation,
+            staged_items,
+            &fence,
+            observed_at_unix_ms,
+        )?;
+
+        Ok(SelectedRootRemoteRebaseline {
+            authoritative_items: traversal.supported_items,
+            folder_pages: traversal.folder_pages,
+            unsupported_provider_native: traversal.unsupported_provider_native,
+            abandoned_window_pages: window.page_count,
+            abandoned_window_changes: window.change_count,
+        })
+    })();
+
+    if result.is_err() {
+        let _ = storage.clear_sync_root_remote_inventory_staging(&sync_root.id);
+    }
+
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BootstrapTraversal {
     supported_items: u64,
     folder_pages: u64,
@@ -7942,6 +8055,18 @@ pub enum SelectedRootExecutorError {
     LocalDiffScanRace,
     #[error("local inventory diff encountered a duplicate relative path")]
     LocalDiffDuplicatePath,
+    #[error("remote metadata rebaseline requires a two_way root")]
+    RemoteRebaselineModeUnsupported,
+    #[error("remote metadata rebaseline local state is not ready")]
+    RemoteRebaselineLocalStateNotReady,
+    #[error("remote metadata rebaseline requires zero pending local changes")]
+    RemoteRebaselinePendingLocalChanges,
+    #[error("remote metadata rebaseline requires an incomplete backlog window")]
+    RemoteRebaselineWindowNotEligible,
+    #[error("remote metadata rebaseline is blocked by an active write intent")]
+    RemoteRebaselineWriteIntentActive,
+    #[error("remote metadata rebaseline requires every confirmed intent to be settled")]
+    RemoteRebaselineUnsettledConfirmedIntent,
     #[error("remote-write planning requires a durable local baseline")]
     RemoteWritePlanLocalBaselineMissing,
     #[error("remote-write planning requires a valid local observation baseline")]
@@ -9136,6 +9261,122 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| Ok(SelectedRootInventoryPage::new(Vec::new(), None, 0)))
         }
+    }
+
+    #[test]
+    fn phase5h20b_rebaseline_captures_fresh_fence_and_replaces_backlog_snapshot() {
+        let local_root = local_plan_temp_dir("phase5h20b-rebaseline");
+        std::fs::create_dir(&local_root).unwrap();
+        let local_root = std::fs::canonicalize(&local_root).unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider_id = ProviderId::new("google-drive").unwrap();
+        let account =
+            ProviderAccount::new(provider_id.clone(), "phase5h20b-subject", None, None).unwrap();
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h20b-root",
+            provider_id,
+            account.subject,
+            local_root.to_str().unwrap(),
+            Some("configured-root".into()),
+            SyncMode::TwoWay,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 3)
+            .unwrap();
+
+        let old = item("old", "canonical-root", RemoteItemKind::File);
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(&root.id, std::slice::from_ref(&old), 4)
+            .unwrap();
+        storage
+            .commit_sync_root_remote_inventory_snapshot(
+                &root.id,
+                &ChangeCursor::new("old-fence").unwrap(),
+                5,
+            )
+            .unwrap();
+
+        let root_provider = FakeProvider::new("canonical-root");
+        execute_selected_root_change_batch(
+            &root_provider,
+            &mut storage,
+            &root,
+            &ChangeCursor::new("old-fence").unwrap(),
+            &[],
+            &ChangeCursor::new("durable-old").unwrap(),
+            6,
+        )
+        .unwrap();
+
+        let mut continuation = None;
+        for index in 0..64 {
+            let next = ContinuationToken::new(format!("phase5h20b-token-{index}")).unwrap();
+            storage
+                .stage_sync_root_change_window_page(
+                    &root.id,
+                    &ChangeCursor::new("durable-old").unwrap(),
+                    continuation.as_ref(),
+                    &ChangePage {
+                        changes: vec![],
+                        continuation: Some(next.clone()),
+                        checkpoint: None,
+                    },
+                )
+                .unwrap();
+            continuation = Some(next);
+        }
+
+        let replacement = item("replacement", "canonical-root", RemoteItemKind::File);
+        let provider = FakeBootstrapProvider::new(
+            "canonical-root",
+            "fresh-fence",
+            vec![Ok(SelectedRootInventoryPage::new(
+                vec![replacement.clone()],
+                None,
+                0,
+            ))],
+        );
+
+        let result =
+            rebaseline_selected_root_remote_snapshot(&provider, &mut storage, &root, 20).unwrap();
+
+        assert_eq!(result.authoritative_items, 1);
+        assert_eq!(result.abandoned_window_pages, 64);
+        assert_eq!(result.abandoned_window_changes, 0);
+        assert_eq!(
+            provider.events.borrow().as_slice(),
+            ["resolve_root", "cursor", "list", "resolve_root"]
+        );
+        assert_eq!(
+            storage.list_sync_root_remote_items(&root.id).unwrap(),
+            vec![replacement]
+        );
+        assert!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let state = storage.sync_root_remote_inventory_state(&root.id).unwrap();
+        assert!(state.snapshot_complete);
+        assert!(!state.catchup_complete);
+        assert_eq!(state.catchup_from_cursor.unwrap().as_str(), "fresh-fence");
+
+        std::fs::remove_dir(local_root).unwrap();
     }
 
     #[test]

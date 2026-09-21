@@ -3,8 +3,8 @@
 #![forbid(unsafe_code)]
 
 use nubisync_core::{
-    ChangeCursor, ContinuationToken, LocalItemKind, LocalItemSnapshot, ProviderAccount, ProviderId,
-    RemoteChange, RemoteItem, RemoteItemKind, SyncMode, SyncRoot,
+    ChangeCursor, ChangePage, ContinuationToken, LocalItemKind, LocalItemSnapshot, ProviderAccount,
+    ProviderId, RemoteChange, RemoteItem, RemoteItemKind, SyncMode, SyncRoot,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
@@ -4623,6 +4623,228 @@ impl Storage {
         Ok(inserted)
     }
 
+    pub fn commit_sync_root_remote_inventory_rebaseline(
+        &mut self,
+        sync_root_id: &str,
+        expected_window_base_cursor: &ChangeCursor,
+        expected_window_page_count: u64,
+        expected_window_change_count: u64,
+        expected_local_generation: u64,
+        expected_staged_item_count: u64,
+        catchup_from_cursor: &ChangeCursor,
+        completed_at_unix_ms: i64,
+    ) -> Result<usize, StorageError> {
+        if sync_root_id.trim().is_empty()
+            || expected_window_page_count < 64
+            || completed_at_unix_ms <= 0
+        {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        }
+
+        let expected_pages =
+            i64::try_from(expected_window_page_count).map_err(|_| StorageError::NumericOverflow)?;
+        let expected_changes = i64::try_from(expected_window_change_count)
+            .map_err(|_| StorageError::NumericOverflow)?;
+        let expected_generation =
+            i64::try_from(expected_local_generation).map_err(|_| StorageError::NumericOverflow)?;
+        let expected_staged =
+            i64::try_from(expected_staged_item_count).map_err(|_| StorageError::NumericOverflow)?;
+
+        let transaction = self.connection.transaction()?;
+
+        let mode: Option<String> = transaction
+            .query_row(
+                "SELECT mode FROM sync_roots WHERE id=?1",
+                params![sync_root_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if mode.as_deref() != Some("two_way") {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        }
+
+        let local: Option<(i64, i64, i64)> = transaction
+            .query_row(
+                "SELECT snapshot_complete, generation, observation_valid
+                 FROM sync_root_local_inventory_state
+                 WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if local != Some((1, expected_generation, 1)) {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        }
+
+        let pending_local: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_local_change_events
+             WHERE sync_root_id=?1
+               AND baseline_generation=?2
+               AND status='pending'",
+            params![sync_root_id, expected_generation],
+            |row| row.get(0),
+        )?;
+        if pending_local != 0 {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        }
+
+        let active_intents: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_remote_write_intents
+             WHERE sync_root_id=?1
+               AND status IN ('planned','submitted','awaiting_confirmation','conflict')",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        if active_intents != 0 {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        }
+
+        let unsettled_confirmed: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM sync_root_remote_write_intents i
+             WHERE i.sync_root_id=?1
+               AND i.status='confirmed'
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM sync_root_remote_write_settlements s
+                   WHERE s.intent_id=i.id
+               )",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        if unsettled_confirmed != 0 {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        }
+
+        let window: Option<(String, Option<String>, Option<String>, i64, i64)> = transaction
+            .query_row(
+                "SELECT base_cursor, continuation, checkpoint, page_count, change_count
+                 FROM sync_root_change_window_state
+                 WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((window_base, continuation, checkpoint, pages, changes)) = window else {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        };
+        if window_base != expected_window_base_cursor.as_str()
+            || continuation.is_none()
+            || checkpoint.is_some()
+            || pages != expected_pages
+            || changes != expected_changes
+        {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        }
+
+        let remote: Option<(i64, i64, Option<String>)> = transaction
+            .query_row(
+                "SELECT snapshot_complete, catchup_complete, change_cursor
+                 FROM sync_root_remote_inventory_state
+                 WHERE sync_root_id=?1",
+                params![sync_root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((snapshot_complete, catchup_complete, durable_cursor)) = remote else {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        };
+        if snapshot_complete != 1
+            || catchup_complete != 1
+            || durable_cursor.as_deref() != Some(expected_window_base_cursor.as_str())
+        {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        }
+
+        let staged_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sync_root_remote_inventory_staging WHERE sync_root_id=?1",
+            params![sync_root_id],
+            |row| row.get(0),
+        )?;
+        if staged_count != expected_staged {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        }
+
+        transaction.execute(
+            "DELETE FROM sync_root_remote_items WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+        let inserted = transaction.execute(
+            "INSERT INTO sync_root_remote_items (
+                sync_root_id, remote_id, parent_remote_id, name, item_kind,
+                size_bytes, trashed, observed_at_unix_ms
+             )
+             SELECT sync_root_id, remote_id, parent_remote_id, name, item_kind,
+                    size_bytes, trashed, observed_at_unix_ms
+             FROM sync_root_remote_inventory_staging
+             WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+        if inserted
+            != usize::try_from(expected_staged_item_count)
+                .map_err(|_| StorageError::NumericOverflow)?
+        {
+            return Err(StorageError::SyncRootRemoteRebaselinePreconditionFailed);
+        }
+        let item_count = i64::try_from(inserted).map_err(|_| StorageError::NumericOverflow)?;
+
+        transaction.execute(
+            "UPDATE sync_root_remote_inventory_state
+             SET snapshot_complete=1,
+                 catchup_complete=0,
+                 item_count=?2,
+                 snapshot_completed_at_unix_ms=?3,
+                 catchup_from_cursor=?4,
+                 change_cursor=NULL
+             WHERE sync_root_id=?1",
+            params![
+                sync_root_id,
+                item_count,
+                completed_at_unix_ms,
+                catchup_from_cursor.as_str()
+            ],
+        )?;
+
+        transaction.execute(
+            "DELETE FROM sync_root_change_window_events WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_change_window_tokens WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_change_window_state WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_remote_write_authority WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_remote_write_authority_state WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_remote_inventory_staging WHERE sync_root_id=?1",
+            params![sync_root_id],
+        )?;
+
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
     pub fn sync_root_remote_inventory_state(
         &self,
         sync_root_id: &str,
@@ -7702,6 +7924,8 @@ pub enum StorageError {
     SyncRootChangeWindowPaginationLoop,
     #[error("sync root change window exceeded a safety limit")]
     SyncRootChangeWindowSafetyLimitExceeded,
+    #[error("sync root remote metadata rebaseline precondition failed")]
+    SyncRootRemoteRebaselinePreconditionFailed,
     #[error("sync root catalog does not have a complete authoritative snapshot")]
     SyncRootCatalogSnapshotMissing,
     #[error("sync root catalog bootstrap catch-up cursor is missing")]
@@ -7777,6 +8001,240 @@ mod tests {
             modified_unix_ms: None,
             trashed: false,
         })
+    }
+
+    #[test]
+    fn phase5h20b_remote_rebaseline_atomically_replaces_catalog_and_discards_backlog() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h20b-root",
+            provider,
+            account.subject,
+            "/tmp/phase5h20b-root",
+            Some("remote-root".into()),
+            SyncMode::TwoWay,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 10)
+            .unwrap();
+
+        let old = test_remote_item("old", Some("remote-root"), "old.txt", RemoteItemKind::File);
+        prepare_root_snapshot(
+            &mut storage,
+            &root,
+            std::slice::from_ref(&old),
+            "old-fence",
+            20,
+        );
+        storage
+            .commit_sync_root_catalog_batch_and_cursor(
+                &root.id,
+                &ChangeCursor::new("old-fence").unwrap(),
+                &[],
+                &ChangeCursor::new("durable-old").unwrap(),
+                22,
+            )
+            .unwrap();
+
+        let mut continuation = None;
+        for index in 0..64 {
+            let next = ContinuationToken::new(format!("token-{index}")).unwrap();
+            storage
+                .stage_sync_root_change_window_page(
+                    &root.id,
+                    &ChangeCursor::new("durable-old").unwrap(),
+                    continuation.as_ref(),
+                    &ChangePage {
+                        changes: vec![],
+                        continuation: Some(next.clone()),
+                        checkpoint: None,
+                    },
+                )
+                .unwrap();
+            continuation = Some(next);
+        }
+
+        let replacement = test_remote_item(
+            "replacement",
+            Some("remote-root"),
+            "replacement.txt",
+            RemoteItemKind::File,
+        );
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .stage_sync_root_remote_inventory_items(
+                &root.id,
+                std::slice::from_ref(&replacement),
+                30,
+            )
+            .unwrap();
+
+        let committed = storage
+            .commit_sync_root_remote_inventory_rebaseline(
+                &root.id,
+                &ChangeCursor::new("durable-old").unwrap(),
+                64,
+                0,
+                1,
+                1,
+                &ChangeCursor::new("fresh-fence").unwrap(),
+                31,
+            )
+            .unwrap();
+
+        assert_eq!(committed, 1);
+        assert_eq!(
+            storage.list_sync_root_remote_items(&root.id).unwrap(),
+            vec![replacement]
+        );
+        assert!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .sync_root_change_window_changes(&root.id)
+                .unwrap()
+                .is_empty()
+        );
+
+        let state = storage.sync_root_remote_inventory_state(&root.id).unwrap();
+        assert!(state.snapshot_complete);
+        assert!(!state.catchup_complete);
+        assert_eq!(state.item_count, 1);
+        assert_eq!(state.catchup_from_cursor.unwrap().as_str(), "fresh-fence");
+        assert!(storage.sync_root_change_cursor(&root.id).unwrap().is_none());
+        assert_eq!(
+            storage
+                .staged_sync_root_remote_inventory_count(&root.id)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn phase5h20b_remote_rebaseline_cas_failure_preserves_old_catalog_and_window() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let provider = ProviderId::new("google-drive").unwrap();
+        let account = test_account(&provider);
+        storage.upsert_account(&account, 1).unwrap();
+
+        let root = SyncRoot::new(
+            "phase5h20b-cas",
+            provider,
+            account.subject,
+            "/tmp/phase5h20b-cas",
+            Some("remote-root".into()),
+            SyncMode::TwoWay,
+            2,
+        )
+        .unwrap();
+        storage.insert_sync_root(&root).unwrap();
+
+        storage
+            .begin_sync_root_local_inventory_staging(&root.id)
+            .unwrap();
+        storage
+            .commit_sync_root_local_inventory_snapshot(&root.id, 10)
+            .unwrap();
+
+        let old = test_remote_item("old", Some("remote-root"), "old.txt", RemoteItemKind::File);
+        prepare_root_snapshot(
+            &mut storage,
+            &root,
+            std::slice::from_ref(&old),
+            "old-fence",
+            20,
+        );
+        storage
+            .commit_sync_root_catalog_batch_and_cursor(
+                &root.id,
+                &ChangeCursor::new("old-fence").unwrap(),
+                &[],
+                &ChangeCursor::new("durable-old").unwrap(),
+                22,
+            )
+            .unwrap();
+
+        let mut continuation = None;
+        for index in 0..64 {
+            let next = ContinuationToken::new(format!("token-{index}")).unwrap();
+            storage
+                .stage_sync_root_change_window_page(
+                    &root.id,
+                    &ChangeCursor::new("durable-old").unwrap(),
+                    continuation.as_ref(),
+                    &ChangePage {
+                        changes: vec![],
+                        continuation: Some(next.clone()),
+                        checkpoint: None,
+                    },
+                )
+                .unwrap();
+            continuation = Some(next);
+        }
+
+        storage
+            .begin_sync_root_remote_inventory_staging(&root.id)
+            .unwrap();
+        let replacement = test_remote_item(
+            "replacement",
+            Some("remote-root"),
+            "replacement.txt",
+            RemoteItemKind::File,
+        );
+        storage
+            .stage_sync_root_remote_inventory_items(
+                &root.id,
+                std::slice::from_ref(&replacement),
+                30,
+            )
+            .unwrap();
+
+        let error = storage
+            .commit_sync_root_remote_inventory_rebaseline(
+                &root.id,
+                &ChangeCursor::new("durable-old").unwrap(),
+                63,
+                0,
+                1,
+                1,
+                &ChangeCursor::new("fresh-fence").unwrap(),
+                31,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::SyncRootRemoteRebaselinePreconditionFailed
+        ));
+        assert_eq!(
+            storage.list_sync_root_remote_items(&root.id).unwrap(),
+            vec![old]
+        );
+        assert_eq!(
+            storage
+                .sync_root_change_window_state(&root.id)
+                .unwrap()
+                .unwrap()
+                .page_count,
+            64
+        );
     }
 
     #[test]

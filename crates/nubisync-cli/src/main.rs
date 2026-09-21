@@ -29,8 +29,8 @@ use nubisync_daemon::{
     plan_selected_root_remote_deletion, plan_selected_root_remote_directory_deletion,
     plan_selected_root_remote_replacement, plan_selected_root_remote_write_intents,
     plan_selected_root_stale_files, plan_selected_root_unified_convergence_step,
-    replace_selected_root_existing_file, replace_selected_root_stale_files,
-    try_acquire_selected_root_cross_process_execution_lock,
+    rebaseline_selected_root_remote_snapshot, replace_selected_root_existing_file,
+    replace_selected_root_stale_files, try_acquire_selected_root_cross_process_execution_lock,
     validate_selected_root_folder_create_local_identity, verify_selected_root_existing_file,
     verify_selected_root_existing_files, verify_selected_root_local_receipts,
 };
@@ -199,6 +199,14 @@ fn run() -> Result<(), CliError> {
                 && approve == "--approve" =>
         {
             sync_roots_refresh_two_way_metadata()
+        }
+        [sync, roots, rebaseline_two_way_metadata, approve]
+            if sync == "sync"
+                && roots == "roots"
+                && rebaseline_two_way_metadata == "rebaseline-two-way-metadata"
+                && approve == "--approve" =>
+        {
+            sync_roots_rebaseline_two_way_metadata()
         }
         [sync, roots, observe_write_authority, approve]
             if sync == "sync"
@@ -580,6 +588,7 @@ USAGE:
   nubisync sync roots local-diff --approve
   nubisync sync roots local-journal --approve
   nubisync sync roots refresh-two-way-metadata --approve
+  nubisync sync roots rebaseline-two-way-metadata --approve
   nubisync sync roots observe-write-authority --approve
   nubisync sync roots remote-write-plan --approve
   nubisync sync roots allocate-create-ids --approve
@@ -1136,6 +1145,166 @@ fn sync_roots_refresh_two_way_metadata() -> Result<(), CliError> {
     println!("CURSOR_VALUES_PRINTED=no");
     println!("TOKEN_VALUES_PRINTED=no");
     println!("DRIVE_WRITE_ACCESS=readonly_metadata_refresh");
+    Ok(())
+}
+
+fn sync_roots_rebaseline_two_way_metadata() -> Result<(), CliError> {
+    let db_path = nubisync_database_path()?;
+    if !db_path.exists() {
+        return Err(CliError::NoLocalGoogleAccount);
+    }
+
+    let mut storage = Storage::open(&db_path)?;
+    let provider = ProviderId::new("google-drive")?;
+    let account = single_google_account(storage.list_accounts(&provider)?)?;
+    let roots = storage.list_sync_roots(&provider, &account.subject)?;
+    if roots.len() != 1 {
+        return Err(CliError::SyncRootTwoWayRebaselineSelectionFailed);
+    }
+
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or(CliError::SyncRootTwoWayRebaselineSelectionFailed)?;
+    if root.mode != SyncMode::TwoWay {
+        return Err(CliError::SyncRootTwoWayRebaselineModeUnsupported);
+    }
+
+    let local_before = storage.sync_root_local_inventory_state(&root.id)?;
+    if !local_before.snapshot_complete || !local_before.observation_valid {
+        return Err(CliError::SyncRootTwoWayRebaselineLocalStateNotReady);
+    }
+
+    let pending_before =
+        storage.pending_sync_root_local_change_event_count(&root.id, local_before.generation)?;
+    if pending_before != 0 {
+        return Err(CliError::SyncRootTwoWayRebaselinePendingLocalChanges);
+    }
+
+    let window_before = storage
+        .sync_root_change_window_state(&root.id)?
+        .ok_or(CliError::SyncRootTwoWayRebaselineWindowNotEligible)?;
+    if window_before.is_complete()
+        || window_before.continuation.is_none()
+        || window_before.page_count < 64
+    {
+        return Err(CliError::SyncRootTwoWayRebaselineWindowNotEligible);
+    }
+
+    let intent_count_before = storage.sync_root_remote_write_intent_count(&root.id)?;
+    for status in [
+        RemoteWriteIntentStatus::Planned,
+        RemoteWriteIntentStatus::Submitted,
+        RemoteWriteIntentStatus::AwaitingConfirmation,
+        RemoteWriteIntentStatus::Conflict,
+    ] {
+        if storage.sync_root_remote_write_intent_status_count(&root.id, status)? != 0 {
+            return Err(CliError::SyncRootTwoWayRebaselineActiveWriteIntent);
+        }
+    }
+
+    let confirmed = storage
+        .sync_root_remote_write_intent_status_count(&root.id, RemoteWriteIntentStatus::Confirmed)?;
+    if confirmed != storage.sync_root_remote_write_settlement_count(&root.id)? {
+        return Err(CliError::SyncRootTwoWayRebaselineUnsettledConfirmedIntent);
+    }
+
+    ensure_keyring_available()?;
+    let keyring = KeyringSecretStore::default();
+    let refresh_key = refresh_token_key(&account.subject)?;
+    let refresh_token = required_secret_utf8(
+        keyring.get(&refresh_key)?,
+        CliError::MissingStoredRefreshToken,
+    )?;
+    let (client_id, client_secret) = load_google_client_config(&keyring)?;
+
+    println!("SYNC_ROOT_TWO_WAY_METADATA_REBASELINE_STAGE=refresh_readonly_access_token");
+    let oauth = GoogleOAuthConfig::new(client_id)?;
+    let tokens = oauth.refresh_access_token(&refresh_token, &client_secret)?;
+    if let Some(scope) = tokens.scope()
+        && !oauth_scope_contains(Some(scope), GOOGLE_DRIVE_READONLY_SCOPE)
+    {
+        return Err(CliError::GoogleReadonlyScopeNotGranted);
+    }
+    if let Some(rotated) = tokens.refresh_token() {
+        keyring.put(&refresh_key, SecretValue::new(rotated.as_bytes().to_vec())?)?;
+    }
+
+    let api = GoogleDriveApi::new(tokens.access_token().clone())?;
+    if api.user_info()?.sub != account.subject {
+        return Err(CliError::GoogleAccountMismatch);
+    }
+
+    println!("SYNC_ROOT_TWO_WAY_METADATA_REBASELINE_STAGE=capture_fence_and_rebuild_snapshot");
+    let result =
+        rebaseline_selected_root_remote_snapshot(&api, &mut storage, &root, unix_time_ms()?)?;
+
+    let local_after = storage.sync_root_local_inventory_state(&root.id)?;
+    let pending_after =
+        storage.pending_sync_root_local_change_event_count(&root.id, local_after.generation)?;
+    if local_after != local_before || pending_after != 0 {
+        return Err(CliError::SyncRootTwoWayRebaselineLocalStateChanged);
+    }
+
+    let intent_count_after = storage.sync_root_remote_write_intent_count(&root.id)?;
+    if intent_count_after != intent_count_before {
+        return Err(CliError::SyncRootTwoWayRebaselineIntentStateChanged);
+    }
+
+    if storage.sync_root_change_window_state(&root.id)?.is_some() {
+        return Err(CliError::SyncRootTwoWayRebaselineWindowNotCleared);
+    }
+
+    let remote_after = storage.sync_root_remote_inventory_state(&root.id)?;
+    if !remote_after.snapshot_complete
+        || remote_after.catchup_complete
+        || remote_after.catchup_from_cursor.is_none()
+        || storage.sync_root_change_cursor(&root.id)?.is_some()
+    {
+        return Err(CliError::SyncRootTwoWayRebaselineRemoteStateMismatch);
+    }
+
+    if storage
+        .sync_root_remote_write_authority_state(&root.id)?
+        .is_some()
+        || storage.sync_root_remote_write_authority_count(&root.id)? != 0
+    {
+        return Err(CliError::SyncRootTwoWayRebaselineAuthorityNotCleared);
+    }
+
+    println!("SYNC_ROOT_TWO_WAY_METADATA_REBASELINE=PASS");
+    println!("MODE=two_way");
+    println!("ABANDONED_WINDOW_PAGES={}", result.abandoned_window_pages);
+    println!(
+        "ABANDONED_WINDOW_CHANGES={}",
+        result.abandoned_window_changes
+    );
+    println!("AUTHORITATIVE_ITEMS={}", result.authoritative_items);
+    println!("FOLDER_PAGES={}", result.folder_pages);
+    println!(
+        "UNSUPPORTED_PROVIDER_NATIVE={}",
+        result.unsupported_provider_native
+    );
+    println!("FRESH_FENCE_CAPTURED=yes");
+    println!("OLD_WINDOW_DISCARDED_ATOMICALLY=yes");
+    println!("AUTHORITY_INVALIDATED=yes");
+    println!("INITIAL_CATCHUP_REQUIRED=yes");
+    println!("LOCAL_BASELINE_UNCHANGED=yes");
+    println!("LOCAL_PENDING_EVENTS=0");
+    println!("REMOTE_WRITE_INTENTS_PRESERVED=yes");
+    println!("NETWORK_CHECK=performed");
+    println!("DATABASE_MUTATION=yes");
+    println!("FILESYSTEM_READ=not_performed");
+    println!("FILESYSTEM_MUTATION=no");
+    println!("FILE_CONTENT_ACCESSED=no");
+    println!("PROVIDER_WRITE_METHOD_CALLED=no");
+    println!("REMOTE_OBJECT_MUTATION=no");
+    println!("ROOT_PATH_PRINTED=no");
+    println!("LOCAL_NAMES_PRINTED=no");
+    println!("REMOTE_IDS_PRINTED=no");
+    println!("CURSOR_VALUES_PRINTED=no");
+    println!("TOKEN_VALUES_PRINTED=no");
+    println!("DRIVE_WRITE_ACCESS=readonly_metadata_rebaseline");
     Ok(())
 }
 
@@ -8080,6 +8249,7 @@ fn cli_requires_cross_process_execution_lock(args: &[String]) -> bool {
                 | "local-diff"
                 | "local-journal"
                 | "refresh-two-way-metadata"
+                | "rebaseline-two-way-metadata"
                 | "observe-write-authority"
                 | "remote-write-plan"
                 | "allocate-create-ids"
@@ -8226,6 +8396,16 @@ mod sync_root_cli_tests {
         assert!(!file_create_provider_version_floor_met(9, 8));
         assert!(!file_create_provider_version_floor_met(0, 9));
         assert!(!file_create_provider_version_floor_met(9, 0));
+    }
+
+    #[test]
+    fn phase5h20b_remote_rebaseline_is_cross_process_locked() {
+        let args = ["sync", "roots", "rebaseline-two-way-metadata", "--approve"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        assert!(cli_requires_cross_process_execution_lock(&args));
     }
 
     #[test]
@@ -8662,6 +8842,30 @@ enum CliError {
     SyncRootInventorySelectionFailed,
     #[error("sync root metadata-step selection failed")]
     SyncRootMetadataStepSelectionFailed,
+    #[error("sync root two-way metadata rebaseline selection failed")]
+    SyncRootTwoWayRebaselineSelectionFailed,
+    #[error("sync root two-way metadata rebaseline requires two_way mode")]
+    SyncRootTwoWayRebaselineModeUnsupported,
+    #[error("sync root two-way metadata rebaseline local state is not ready")]
+    SyncRootTwoWayRebaselineLocalStateNotReady,
+    #[error("sync root two-way metadata rebaseline requires zero pending local changes")]
+    SyncRootTwoWayRebaselinePendingLocalChanges,
+    #[error("sync root two-way metadata rebaseline requires an incomplete backlog window")]
+    SyncRootTwoWayRebaselineWindowNotEligible,
+    #[error("sync root two-way metadata rebaseline is blocked by an active write intent")]
+    SyncRootTwoWayRebaselineActiveWriteIntent,
+    #[error("sync root two-way metadata rebaseline requires every confirmed intent to be settled")]
+    SyncRootTwoWayRebaselineUnsettledConfirmedIntent,
+    #[error("sync root two-way metadata rebaseline changed local state")]
+    SyncRootTwoWayRebaselineLocalStateChanged,
+    #[error("sync root two-way metadata rebaseline changed durable write-intent population")]
+    SyncRootTwoWayRebaselineIntentStateChanged,
+    #[error("sync root two-way metadata rebaseline did not clear the old change window")]
+    SyncRootTwoWayRebaselineWindowNotCleared,
+    #[error("sync root two-way metadata rebaseline durable remote state mismatched")]
+    SyncRootTwoWayRebaselineRemoteStateMismatch,
+    #[error("sync root two-way metadata rebaseline did not invalidate stale write authority")]
+    SyncRootTwoWayRebaselineAuthorityNotCleared,
     #[error("sync root two-way metadata refresh selection failed")]
     SyncRootTwoWayMetadataRefreshSelectionFailed,
     #[error("sync root two-way metadata refresh requires two_way mode")]
