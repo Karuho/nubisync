@@ -12,13 +12,13 @@ use nubisync_core::{
 use nubisync_daemon::{
     SUPERVISED_FILE_BATCH_MAX_ACTIONS, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
     SUPERVISED_RECEIVE_ONLY_RUN_MAX_ROUNDS, SelectedRootCrossProcessExecutionLock,
-    SelectedRootReceiveOnlySingleFlightResult, SelectedRootRemoteWritePlanDisposition,
-    adopt_selected_root_existing_directory, bootstrap_selected_root_snapshot,
-    capture_selected_root_local_baseline, collect_selected_root_change_window_page,
-    delete_selected_root_existing_directory, delete_selected_root_existing_file,
-    delete_selected_root_stale_directories, delete_selected_root_stale_files,
-    execute_completed_selected_root_change_window, execute_selected_root_receive_only_cycle,
-    execute_selected_root_receive_only_single_flight,
+    SelectedRootFileCreateUploadBuffer, SelectedRootReceiveOnlySingleFlightResult,
+    SelectedRootRemoteWritePlanDisposition, adopt_selected_root_existing_directory,
+    bootstrap_selected_root_snapshot, capture_selected_root_local_baseline,
+    collect_selected_root_change_window_page, delete_selected_root_existing_directory,
+    delete_selected_root_existing_file, delete_selected_root_stale_directories,
+    delete_selected_root_stale_files, execute_completed_selected_root_change_window,
+    execute_selected_root_receive_only_cycle, execute_selected_root_receive_only_single_flight,
     execute_selected_root_unified_convergence_step, journal_selected_root_local_inventory_diff,
     journal_selected_root_two_way_local_inventory_diff, materialize_selected_root_directories,
     materialize_selected_root_missing_file, materialize_selected_root_missing_files,
@@ -35,10 +35,10 @@ use nubisync_daemon::{
     verify_selected_root_existing_files, verify_selected_root_local_receipts,
 };
 use nubisync_drive::{
-    DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES, DriveExpectedFileLookup, DriveExpectedFolderLookup,
-    DriveFolderCreateSubmission, DriveResumableUploadProgress, DriveRootMembership,
-    GOOGLE_DRIVE_FULL_SCOPE, GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi,
-    GoogleOAuthConfig,
+    DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES, DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES,
+    DriveExpectedFileLookup, DriveExpectedFolderLookup, DriveFolderCreateSubmission,
+    DriveResumableUploadProgress, DriveRootMembership, GOOGLE_DRIVE_FULL_SCOPE,
+    GOOGLE_DRIVE_READONLY_SCOPE, GoogleDriveAccess, GoogleDriveApi, GoogleOAuthConfig,
 };
 use nubisync_storage::{
     REMOTE_WRITE_INTENT_BATCH_MAX, RemoteWriteAuthoritySnapshot, RemoteWriteIntentStatus, Storage,
@@ -60,6 +60,7 @@ const OAUTH_CLIENT_SUBJECT: &str = "oauth-desktop-client";
 const OAUTH_CLIENT_ID_PURPOSE: &str = "client-id";
 const OAUTH_CLIENT_SECRET_PURPOSE: &str = "client-secret";
 const SUPERVISED_FILE_CREATE_MIME_TYPE: &str = "application/octet-stream";
+const SUPERVISED_FILE_CREATE_MAX_NO_PROGRESS_RESPONSES: u64 = 3;
 
 fn main() {
     if let Err(error) = run() {
@@ -1917,7 +1918,7 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
         .ok_or(CliError::SyncRootFileCreateSubmissionSelectionFailed)?;
 
     println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=open_local_source");
-    let mut local = open_selected_root_file_create_local_source(&root, candidate)?;
+    let local = open_selected_root_file_create_local_source(&root, candidate)?;
     let leaf_name = local.leaf_name().to_owned();
 
     ensure_keyring_available()?;
@@ -2022,59 +2023,83 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
 
     let chunk_size = usize::try_from(DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES)
         .map_err(|_| CliError::NumericOverflow)?;
-    let mut offset = 0_u64;
-    let mut chunks = 0_u64;
+    let mut upload = SelectedRootFileCreateUploadBuffer::new(
+        local,
+        chunk_size,
+        DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES,
+    )?;
     let mut final_sha256: Option<String> = None;
     let mut completion = None;
+    let mut status_probes = 0_u64;
+    let mut partial_prefix_recoveries = 0_u64;
+    let mut no_progress_responses = 0_u64;
 
-    while offset < local.total_bytes() {
-        let chunk = local
-            .read_next_chunk(chunk_size)?
-            .ok_or(CliError::SyncRootFileCreateStreamIncomplete)?;
-        let chunk_len = u64::try_from(chunk.len()).map_err(|_| CliError::NumericOverflow)?;
-        let expected_next = offset
-            .checked_add(chunk_len)
+    while completion.is_none() {
+        let request = upload.prepare_request()?;
+        let request_start = request.start_offset();
+        let request_len = u64::try_from(request.len()).map_err(|_| CliError::NumericOverflow)?;
+        let request_end = request_start
+            .checked_add(request_len)
             .ok_or(CliError::NumericOverflow)?;
-        let is_final = expected_next == local.total_bytes();
+        let is_final = request.is_final();
 
-        if is_final {
-            let sha256 = local.completed_sha256_hex()?;
+        if is_final && final_sha256.is_none() {
+            let sha256 = upload.completed_sha256_hex()?;
             storage.record_sync_root_file_create_stream_fingerprint(
                 candidate.intent_id,
                 submitted.execution_generation,
-                local.total_bytes(),
+                upload.total_bytes(),
                 &sha256,
             )?;
             final_sha256 = Some(sha256);
             println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=fingerprint_durable_before_final_put");
         }
 
+        upload.record_transmission(&request)?;
         println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=upload_chunk");
-        let progress = match api.upload_resumable_file_chunk(&session, offset, chunk) {
-            Ok(progress) => progress,
-            Err(_) => {
-                println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=query_status_after_chunk_error");
-                api.query_resumable_file_upload_status(&session)?
-            }
-        };
-
-        chunks = chunks.checked_add(1).ok_or(CliError::NumericOverflow)?;
+        let progress =
+            match api.upload_resumable_file_chunk(&session, request_start, request.into_bytes()) {
+                Ok(progress) => progress,
+                Err(_) => {
+                    status_probes = status_probes
+                        .checked_add(1)
+                        .ok_or(CliError::NumericOverflow)?;
+                    println!(
+                        "SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=query_status_after_chunk_error"
+                    );
+                    api.query_resumable_file_upload_status(&session)?
+                }
+            };
 
         match progress {
-            DriveResumableUploadProgress::Incomplete { next_offset }
-                if !is_final && next_offset == expected_next =>
-            {
-                offset = next_offset;
+            DriveResumableUploadProgress::Incomplete { next_offset } => {
+                let accepted = upload
+                    .acknowledge_provider_offset(next_offset)
+                    .map_err(|_| CliError::SyncRootFileCreateResumeOffsetMismatch)?;
+
+                if accepted == 0 {
+                    no_progress_responses = no_progress_responses
+                        .checked_add(1)
+                        .ok_or(CliError::NumericOverflow)?;
+                    if no_progress_responses > SUPERVISED_FILE_CREATE_MAX_NO_PROGRESS_RESPONSES {
+                        return Err(CliError::SyncRootFileCreateNoProgressLimitExceeded);
+                    }
+                } else {
+                    no_progress_responses = 0;
+                    if next_offset < request_end {
+                        partial_prefix_recoveries = partial_prefix_recoveries
+                            .checked_add(1)
+                            .ok_or(CliError::NumericOverflow)?;
+                    }
+                }
             }
             DriveResumableUploadProgress::Complete(value) if is_final => {
                 completion = Some(value);
-                offset = expected_next;
             }
             DriveResumableUploadProgress::Expired => {
                 return Err(CliError::SyncRootFileCreateSessionExpired);
             }
-            DriveResumableUploadProgress::Incomplete { .. }
-            | DriveResumableUploadProgress::Complete(_) => {
+            DriveResumableUploadProgress::Complete(_) => {
                 return Err(CliError::SyncRootFileCreateResumeOffsetMismatch);
             }
         }
@@ -2102,7 +2127,7 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
                 &leaf_name,
                 parent_remote_id,
                 SUPERVISED_FILE_CREATE_MIME_TYPE,
-                local.total_bytes(),
+                upload.total_bytes(),
                 &final_sha256,
             )? {
                 DriveExpectedFileLookup::Exact { remote_version } => remote_version,
@@ -2123,7 +2148,7 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
         }
     };
 
-    let streamed = local.finish()?;
+    let streamed = upload.finish_completed()?;
     if streamed.sha256_hex() != final_sha256 {
         return Err(CliError::SyncRootFileCreateStreamFingerprintMismatch);
     }
@@ -2148,8 +2173,16 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
     println!("PRE_SUBMIT_CURSOR_MATCH=yes");
     println!("DURABLE_SUBMITTED_BEFORE_UPLOAD=yes");
     println!("RESUMABLE_SESSION_INITIATED=yes");
-    println!("UPLOAD_CHUNKS={chunks}");
+    println!("UPLOAD_CHUNKS={}", streamed.transmissions);
     println!("BYTES_STREAMED={}", streamed.bytes_streamed);
+    println!(
+        "NETWORK_BYTES_ATTEMPTED={}",
+        streamed.network_bytes_attempted
+    );
+    println!("STATUS_PROBES={status_probes}");
+    println!("PARTIAL_PREFIX_RECOVERIES={partial_prefix_recoveries}");
+    println!("RANGE_PREFIX_AUTHORITATIVE=yes");
+    println!("RETRANSMISSION_DOUBLE_HASH=no");
     println!("STREAM_SHA256_DURABLE=yes");
     println!("HASH_VALUE_PRINTED=no");
     println!(
@@ -8994,6 +9027,8 @@ enum CliError {
     SyncRootFileCreateSessionExpired,
     #[error("sync root ordinary-file create provider resume offset mismatched")]
     SyncRootFileCreateResumeOffsetMismatch,
+    #[error("sync root ordinary-file create resumable session made no bounded progress")]
+    SyncRootFileCreateNoProgressLimitExceeded,
     #[error("sync root ordinary-file create provider completion metadata is missing")]
     SyncRootFileCreateCompletionMissing,
     #[error("sync root ordinary-file create provider SHA-256 mismatched")]

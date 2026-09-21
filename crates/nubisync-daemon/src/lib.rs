@@ -181,6 +181,284 @@ impl fmt::Debug for SelectedRootFileCreateStreamResult {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectedRootFileCreateUploadRequest {
+    start_offset: u64,
+    bytes: Vec<u8>,
+    final_request: bool,
+}
+
+impl SelectedRootFileCreateUploadRequest {
+    pub fn start_offset(&self) -> u64 {
+        self.start_offset
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn is_final(&self) -> bool {
+        self.final_request
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl fmt::Debug for SelectedRootFileCreateUploadRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedRootFileCreateUploadRequest")
+            .field("start_offset", &self.start_offset)
+            .field("payload_len", &self.bytes.len())
+            .field("final_request", &self.final_request)
+            .field("payload", &"[redacted]")
+            .finish()
+    }
+}
+
+pub struct SelectedRootFileCreateUploadBuffer {
+    source: SelectedRootFileCreateLocalSource,
+    pending_start_offset: u64,
+    pending: Vec<u8>,
+    target_request_bytes: usize,
+    alignment_bytes: u64,
+    network_bytes_attempted: u64,
+    transmissions: u64,
+}
+
+impl SelectedRootFileCreateUploadBuffer {
+    pub fn new(
+        source: SelectedRootFileCreateLocalSource,
+        target_request_bytes: usize,
+        alignment_bytes: u64,
+    ) -> Result<Self, SelectedRootExecutorError> {
+        if target_request_bytes == 0 || alignment_bytes == 0 {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateChunkSizeInvalid);
+        }
+        let target_u64 = u64::try_from(target_request_bytes)
+            .map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+        if target_u64 % alignment_bytes != 0 {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateChunkSizeInvalid);
+        }
+
+        Ok(Self {
+            source,
+            pending_start_offset: 0,
+            pending: Vec::with_capacity(target_request_bytes),
+            target_request_bytes,
+            alignment_bytes,
+            network_bytes_attempted: 0,
+            transmissions: 0,
+        })
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.source.total_bytes()
+    }
+
+    pub fn unique_bytes_read(&self) -> u64 {
+        self.source.bytes_read()
+    }
+
+    pub fn pending_start_offset(&self) -> u64 {
+        self.pending_start_offset
+    }
+
+    pub fn completed_sha256_hex(&self) -> Result<String, SelectedRootExecutorError> {
+        self.source.completed_sha256_hex()
+    }
+
+    fn pending_end_offset(&self) -> Result<u64, SelectedRootExecutorError> {
+        self.pending_start_offset
+            .checked_add(
+                u64::try_from(self.pending.len())
+                    .map_err(|_| SelectedRootExecutorError::CountOverflow)?,
+            )
+            .ok_or(SelectedRootExecutorError::CountOverflow)
+    }
+
+    fn validate_buffer_invariant(&self) -> Result<(), SelectedRootExecutorError> {
+        let pending_end = self.pending_end_offset()?;
+        if pending_end != self.source.bytes_read()
+            || pending_end > self.source.total_bytes()
+            || self.pending_start_offset > pending_end
+        {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateResumeOffsetMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn prepare_request(
+        &mut self,
+    ) -> Result<SelectedRootFileCreateUploadRequest, SelectedRootExecutorError> {
+        self.validate_buffer_invariant()?;
+        if self.pending_start_offset >= self.source.total_bytes() {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateStreamIncomplete);
+        }
+
+        let remaining_from_provider = self
+            .source
+            .total_bytes()
+            .checked_sub(self.pending_start_offset)
+            .ok_or(SelectedRootExecutorError::RemoteWriteFileCreateResumeOffsetMismatch)?;
+        let target = remaining_from_provider.min(
+            u64::try_from(self.target_request_bytes)
+                .map_err(|_| SelectedRootExecutorError::CountOverflow)?,
+        );
+        let target =
+            usize::try_from(target).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+
+        if self.pending.len() > target {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateResumeOffsetMismatch);
+        }
+
+        let missing = target - self.pending.len();
+        if missing > 0 {
+            let newly_read = self
+                .source
+                .read_next_chunk(missing)?
+                .ok_or(SelectedRootExecutorError::RemoteWriteFileCreateStreamIncomplete)?;
+            if newly_read.len() != missing {
+                return Err(SelectedRootExecutorError::RemoteWriteFileCreateStreamIncomplete);
+            }
+            self.pending.extend_from_slice(&newly_read);
+        }
+
+        self.validate_buffer_invariant()?;
+        let end = self.pending_end_offset()?;
+        let final_request = end == self.source.total_bytes();
+        let pending_len = u64::try_from(self.pending.len())
+            .map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+        if !final_request && pending_len % self.alignment_bytes != 0 {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateChunkSizeInvalid);
+        }
+
+        Ok(SelectedRootFileCreateUploadRequest {
+            start_offset: self.pending_start_offset,
+            bytes: self.pending.clone(),
+            final_request,
+        })
+    }
+
+    pub fn record_transmission(
+        &mut self,
+        request: &SelectedRootFileCreateUploadRequest,
+    ) -> Result<(), SelectedRootExecutorError> {
+        self.validate_buffer_invariant()?;
+        if request.start_offset != self.pending_start_offset
+            || request.bytes != self.pending
+            || request.bytes.is_empty()
+        {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateResumeOffsetMismatch);
+        }
+
+        self.network_bytes_attempted = self
+            .network_bytes_attempted
+            .checked_add(
+                u64::try_from(request.bytes.len())
+                    .map_err(|_| SelectedRootExecutorError::CountOverflow)?,
+            )
+            .ok_or(SelectedRootExecutorError::CountOverflow)?;
+        self.transmissions = self
+            .transmissions
+            .checked_add(1)
+            .ok_or(SelectedRootExecutorError::CountOverflow)?;
+        Ok(())
+    }
+
+    pub fn acknowledge_provider_offset(
+        &mut self,
+        next_offset: u64,
+    ) -> Result<u64, SelectedRootExecutorError> {
+        self.validate_buffer_invariant()?;
+        let pending_end = self.pending_end_offset()?;
+        if next_offset < self.pending_start_offset || next_offset > pending_end {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateResumeOffsetMismatch);
+        }
+
+        let accepted = next_offset
+            .checked_sub(self.pending_start_offset)
+            .ok_or(SelectedRootExecutorError::RemoteWriteFileCreateResumeOffsetMismatch)?;
+        let accepted_usize =
+            usize::try_from(accepted).map_err(|_| SelectedRootExecutorError::CountOverflow)?;
+        if accepted_usize > 0 {
+            self.pending.drain(..accepted_usize);
+        }
+        self.pending_start_offset = next_offset;
+        self.validate_buffer_invariant()?;
+        Ok(accepted)
+    }
+
+    pub fn finish_completed(
+        self,
+    ) -> Result<SelectedRootFileCreateUploadResult, SelectedRootExecutorError> {
+        self.validate_buffer_invariant()?;
+        if self.source.bytes_read() != self.source.total_bytes()
+            || self.pending_end_offset()? != self.source.total_bytes()
+        {
+            return Err(SelectedRootExecutorError::RemoteWriteFileCreateStreamIncomplete);
+        }
+
+        let stream = self.source.finish()?;
+        Ok(SelectedRootFileCreateUploadResult {
+            bytes_streamed: stream.bytes_streamed,
+            sha256_hex: stream.sha256_hex,
+            source_stable: stream.source_stable,
+            network_bytes_attempted: self.network_bytes_attempted,
+            transmissions: self.transmissions,
+        })
+    }
+}
+
+impl fmt::Debug for SelectedRootFileCreateUploadBuffer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedRootFileCreateUploadBuffer")
+            .field("pending_start_offset", &self.pending_start_offset)
+            .field("pending_len", &self.pending.len())
+            .field("target_request_bytes", &self.target_request_bytes)
+            .field("alignment_bytes", &self.alignment_bytes)
+            .field("network_bytes_attempted", &self.network_bytes_attempted)
+            .field("transmissions", &self.transmissions)
+            .field("payload", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectedRootFileCreateUploadResult {
+    pub bytes_streamed: u64,
+    sha256_hex: String,
+    pub source_stable: bool,
+    pub network_bytes_attempted: u64,
+    pub transmissions: u64,
+}
+
+impl SelectedRootFileCreateUploadResult {
+    pub fn sha256_hex(&self) -> &str {
+        &self.sha256_hex
+    }
+}
+
+impl fmt::Debug for SelectedRootFileCreateUploadResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedRootFileCreateUploadResult")
+            .field("bytes_streamed", &self.bytes_streamed)
+            .field("sha256_hex", &"[redacted]")
+            .field("source_stable", &self.source_stable)
+            .field("network_bytes_attempted", &self.network_bytes_attempted)
+            .field("transmissions", &self.transmissions)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectedRootLocalDiffKind {
     Created,
@@ -8141,6 +8419,8 @@ pub enum SelectedRootExecutorError {
     RemoteWriteFileCreateReadFailed,
     #[error("ordinary-file create content stream is incomplete")]
     RemoteWriteFileCreateStreamIncomplete,
+    #[error("ordinary-file create provider resume offset mismatched retained source bytes")]
+    RemoteWriteFileCreateResumeOffsetMismatch,
     #[error("folder-create local validation requires a two_way root")]
     RemoteWriteFolderCreateModeUnsupported,
     #[error("folder-create local directory identity no longer matches the durable intent")]
@@ -8445,6 +8725,127 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    fn phase5h21b_test_source(
+        label: &str,
+        bytes: &[u8],
+    ) -> (SelectedRootFileCreateLocalSource, PathBuf) {
+        let path = local_plan_temp_dir(label);
+        std::fs::write(&path, bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        (
+            SelectedRootFileCreateLocalSource {
+                file,
+                absolute_path: path.clone(),
+                leaf_name: "upload.bin".into(),
+                total_bytes: u64::try_from(bytes.len()).unwrap(),
+                initial_metadata: metadata,
+                bytes_read: 0,
+                hasher: Sha256::new(),
+            },
+            path,
+        )
+    }
+
+    #[test]
+    fn phase5h21b_partial_prefix_retains_suffix_refills_and_hashes_source_once() {
+        let bytes = b"abcdefghijklmnop";
+        let (source, path) = phase5h21b_test_source("5h21b-partial", bytes);
+        let mut upload = SelectedRootFileCreateUploadBuffer::new(source, 8, 4).unwrap();
+
+        let first = upload.prepare_request().unwrap();
+        assert_eq!(first.start_offset(), 0);
+        assert_eq!(first.len(), 8);
+        assert!(!first.is_final());
+        assert_eq!(first.bytes.as_slice(), b"abcdefgh");
+        upload.record_transmission(&first).unwrap();
+
+        assert_eq!(upload.acknowledge_provider_offset(3).unwrap(), 3);
+        assert_eq!(upload.pending_start_offset(), 3);
+        assert_eq!(upload.unique_bytes_read(), 8);
+
+        let second = upload.prepare_request().unwrap();
+        assert_eq!(second.start_offset(), 3);
+        assert_eq!(second.len(), 8);
+        assert!(!second.is_final());
+        assert_eq!(second.bytes.as_slice(), b"defghijk");
+        assert_eq!(upload.unique_bytes_read(), 11);
+        upload.record_transmission(&second).unwrap();
+        assert_eq!(upload.acknowledge_provider_offset(11).unwrap(), 8);
+
+        let final_request = upload.prepare_request().unwrap();
+        assert_eq!(final_request.start_offset(), 11);
+        assert_eq!(final_request.len(), 5);
+        assert!(final_request.is_final());
+        assert_eq!(final_request.bytes.as_slice(), b"lmnop");
+        assert_eq!(upload.unique_bytes_read(), 16);
+
+        let expected_sha = {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            digest_to_hex(hasher.finalize().as_slice())
+        };
+        assert_eq!(upload.completed_sha256_hex().unwrap(), expected_sha);
+
+        upload.record_transmission(&final_request).unwrap();
+        let result = upload.finish_completed().unwrap();
+        assert_eq!(result.bytes_streamed, 16);
+        assert_eq!(result.network_bytes_attempted, 21);
+        assert_eq!(result.transmissions, 3);
+        assert_eq!(result.sha256_hex(), expected_sha);
+        assert!(result.source_stable);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn phase5h21b_zero_acceptance_reuses_buffer_without_reread_or_double_hash() {
+        let bytes = b"abcdefgh";
+        let (source, path) = phase5h21b_test_source("5h21b-zero", bytes);
+        let mut upload = SelectedRootFileCreateUploadBuffer::new(source, 8, 4).unwrap();
+
+        let first = upload.prepare_request().unwrap();
+        assert!(first.is_final());
+        let first_hash = upload.completed_sha256_hex().unwrap();
+        upload.record_transmission(&first).unwrap();
+        assert_eq!(upload.acknowledge_provider_offset(0).unwrap(), 0);
+
+        let retry = upload.prepare_request().unwrap();
+        assert_eq!(retry.start_offset(), 0);
+        assert_eq!(retry.bytes, first.bytes);
+        assert_eq!(upload.unique_bytes_read(), 8);
+        assert_eq!(upload.completed_sha256_hex().unwrap(), first_hash);
+        upload.record_transmission(&retry).unwrap();
+
+        let result = upload.finish_completed().unwrap();
+        assert_eq!(result.bytes_streamed, 8);
+        assert_eq!(result.network_bytes_attempted, 16);
+        assert_eq!(result.transmissions, 2);
+        assert_eq!(result.sha256_hex(), first_hash);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn phase5h21b_provider_offset_must_stay_within_unacknowledged_buffer() {
+        let (source, path) = phase5h21b_test_source("5h21b-offset", b"abcdefghijklmnop");
+        let mut upload = SelectedRootFileCreateUploadBuffer::new(source, 8, 4).unwrap();
+        let request = upload.prepare_request().unwrap();
+        upload.record_transmission(&request).unwrap();
+
+        assert_eq!(upload.acknowledge_provider_offset(4).unwrap(), 4);
+        assert!(matches!(
+            upload.acknowledge_provider_offset(3),
+            Err(SelectedRootExecutorError::RemoteWriteFileCreateResumeOffsetMismatch)
+        ));
+        assert!(matches!(
+            upload.acknowledge_provider_offset(9),
+            Err(SelectedRootExecutorError::RemoteWriteFileCreateResumeOffsetMismatch)
+        ));
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
