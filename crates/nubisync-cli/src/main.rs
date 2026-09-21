@@ -7,7 +7,7 @@
 
 use nubisync_auth::{KeyringSecretStore, SecretKey, SecretStore, SecretValue};
 use nubisync_core::{
-    ProviderAccount, ProviderId, RemoteChange, RemoteItemKind, SyncMode, SyncRoot,
+    ChangeCursor, ProviderAccount, ProviderId, RemoteChange, RemoteItemKind, SyncMode, SyncRoot,
 };
 use nubisync_daemon::{
     SUPERVISED_FILE_BATCH_MAX_ACTIONS, SUPERVISED_FILE_DOWNLOAD_MAX_BYTES,
@@ -1000,6 +1000,24 @@ fn sync_roots_metadata_step() -> Result<(), CliError> {
     Ok(())
 }
 
+fn two_way_metadata_refresh_base_cursor(
+    remote_state: &nubisync_storage::RemoteInventoryState,
+    durable_cursor: Option<ChangeCursor>,
+) -> Result<ChangeCursor, CliError> {
+    if !remote_state.snapshot_complete {
+        return Err(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady);
+    }
+
+    if remote_state.catchup_complete {
+        return durable_cursor.ok_or(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady);
+    }
+
+    remote_state
+        .catchup_from_cursor
+        .clone()
+        .ok_or(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady)
+}
+
 fn sync_roots_refresh_two_way_metadata() -> Result<(), CliError> {
     const MAX_PAGES: usize = 64;
 
@@ -1041,12 +1059,10 @@ fn sync_roots_refresh_two_way_metadata() -> Result<(), CliError> {
         storage.pending_sync_root_local_change_event_count(&root.id, local_before.generation)?;
 
     let remote_before = storage.sync_root_remote_inventory_state(&root.id)?;
-    if !remote_before.ready_for_reconciliation() {
-        return Err(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady);
-    }
-    let cursor_before = storage
-        .sync_root_change_cursor(&root.id)?
-        .ok_or(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady)?;
+    let durable_cursor_before = storage.sync_root_change_cursor(&root.id)?;
+    let cursor_before =
+        two_way_metadata_refresh_base_cursor(&remote_before, durable_cursor_before)?;
+    let initial_catchup_before = !remote_before.catchup_complete;
 
     ensure_keyring_available()?;
     let keyring = KeyringSecretStore::default();
@@ -1126,6 +1142,10 @@ fn sync_roots_refresh_two_way_metadata() -> Result<(), CliError> {
     println!("CATALOG_MUTATIONS={}", execution.storage_mutations);
     println!("AUTHORITATIVE_ITEMS={}", execution.authoritative_items);
     println!("CURSOR_ADVANCED={}", yes_no(cursor_after != cursor_before));
+    println!(
+        "INITIAL_CATCHUP_COMPLETED={}",
+        yes_no(initial_catchup_before && remote_after.catchup_complete)
+    );
     println!("LOCAL_BASELINE_UNCHANGED=yes");
     println!("LOCAL_PENDING_EVENTS_PRESERVED=yes");
     println!("LOCAL_PENDING_EVENTS={pending_after}");
@@ -8396,6 +8416,54 @@ mod sync_root_cli_tests {
         assert!(!file_create_provider_version_floor_met(9, 8));
         assert!(!file_create_provider_version_floor_met(0, 9));
         assert!(!file_create_provider_version_floor_met(9, 0));
+    }
+
+    #[test]
+    fn phase5h20c_two_way_refresh_uses_rebaseline_fence_before_initial_catchup() {
+        let state = nubisync_storage::RemoteInventoryState {
+            snapshot_complete: true,
+            catchup_complete: false,
+            item_count: 1,
+            snapshot_completed_at_unix_ms: Some(1),
+            catchup_from_cursor: Some(ChangeCursor::new("fresh-fence").unwrap()),
+        };
+
+        let selected = two_way_metadata_refresh_base_cursor(&state, None).unwrap();
+        assert_eq!(selected.as_str(), "fresh-fence");
+    }
+
+    #[test]
+    fn phase5h20c_two_way_refresh_uses_durable_cursor_after_initial_catchup() {
+        let state = nubisync_storage::RemoteInventoryState {
+            snapshot_complete: true,
+            catchup_complete: true,
+            item_count: 1,
+            snapshot_completed_at_unix_ms: Some(1),
+            catchup_from_cursor: Some(ChangeCursor::new("old-bootstrap-fence").unwrap()),
+        };
+
+        let selected = two_way_metadata_refresh_base_cursor(
+            &state,
+            Some(ChangeCursor::new("durable-current").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(selected.as_str(), "durable-current");
+    }
+
+    #[test]
+    fn phase5h20c_two_way_refresh_fails_closed_without_any_valid_fence() {
+        let state = nubisync_storage::RemoteInventoryState {
+            snapshot_complete: true,
+            catchup_complete: false,
+            item_count: 1,
+            snapshot_completed_at_unix_ms: Some(1),
+            catchup_from_cursor: None,
+        };
+
+        assert!(matches!(
+            two_way_metadata_refresh_base_cursor(&state, None),
+            Err(CliError::SyncRootTwoWayMetadataRefreshRemoteStateNotReady)
+        ));
     }
 
     #[test]

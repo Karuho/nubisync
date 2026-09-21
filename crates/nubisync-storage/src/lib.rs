@@ -3,8 +3,8 @@
 #![forbid(unsafe_code)]
 
 use nubisync_core::{
-    ChangeCursor, ChangePage, ContinuationToken, LocalItemKind, LocalItemSnapshot, ProviderAccount,
-    ProviderId, RemoteChange, RemoteItem, RemoteItemKind, SyncMode, SyncRoot,
+    ChangeCursor, ContinuationToken, LocalItemKind, LocalItemSnapshot, ProviderAccount, ProviderId,
+    RemoteChange, RemoteItem, RemoteItemKind, SyncMode, SyncRoot,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
@@ -7941,6 +7941,7 @@ pub enum StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nubisync_core::ChangePage;
 
     fn test_account(provider: &ProviderId) -> ProviderAccount {
         ProviderAccount::new(
