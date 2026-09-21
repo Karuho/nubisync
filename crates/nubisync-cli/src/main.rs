@@ -2204,13 +2204,32 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileCreateRecoveryLookupDisposition {
+    Exact(u64),
+    Conflict,
+    Missing,
+}
+
+fn file_create_recovery_lookup_disposition(
+    lookup: DriveExpectedFileLookup,
+) -> FileCreateRecoveryLookupDisposition {
+    match lookup {
+        DriveExpectedFileLookup::Exact { remote_version } => {
+            FileCreateRecoveryLookupDisposition::Exact(remote_version)
+        }
+        DriveExpectedFileLookup::Mismatch => FileCreateRecoveryLookupDisposition::Conflict,
+        DriveExpectedFileLookup::Missing => FileCreateRecoveryLookupDisposition::Missing,
+    }
+}
+
 fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
     let db_path = nubisync_database_path()?;
     if !db_path.exists() {
         return Err(CliError::NoLocalGoogleAccount);
     }
 
-    let storage = Storage::open(&db_path)?;
+    let mut storage = Storage::open(&db_path)?;
     let provider = ProviderId::new("google-drive")?;
     let account = single_google_account(storage.list_accounts(&provider)?)?;
     let roots = storage.list_sync_roots(&provider, &account.subject)?;
@@ -2233,6 +2252,7 @@ fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
         println!("SUBMITTED_CREATE_FILE_INTENTS=0");
         println!("SELECTED_INTENTS=0");
         println!("RECOVERY_OUTCOME=none");
+        println!("REPLACEMENT_SESSION_INITIATED=no");
         println!("PROVIDER_WRITE=not_performed");
         println!("FILE_CONTENT_ACCESSED=no");
         return Ok(());
@@ -2271,6 +2291,21 @@ fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
         }
     };
 
+    if evidence.size_bytes != candidate.local_size_bytes {
+        return Err(CliError::SyncRootFileCreateStreamFingerprintMismatch);
+    }
+
+    let execution_before = storage
+        .sync_root_remote_write_intent_execution_state(candidate.intent_id)?
+        .ok_or(CliError::SyncRootFileCreateRecoverySelectionFailed)?;
+    if execution_before.status != RemoteWriteIntentStatus::Submitted
+        || execution_before.operation.as_str() != "create_file"
+        || execution_before.execution_generation != candidate.execution_generation
+        || execution_before.attempt_count == 0
+    {
+        return Err(CliError::SyncRootFileCreateRecoverySelectionFailed);
+    }
+
     ensure_keyring_available()?;
     let keyring = KeyringSecretStore::default();
     let fullsync_key = fullsync_refresh_token_key(&account.subject)?;
@@ -2299,26 +2334,44 @@ fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
     }
 
     println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=inspect_predetermined_id");
-    let lookup = api.inspect_expected_file(
+    let initial_lookup = file_create_recovery_lookup_disposition(api.inspect_expected_file(
         candidate.predetermined_remote_id(),
         &leaf_name,
         candidate.expected_parent_remote_id(),
         SUPERVISED_FILE_CREATE_MIME_TYPE,
         evidence.size_bytes,
         evidence.sha256_hex(),
-    )?;
+    )?);
 
-    let (outcome, status_after, mutation) = match lookup {
-        DriveExpectedFileLookup::Exact { remote_version } => {
+    match initial_lookup {
+        FileCreateRecoveryLookupDisposition::Exact(remote_version) => {
             let next = storage.complete_sync_root_file_create_upload(
                 candidate.intent_id,
                 candidate.execution_generation,
                 remote_version,
                 unix_time_ms()?,
             )?;
-            ("exact_id_content_match", next.status.as_str(), "yes")
+            println!("SYNC_ROOT_FILE_CREATE_RECOVERY=PASS");
+            println!("MODE=two_way");
+            println!("SUBMITTED_CREATE_FILE_INTENTS=1");
+            println!("SELECTED_INTENTS=1");
+            println!("RECOVERY_OUTCOME=exact_id_content_match");
+            println!("INTENT_STATUS_AFTER={}", next.status.as_str());
+            println!("DATABASE_MUTATION=yes");
+            println!("REPLACEMENT_SESSION_INITIATED=no");
+            println!("RESTART_CAS_COMMITTED=no");
+            println!("PROVIDER_WRITE=not_performed");
+            println!("REMOTE_OBJECT_MUTATION=none");
+            println!("DURABLE_STREAM_FINGERPRINT=yes");
+            println!("HASH_VALUE_PRINTED=no");
+            println!("REMOTE_IDS_PRINTED=no");
+            println!("TOKEN_VALUES_PRINTED=no");
+            println!("SESSION_URI_PRINTED=no");
+            println!("BLIND_REPLAY=no");
+            println!("CHANGE_STREAM_CONFIRMATION_REQUIRED=yes");
+            return Ok(());
         }
-        DriveExpectedFileLookup::Mismatch => {
+        FileCreateRecoveryLookupDisposition::Conflict => {
             let next = storage.transition_sync_root_file_create_intent(
                 candidate.intent_id,
                 RemoteWriteIntentStatus::Submitted,
@@ -2326,31 +2379,359 @@ fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
                 RemoteWriteIntentStatus::Conflict,
                 unix_time_ms()?,
             )?;
-            ("exact_id_mismatch", next.status.as_str(), "yes")
+            println!("SYNC_ROOT_FILE_CREATE_RECOVERY=PASS");
+            println!("MODE=two_way");
+            println!("SUBMITTED_CREATE_FILE_INTENTS=1");
+            println!("SELECTED_INTENTS=1");
+            println!("RECOVERY_OUTCOME=exact_id_mismatch");
+            println!("INTENT_STATUS_AFTER={}", next.status.as_str());
+            println!("DATABASE_MUTATION=yes");
+            println!("REPLACEMENT_SESSION_INITIATED=no");
+            println!("RESTART_CAS_COMMITTED=no");
+            println!("PROVIDER_WRITE=not_performed");
+            println!("REMOTE_OBJECT_MUTATION=none");
+            println!("HASH_VALUE_PRINTED=no");
+            println!("REMOTE_IDS_PRINTED=no");
+            println!("TOKEN_VALUES_PRINTED=no");
+            println!("SESSION_URI_PRINTED=no");
+            println!("BLIND_REPLAY=no");
+            return Ok(());
         }
-        DriveExpectedFileLookup::Missing => (
-            "exact_id_missing_no_blind_replay",
-            RemoteWriteIntentStatus::Submitted.as_str(),
-            "no",
-        ),
+        FileCreateRecoveryLookupDisposition::Missing => {}
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=revalidate_local_identity");
+    let local = open_selected_root_file_create_local_source(&root, candidate)?;
+    if local.total_bytes() != evidence.size_bytes {
+        return Err(CliError::SyncRootFileCreateLocalIdentityMismatch);
+    }
+
+    let durable_cursor = storage
+        .sync_root_change_cursor(&root.id)?
+        .ok_or(CliError::SyncRootFileCreateRemoteFenceMismatch)?;
+    let authority_state = storage
+        .sync_root_remote_write_authority_state(&root.id)?
+        .ok_or(CliError::SyncRootFileCreateRemoteFenceMismatch)?;
+    if authority_state.change_cursor != durable_cursor {
+        return Err(CliError::SyncRootFileCreateRemoteFenceMismatch);
+    }
+
+    let parent_remote_id = candidate.expected_parent_remote_id();
+    let durable_parent_authority = storage
+        .sync_root_remote_write_authority(&root.id, parent_remote_id)?
+        .ok_or(CliError::SyncRootFileCreateParentAuthorityMismatch)?;
+    if !durable_parent_authority.can_add_children {
+        return Err(CliError::SyncRootFileCreateParentAuthorityMismatch);
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=verify_fresh_parent");
+    let fresh_parent = api.observe_write_authority(parent_remote_id)?;
+    if fresh_parent.kind != RemoteItemKind::Folder
+        || !fresh_parent.can_add_children
+        || fresh_parent.remote_version != durable_parent_authority.remote_version
+    {
+        return Err(CliError::SyncRootFileCreateParentAuthorityMismatch);
+    }
+
+    let root_remote_id = root
+        .remote_root_id
+        .as_deref()
+        .ok_or(CliError::SyncRootFileCreateRemoteRootMissing)?;
+    let drive_root = api.resolve_folder_root(root_remote_id)?;
+    if parent_remote_id != root_remote_id {
+        let parent_item = storage
+            .sync_root_remote_item(&root.id, parent_remote_id)?
+            .ok_or(CliError::SyncRootFileCreateParentTopologyMismatch)?;
+        if parent_item.kind != RemoteItemKind::Folder || parent_item.trashed {
+            return Err(CliError::SyncRootFileCreateParentTopologyMismatch);
+        }
+        if api.resolve_item_membership(&parent_item, &drive_root)?
+            != DriveRootMembership::Descendant
+        {
+            return Err(CliError::SyncRootFileCreateParentTopologyMismatch);
+        }
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=establish_restart_fence");
+    let provider_cursor_before = api.current_change_cursor()?;
+    if provider_cursor_before != durable_cursor {
+        return Err(CliError::SyncRootFileCreateRemoteFenceMismatch);
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=reinspect_predetermined_id");
+    match file_create_recovery_lookup_disposition(api.inspect_expected_file(
+        candidate.predetermined_remote_id(),
+        &leaf_name,
+        parent_remote_id,
+        SUPERVISED_FILE_CREATE_MIME_TYPE,
+        evidence.size_bytes,
+        evidence.sha256_hex(),
+    )?) {
+        FileCreateRecoveryLookupDisposition::Exact(remote_version) => {
+            let next = storage.complete_sync_root_file_create_upload(
+                candidate.intent_id,
+                candidate.execution_generation,
+                remote_version,
+                unix_time_ms()?,
+            )?;
+            println!("SYNC_ROOT_FILE_CREATE_RECOVERY=PASS");
+            println!("MODE=two_way");
+            println!("SUBMITTED_CREATE_FILE_INTENTS=1");
+            println!("SELECTED_INTENTS=1");
+            println!("RECOVERY_OUTCOME=exact_id_appeared_before_restart");
+            println!("INTENT_STATUS_AFTER={}", next.status.as_str());
+            println!("DATABASE_MUTATION=yes");
+            println!("REPLACEMENT_SESSION_INITIATED=no");
+            println!("RESTART_CAS_COMMITTED=no");
+            println!("PROVIDER_WRITE=not_performed");
+            println!("REMOTE_OBJECT_MUTATION=none");
+            println!("BLIND_REPLAY=no");
+            println!("SECOND_ID_INSPECTION=yes");
+            println!("CHANGE_STREAM_CONFIRMATION_REQUIRED=yes");
+            return Ok(());
+        }
+        FileCreateRecoveryLookupDisposition::Conflict => {
+            let next = storage.transition_sync_root_file_create_intent(
+                candidate.intent_id,
+                RemoteWriteIntentStatus::Submitted,
+                candidate.execution_generation,
+                RemoteWriteIntentStatus::Conflict,
+                unix_time_ms()?,
+            )?;
+            println!("SYNC_ROOT_FILE_CREATE_RECOVERY=PASS");
+            println!("MODE=two_way");
+            println!("SUBMITTED_CREATE_FILE_INTENTS=1");
+            println!("SELECTED_INTENTS=1");
+            println!("RECOVERY_OUTCOME=id_mismatch_before_restart");
+            println!("INTENT_STATUS_AFTER={}", next.status.as_str());
+            println!("DATABASE_MUTATION=yes");
+            println!("REPLACEMENT_SESSION_INITIATED=no");
+            println!("RESTART_CAS_COMMITTED=no");
+            println!("PROVIDER_WRITE=not_performed");
+            println!("REMOTE_OBJECT_MUTATION=none");
+            println!("BLIND_REPLAY=no");
+            println!("SECOND_ID_INSPECTION=yes");
+            return Ok(());
+        }
+        FileCreateRecoveryLookupDisposition::Missing => {}
+    }
+
+    let provider_cursor_after = api.current_change_cursor()?;
+    if provider_cursor_after != provider_cursor_before || provider_cursor_after != durable_cursor {
+        return Err(CliError::SyncRootFileCreateRemoteFenceMismatch);
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=commit_restart_attempt");
+    let restarted = storage.restart_sync_root_file_create_submission(
+        &root.id,
+        candidate.intent_id,
+        candidate.execution_generation,
+        execution_before.attempt_count,
+        &provider_cursor_after,
+        unix_time_ms()?,
+    )?;
+    if restarted.attempt_count != execution_before.attempt_count + 1
+        || restarted.execution_generation != candidate.execution_generation + 1
+        || restarted.status != RemoteWriteIntentStatus::Submitted
+    {
+        return Err(CliError::SyncRootFileCreateRecoverySelectionFailed);
+    }
+
+    println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=initiate_replacement_resumable");
+    let session = api.initiate_resumable_file_create(
+        candidate.predetermined_remote_id(),
+        &leaf_name,
+        parent_remote_id,
+        SUPERVISED_FILE_CREATE_MIME_TYPE,
+        local.total_bytes(),
+    )?;
+
+    let chunk_size = usize::try_from(DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES)
+        .map_err(|_| CliError::NumericOverflow)?;
+    let mut upload = SelectedRootFileCreateUploadBuffer::new(
+        local,
+        chunk_size,
+        DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES,
+    )?;
+    let mut completion = None;
+    let mut status_probes = 0_u64;
+    let mut partial_prefix_recoveries = 0_u64;
+    let mut no_progress_responses = 0_u64;
+
+    while completion.is_none() {
+        let request = upload.prepare_request()?;
+        let request_start = request.start_offset();
+        let request_len = u64::try_from(request.len()).map_err(|_| CliError::NumericOverflow)?;
+        let request_end = request_start
+            .checked_add(request_len)
+            .ok_or(CliError::NumericOverflow)?;
+        let is_final = request.is_final();
+
+        if is_final {
+            let current_sha256 = upload.completed_sha256_hex()?;
+            if current_sha256 != evidence.sha256_hex() {
+                return Err(CliError::SyncRootFileCreateStreamFingerprintMismatch);
+            }
+            storage.record_sync_root_file_create_stream_fingerprint(
+                candidate.intent_id,
+                restarted.execution_generation,
+                upload.total_bytes(),
+                &current_sha256,
+            )?;
+            println!(
+                "SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=fingerprint_revalidated_before_final_put"
+            );
+        }
+
+        upload.record_transmission(&request)?;
+        println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=upload_replacement_chunk");
+        let progress =
+            match api.upload_resumable_file_chunk(&session, request_start, request.into_bytes()) {
+                Ok(progress) => progress,
+                Err(_) => {
+                    status_probes = status_probes
+                        .checked_add(1)
+                        .ok_or(CliError::NumericOverflow)?;
+                    println!(
+                        "SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=query_replacement_status_after_error"
+                    );
+                    api.query_resumable_file_upload_status(&session)?
+                }
+            };
+
+        match progress {
+            DriveResumableUploadProgress::Incomplete { next_offset } => {
+                let accepted = upload
+                    .acknowledge_provider_offset(next_offset)
+                    .map_err(|_| CliError::SyncRootFileCreateResumeOffsetMismatch)?;
+                if accepted == 0 {
+                    no_progress_responses = no_progress_responses
+                        .checked_add(1)
+                        .ok_or(CliError::NumericOverflow)?;
+                    if no_progress_responses > SUPERVISED_FILE_CREATE_MAX_NO_PROGRESS_RESPONSES {
+                        return Err(CliError::SyncRootFileCreateNoProgressLimitExceeded);
+                    }
+                } else {
+                    no_progress_responses = 0;
+                    if next_offset < request_end {
+                        partial_prefix_recoveries = partial_prefix_recoveries
+                            .checked_add(1)
+                            .ok_or(CliError::NumericOverflow)?;
+                    }
+                }
+            }
+            DriveResumableUploadProgress::Complete(value) if is_final => {
+                completion = Some(value);
+            }
+            DriveResumableUploadProgress::Expired => {
+                return Err(CliError::SyncRootFileCreateSessionExpired);
+            }
+            DriveResumableUploadProgress::Complete(_) => {
+                return Err(CliError::SyncRootFileCreateResumeOffsetMismatch);
+            }
+        }
+    }
+
+    let completion = completion.ok_or(CliError::SyncRootFileCreateCompletionMissing)?;
+
+    let remote_version = match completion.sha256_checksum() {
+        Some(remote_sha256) if remote_sha256 == evidence.sha256_hex() => completion.remote_version,
+        Some(_) => {
+            storage.transition_sync_root_file_create_intent(
+                candidate.intent_id,
+                RemoteWriteIntentStatus::Submitted,
+                restarted.execution_generation,
+                RemoteWriteIntentStatus::Conflict,
+                unix_time_ms()?,
+            )?;
+            return Err(CliError::SyncRootFileCreateProviderHashMismatch);
+        }
+        None => {
+            println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=verify_replacement_completed_id");
+            match file_create_recovery_lookup_disposition(api.inspect_expected_file(
+                candidate.predetermined_remote_id(),
+                &leaf_name,
+                parent_remote_id,
+                SUPERVISED_FILE_CREATE_MIME_TYPE,
+                evidence.size_bytes,
+                evidence.sha256_hex(),
+            )?) {
+                FileCreateRecoveryLookupDisposition::Exact(remote_version) => remote_version,
+                FileCreateRecoveryLookupDisposition::Conflict => {
+                    storage.transition_sync_root_file_create_intent(
+                        candidate.intent_id,
+                        RemoteWriteIntentStatus::Submitted,
+                        restarted.execution_generation,
+                        RemoteWriteIntentStatus::Conflict,
+                        unix_time_ms()?,
+                    )?;
+                    return Err(CliError::SyncRootFileCreateProviderHashMismatch);
+                }
+                FileCreateRecoveryLookupDisposition::Missing => {
+                    return Err(CliError::SyncRootFileCreateCompletionMissing);
+                }
+            }
+        }
     };
+
+    let streamed = upload.finish_completed()?;
+    if streamed.sha256_hex() != evidence.sha256_hex() {
+        return Err(CliError::SyncRootFileCreateStreamFingerprintMismatch);
+    }
+    if !streamed.source_stable {
+        return Err(CliError::SyncRootFileCreateLocalIdentityMismatch);
+    }
+
+    let awaiting = storage.complete_sync_root_file_create_upload(
+        candidate.intent_id,
+        restarted.execution_generation,
+        remote_version,
+        unix_time_ms()?,
+    )?;
 
     println!("SYNC_ROOT_FILE_CREATE_RECOVERY=PASS");
     println!("MODE=two_way");
     println!("SUBMITTED_CREATE_FILE_INTENTS=1");
     println!("SELECTED_INTENTS=1");
-    println!("RECOVERY_OUTCOME={outcome}");
-    println!("INTENT_STATUS_AFTER={status_after}");
-    println!("DATABASE_MUTATION={mutation}");
-    println!("PROVIDER_WRITE=not_performed");
-    println!("REMOTE_OBJECT_MUTATION=none");
-    println!("DURABLE_STREAM_FINGERPRINT=yes");
+    println!("RECOVERY_OUTCOME=replacement_session_completed");
+    println!("INTENT_STATUS_AFTER={}", awaiting.status.as_str());
+    println!("ATTEMPT_COUNT_BEFORE={}", execution_before.attempt_count);
+    println!("ATTEMPT_COUNT_AFTER={}", restarted.attempt_count);
+    println!(
+        "EXECUTION_GENERATION_AFTER_RESTART={}",
+        restarted.execution_generation
+    );
+    println!("RESTART_CAS_COMMITTED=yes");
+    println!("REPLACEMENT_SESSION_INITIATED=yes");
+    println!("REPLACEMENT_SESSIONS_THIS_INVOCATION=1");
+    println!("SECOND_ID_INSPECTION=yes");
+    println!("PRE_RESTART_CURSOR_STABLE=yes");
+    println!("PARENT_AUTHORITY_REVALIDATED=yes");
+    println!("PARENT_TOPOLOGY_REVALIDATED=yes");
+    println!("LOCAL_IDENTITY_REVALIDATED=yes");
+    println!("STREAM_SHA256_REVALIDATED=yes");
+    println!("RANGE_PREFIX_AUTHORITATIVE=yes");
+    println!("RETRANSMISSION_DOUBLE_HASH=no");
+    println!("UPLOAD_CHUNKS={}", streamed.transmissions);
+    println!("BYTES_STREAMED={}", streamed.bytes_streamed);
+    println!(
+        "NETWORK_BYTES_ATTEMPTED={}",
+        streamed.network_bytes_attempted
+    );
+    println!("STATUS_PROBES={status_probes}");
+    println!("PARTIAL_PREFIX_RECOVERIES={partial_prefix_recoveries}");
+    println!("DATABASE_MUTATION=yes");
+    println!("PROVIDER_WRITE=one_replacement_resumable_attempt");
+    println!("REMOTE_OBJECT_MUTATION=file_create_resumable_only");
+    println!("CHANGE_STREAM_CONFIRMATION_REQUIRED=yes");
+    println!("LOCAL_EVENT_APPLIED=no");
+    println!("BASELINE_ADVANCED=no");
     println!("HASH_VALUE_PRINTED=no");
     println!("REMOTE_IDS_PRINTED=no");
+    println!("CURSOR_VALUES_PRINTED=no");
     println!("TOKEN_VALUES_PRINTED=no");
     println!("SESSION_URI_PRINTED=no");
     println!("BLIND_REPLAY=no");
-    println!("CHANGE_STREAM_CONFIRMATION_REQUIRED=yes");
     Ok(())
 }
 
@@ -8449,6 +8830,32 @@ mod sync_root_cli_tests {
         assert!(!file_create_provider_version_floor_met(9, 8));
         assert!(!file_create_provider_version_floor_met(0, 9));
         assert!(!file_create_provider_version_floor_met(9, 0));
+    }
+
+    #[test]
+    fn phase5h21d_file_create_recovery_lookup_disposition_is_exact() {
+        assert_eq!(
+            file_create_recovery_lookup_disposition(DriveExpectedFileLookup::Exact {
+                remote_version: 17,
+            }),
+            FileCreateRecoveryLookupDisposition::Exact(17)
+        );
+    }
+
+    #[test]
+    fn phase5h21d_file_create_recovery_lookup_disposition_is_conflict() {
+        assert_eq!(
+            file_create_recovery_lookup_disposition(DriveExpectedFileLookup::Mismatch),
+            FileCreateRecoveryLookupDisposition::Conflict
+        );
+    }
+
+    #[test]
+    fn phase5h21d_file_create_recovery_lookup_disposition_is_missing_restart_candidate() {
+        assert_eq!(
+            file_create_recovery_lookup_disposition(DriveExpectedFileLookup::Missing),
+            FileCreateRecoveryLookupDisposition::Missing
+        );
     }
 
     #[test]
