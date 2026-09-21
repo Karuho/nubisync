@@ -61,6 +61,54 @@ const OAUTH_CLIENT_ID_PURPOSE: &str = "client-id";
 const OAUTH_CLIENT_SECRET_PURPOSE: &str = "client-secret";
 const SUPERVISED_FILE_CREATE_MIME_TYPE: &str = "application/octet-stream";
 const SUPERVISED_FILE_CREATE_MAX_NO_PROGRESS_RESPONSES: u64 = 3;
+const NUBISYNC_FILE_CREATE_PROOF_FAULT_ENV: &str = "NUBISYNC_FILE_CREATE_PROOF_FAULT";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileCreateProofFault {
+    None,
+    PartialFirstChunk,
+    AbortAfterSessionInit,
+}
+
+fn parse_file_create_proof_fault(
+    value: Option<&str>,
+    debug_build: bool,
+) -> Result<FileCreateProofFault, CliError> {
+    if !debug_build {
+        return Ok(FileCreateProofFault::None);
+    }
+
+    match value {
+        None | Some("") | Some("none") => Ok(FileCreateProofFault::None),
+        Some("partial_first_chunk") => Ok(FileCreateProofFault::PartialFirstChunk),
+        Some("abort_after_session_init") => Ok(FileCreateProofFault::AbortAfterSessionInit),
+        Some(_) => Err(CliError::InvalidFileCreateProofFault),
+    }
+}
+
+fn file_create_proof_fault() -> Result<FileCreateProofFault, CliError> {
+    let value = env::var(NUBISYNC_FILE_CREATE_PROOF_FAULT_ENV).ok();
+    parse_file_create_proof_fault(value.as_deref(), cfg!(debug_assertions))
+}
+
+fn file_create_proof_transmission_len(
+    fault: FileCreateProofFault,
+    already_applied: bool,
+    request_start: u64,
+    request_len: usize,
+) -> Result<(usize, bool), CliError> {
+    if fault != FileCreateProofFault::PartialFirstChunk || already_applied {
+        return Ok((request_len, false));
+    }
+
+    let alignment = usize::try_from(DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES)
+        .map_err(|_| CliError::NumericOverflow)?;
+    if request_start != 0 || request_len <= alignment {
+        return Err(CliError::FileCreateProofFaultNotApplicable);
+    }
+
+    Ok((alignment, true))
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -2012,6 +2060,7 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
         unix_time_ms()?,
     )?;
 
+    let proof_fault = file_create_proof_fault()?;
     println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=initiate_resumable");
     let session = api.initiate_resumable_file_create(
         candidate.predetermined_remote_id(),
@@ -2020,6 +2069,13 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
         SUPERVISED_FILE_CREATE_MIME_TYPE,
         local.total_bytes(),
     )?;
+
+    if proof_fault == FileCreateProofFault::AbortAfterSessionInit {
+        println!("PROOF_FAULT_INJECTION=abort_after_session_init");
+        println!("PROOF_FAULT_SCOPE=debug_cli_only");
+        println!("PROOF_SESSION_URI_PRINTED=no");
+        return Err(CliError::FileCreateProofInjectedAbort);
+    }
 
     let chunk_size = usize::try_from(DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES)
         .map_err(|_| CliError::NumericOverflow)?;
@@ -2033,6 +2089,7 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
     let mut status_probes = 0_u64;
     let mut partial_prefix_recoveries = 0_u64;
     let mut no_progress_responses = 0_u64;
+    let mut proof_partial_applied = false;
 
     while completion.is_none() {
         let request = upload.prepare_request()?;
@@ -2055,10 +2112,24 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
             println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=fingerprint_durable_before_final_put");
         }
 
-        upload.record_transmission(&request)?;
+        let (transmitted_len, injected_partial_now) = file_create_proof_transmission_len(
+            proof_fault,
+            proof_partial_applied,
+            request_start,
+            request.len(),
+        )?;
+        if injected_partial_now {
+            proof_partial_applied = true;
+            println!("PROOF_FAULT_INJECTION=partial_first_chunk");
+            println!("PROOF_FAULT_SCOPE=debug_cli_only");
+        }
+        upload.record_transmission_bytes(&request, transmitted_len)?;
+        let mut transmitted_payload = request.into_bytes();
+        transmitted_payload.truncate(transmitted_len);
+
         println!("SYNC_ROOT_FILE_CREATE_SUBMISSION_STAGE=upload_chunk");
         let progress =
-            match api.upload_resumable_file_chunk(&session, request_start, request.into_bytes()) {
+            match api.upload_resumable_file_chunk(&session, request_start, transmitted_payload) {
                 Ok(progress) => progress,
                 Err(_) => {
                     status_probes = status_probes
@@ -2183,6 +2254,11 @@ fn sync_roots_submit_file_create() -> Result<(), CliError> {
     println!("PARTIAL_PREFIX_RECOVERIES={partial_prefix_recoveries}");
     println!("RANGE_PREFIX_AUTHORITATIVE=yes");
     println!("RETRANSMISSION_DOUBLE_HASH=no");
+    println!(
+        "PROOF_PARTIAL_FIRST_CHUNK_APPLIED={}",
+        yes_no(proof_partial_applied)
+    );
+    println!("PROOF_FAULT_SCOPE=debug_cli_only");
     println!("STREAM_SHA256_DURABLE=yes");
     println!("HASH_VALUE_PRINTED=no");
     println!(
@@ -2537,6 +2613,7 @@ fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
         return Err(CliError::SyncRootFileCreateRecoverySelectionFailed);
     }
 
+    let proof_fault = file_create_proof_fault()?;
     println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=initiate_replacement_resumable");
     let session = api.initiate_resumable_file_create(
         candidate.predetermined_remote_id(),
@@ -2545,6 +2622,13 @@ fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
         SUPERVISED_FILE_CREATE_MIME_TYPE,
         local.total_bytes(),
     )?;
+
+    if proof_fault == FileCreateProofFault::AbortAfterSessionInit {
+        println!("PROOF_FAULT_INJECTION=abort_after_replacement_session_init");
+        println!("PROOF_FAULT_SCOPE=debug_cli_only");
+        println!("PROOF_SESSION_URI_PRINTED=no");
+        return Err(CliError::FileCreateProofInjectedAbort);
+    }
 
     let chunk_size = usize::try_from(DRIVE_DEFAULT_RESUMABLE_CHUNK_BYTES)
         .map_err(|_| CliError::NumericOverflow)?;
@@ -2557,6 +2641,7 @@ fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
     let mut status_probes = 0_u64;
     let mut partial_prefix_recoveries = 0_u64;
     let mut no_progress_responses = 0_u64;
+    let mut proof_partial_applied = false;
 
     while completion.is_none() {
         let request = upload.prepare_request()?;
@@ -2583,10 +2668,24 @@ fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
             );
         }
 
-        upload.record_transmission(&request)?;
+        let (transmitted_len, injected_partial_now) = file_create_proof_transmission_len(
+            proof_fault,
+            proof_partial_applied,
+            request_start,
+            request.len(),
+        )?;
+        if injected_partial_now {
+            proof_partial_applied = true;
+            println!("PROOF_FAULT_INJECTION=partial_first_chunk");
+            println!("PROOF_FAULT_SCOPE=debug_cli_only");
+        }
+        upload.record_transmission_bytes(&request, transmitted_len)?;
+        let mut transmitted_payload = request.into_bytes();
+        transmitted_payload.truncate(transmitted_len);
+
         println!("SYNC_ROOT_FILE_CREATE_RECOVERY_STAGE=upload_replacement_chunk");
         let progress =
-            match api.upload_resumable_file_chunk(&session, request_start, request.into_bytes()) {
+            match api.upload_resumable_file_chunk(&session, request_start, transmitted_payload) {
                 Ok(progress) => progress,
                 Err(_) => {
                     status_probes = status_probes
@@ -2712,6 +2811,11 @@ fn sync_roots_recover_file_create_submission() -> Result<(), CliError> {
     println!("STREAM_SHA256_REVALIDATED=yes");
     println!("RANGE_PREFIX_AUTHORITATIVE=yes");
     println!("RETRANSMISSION_DOUBLE_HASH=no");
+    println!(
+        "PROOF_PARTIAL_FIRST_CHUNK_APPLIED={}",
+        yes_no(proof_partial_applied)
+    );
+    println!("PROOF_FAULT_SCOPE=debug_cli_only");
     println!("UPLOAD_CHUNKS={}", streamed.transmissions);
     println!("BYTES_STREAMED={}", streamed.bytes_streamed);
     println!(
@@ -8833,6 +8937,72 @@ mod sync_root_cli_tests {
     }
 
     #[test]
+    fn phase5h21e1_proof_fault_is_inert_for_non_debug_builds() {
+        assert_eq!(
+            parse_file_create_proof_fault(Some("partial_first_chunk"), false).unwrap(),
+            FileCreateProofFault::None
+        );
+        assert_eq!(
+            parse_file_create_proof_fault(Some("abort_after_session_init"), false).unwrap(),
+            FileCreateProofFault::None
+        );
+    }
+
+    #[test]
+    fn phase5h21e1_debug_fault_selector_is_strict() {
+        assert_eq!(
+            parse_file_create_proof_fault(Some("partial_first_chunk"), true).unwrap(),
+            FileCreateProofFault::PartialFirstChunk
+        );
+        assert_eq!(
+            parse_file_create_proof_fault(Some("abort_after_session_init"), true).unwrap(),
+            FileCreateProofFault::AbortAfterSessionInit
+        );
+        assert!(matches!(
+            parse_file_create_proof_fault(Some("unexpected"), true),
+            Err(CliError::InvalidFileCreateProofFault)
+        ));
+    }
+
+    #[test]
+    fn phase5h21e1_partial_fault_uses_exact_alignment_prefix_once() {
+        let alignment = usize::try_from(DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES).unwrap();
+        let (first_len, first_applied) = file_create_proof_transmission_len(
+            FileCreateProofFault::PartialFirstChunk,
+            false,
+            0,
+            alignment * 4,
+        )
+        .unwrap();
+        assert_eq!(first_len, alignment);
+        assert!(first_applied);
+
+        let (retry_len, retry_applied) = file_create_proof_transmission_len(
+            FileCreateProofFault::PartialFirstChunk,
+            true,
+            alignment as u64,
+            alignment * 3,
+        )
+        .unwrap();
+        assert_eq!(retry_len, alignment * 3);
+        assert!(!retry_applied);
+    }
+
+    #[test]
+    fn phase5h21e1_partial_fault_fails_when_request_cannot_be_split() {
+        let alignment = usize::try_from(DRIVE_RESUMABLE_CHUNK_ALIGNMENT_BYTES).unwrap();
+        assert!(matches!(
+            file_create_proof_transmission_len(
+                FileCreateProofFault::PartialFirstChunk,
+                false,
+                0,
+                alignment,
+            ),
+            Err(CliError::FileCreateProofFaultNotApplicable)
+        ));
+    }
+
+    #[test]
     fn phase5h21d_file_create_recovery_lookup_disposition_is_exact() {
         assert_eq!(
             file_create_recovery_lookup_disposition(DriveExpectedFileLookup::Exact {
@@ -9416,6 +9586,12 @@ enum CliError {
     SyncRootFileCreateSubmissionSelectionFailed,
     #[error("sync root ordinary-file create recovery selection failed")]
     SyncRootFileCreateRecoverySelectionFailed,
+    #[error("file-create proof fault selector is invalid")]
+    InvalidFileCreateProofFault,
+    #[error("file-create proof fault cannot be applied to this request")]
+    FileCreateProofFaultNotApplicable,
+    #[error("file-create proof fault intentionally stopped after session initiation")]
+    FileCreateProofInjectedAbort,
     #[error("sync root ordinary-file create submission requires two_way mode")]
     SyncRootFileCreateSubmissionModeUnsupported,
     #[error("sync root ordinary-file create durable remote root is missing")]

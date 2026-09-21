@@ -350,10 +350,20 @@ impl SelectedRootFileCreateUploadBuffer {
         &mut self,
         request: &SelectedRootFileCreateUploadRequest,
     ) -> Result<(), SelectedRootExecutorError> {
+        self.record_transmission_bytes(request, request.len())
+    }
+
+    pub fn record_transmission_bytes(
+        &mut self,
+        request: &SelectedRootFileCreateUploadRequest,
+        transmitted_bytes: usize,
+    ) -> Result<(), SelectedRootExecutorError> {
         self.validate_buffer_invariant()?;
         if request.start_offset != self.pending_start_offset
             || request.bytes != self.pending
             || request.bytes.is_empty()
+            || transmitted_bytes == 0
+            || transmitted_bytes > request.bytes.len()
         {
             return Err(SelectedRootExecutorError::RemoteWriteFileCreateResumeOffsetMismatch);
         }
@@ -361,7 +371,7 @@ impl SelectedRootFileCreateUploadBuffer {
         self.network_bytes_attempted = self
             .network_bytes_attempted
             .checked_add(
-                u64::try_from(request.bytes.len())
+                u64::try_from(transmitted_bytes)
                     .map_err(|_| SelectedRootExecutorError::CountOverflow)?,
             )
             .ok_or(SelectedRootExecutorError::CountOverflow)?;
@@ -8824,6 +8834,33 @@ mod tests {
         assert_eq!(result.network_bytes_attempted, 16);
         assert_eq!(result.transmissions, 2);
         assert_eq!(result.sha256_hex(), first_hash);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn phase5h21e1_prefix_transmission_accounting_keeps_full_retained_request() {
+        let bytes = vec![b'x'; 1024];
+        let (source, path) = phase5h21b_test_source("5h21e1-prefix-accounting", &bytes);
+        let mut upload = SelectedRootFileCreateUploadBuffer::new(source, 1024, 256).unwrap();
+
+        let request = upload.prepare_request().unwrap();
+        assert_eq!(request.len(), 1024);
+        upload.record_transmission_bytes(&request, 256).unwrap();
+
+        assert_eq!(upload.acknowledge_provider_offset(256).unwrap(), 256);
+        assert_eq!(upload.pending_start_offset(), 256);
+        assert_eq!(upload.unique_bytes_read(), 1024);
+
+        let retry = upload.prepare_request().unwrap();
+        assert_eq!(retry.start_offset(), 256);
+        assert_eq!(retry.len(), 768);
+        upload.record_transmission(&retry).unwrap();
+
+        let result = upload.finish_completed().unwrap();
+        assert_eq!(result.bytes_streamed, 1024);
+        assert_eq!(result.network_bytes_attempted, 1024);
+        assert_eq!(result.transmissions, 2);
 
         std::fs::remove_file(path).unwrap();
     }
